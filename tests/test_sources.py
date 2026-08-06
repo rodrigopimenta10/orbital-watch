@@ -896,10 +896,26 @@ def test_seed_carries_a_cold_build_with_no_network(tmp_path, monkeypatch, real_s
     This is the Cloudflare Pages case: build containers are ephemeral, so
     every deploy starts with an empty cache. Without a seed, one upstream
     hiccup during a deploy publishes an empty dashboard.
+
+    The clock is pinned to the seed's own capture time rather than left at
+    wall-clock ``now``. Age is evaluated before outcome in
+    ``health.classify``, so once the committed snapshot ages past a source's
+    freshness window it is reported STALE *for being old* and the seed-specific
+    wording never appears. Against a live clock this test would therefore pass
+    only for the few hours after each seed refresh and fail permanently
+    afterwards -- a failure about the age of a checked-in fixture, not about
+    the behaviour under test. Deriving the instant from the manifest keeps the
+    assertion pointed at the seed path and survives every future re-seed.
     """
     monkeypatch.setattr(
         "urllib.request.urlopen",
         responder({}, default=urllib.error.URLError("offline")),
+    )
+
+    manifest = json.loads((real_seed_dir / "manifest.json").read_text())
+    newest_capture = max(
+        datetime.fromisoformat(entry["retrieved_at"])
+        for entry in manifest["sources"].values()
     )
 
     meta = run_build(
@@ -907,6 +923,7 @@ def test_seed_carries_a_cold_build_with_no_network(tmp_path, monkeypatch, real_s
         build_dir=tmp_path / "dist",
         web_dir=tmp_path / "nonexistent-web",
         observer=OBSERVER,
+        now=newest_capture + timedelta(seconds=1),
     )
 
     health = assert_site_is_complete(tmp_path / "dist")

@@ -71,7 +71,9 @@ def configure_logging(verbose: bool = False) -> None:
 # --------------------------------------------------------------------------
 
 
-def collect_satellites(cache_dir: Path, ts) -> tuple[list, list, list]:
+def collect_satellites(
+    cache_dir: Path, ts, *, now: datetime | None = None
+) -> tuple[list, list, list]:
     """Fetch every tracked group and build propagatable satellites.
 
     Returns (tracked_satellites, source_health, group_coverage). A group that
@@ -89,7 +91,9 @@ def collect_satellites(cache_dir: Path, ts) -> tuple[list, list, list]:
     for group in TRACKED_GROUPS:
         result = celestrak.fetch_group(group, cache_dir)
         reports.append(
-            health.evaluate(result, TLE_STALENESS, label=f"Celestrak — {group.label}")
+            health.evaluate(
+                result, TLE_STALENESS, label=f"Celestrak — {group.label}", now=now
+            )
         )
 
         if not result.ok:
@@ -163,35 +167,49 @@ def empty_weather() -> dict[str, Any]:
     }
 
 
-def collect_space_weather(cache_dir: Path) -> tuple[dict, list]:
+def collect_space_weather(
+    cache_dir: Path, *, now: datetime | None = None
+) -> tuple[dict, list]:
     """Fetch and interpret space weather. Degrades field by field."""
     reports: list[health.SourceHealth] = []
 
     kp_result = swpc.fetch_kp(cache_dir)
     reports.append(
         health.evaluate(
-            kp_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC — Planetary K-index"
+            kp_result,
+            SPACE_WEATHER_STALENESS,
+            label="NOAA SWPC — Planetary K-index",
+            now=now,
         )
     )
 
     wind_result = swpc.fetch_solar_wind(cache_dir)
     reports.append(
         health.evaluate(
-            wind_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC — Solar Wind Speed"
+            wind_result,
+            SPACE_WEATHER_STALENESS,
+            label="NOAA SWPC — Solar Wind Speed",
+            now=now,
         )
     )
 
     mag_result = swpc.fetch_mag_field(cache_dir)
     reports.append(
         health.evaluate(
-            mag_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC — IMF (Bt/Bz)"
+            mag_result,
+            SPACE_WEATHER_STALENESS,
+            label="NOAA SWPC — IMF (Bt/Bz)",
+            now=now,
         )
     )
 
     cycle_result = swpc.fetch_solar_cycle(cache_dir)
     reports.append(
         health.evaluate(
-            cycle_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC — Solar Cycle"
+            cycle_result,
+            SPACE_WEATHER_STALENESS,
+            label="NOAA SWPC — Solar Cycle",
+            now=now,
         )
     )
 
@@ -433,14 +451,19 @@ def run_build(
     # shape predates the current parser, an upstream that changed structure.
     # Since the whole promise of this build is that it completes, no single
     # stage is allowed to be the thing that stops it.
+    # `now` is threaded into health classification as well as propagation so a
+    # single instant governs the whole page. Letting health call its own
+    # `datetime.now()` meant reported ages were measured against a different
+    # moment than the pass predictions -- invisible on a fast build, wrong on a
+    # slow one, and impossible to pin down in a test.
     try:
-        tracked, tle_reports, coverage = collect_satellites(cache_dir, ts)
+        tracked, tle_reports, coverage = collect_satellites(cache_dir, ts, now=now)
     except Exception:
         log.exception("satellite collection failed; continuing with no satellites")
         tracked, tle_reports, coverage = [], [], []
 
     try:
-        weather, weather_reports = collect_space_weather(cache_dir)
+        weather, weather_reports = collect_space_weather(cache_dir, now=now)
     except Exception:
         log.exception("space weather collection failed; continuing without it")
         weather, weather_reports = empty_weather(), []
