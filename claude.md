@@ -309,6 +309,24 @@ is the right number, not just an affordable one:
   reports FRESH.
 - 140 builds/month of headroom absorbs ordinary development pushes.
 
+**Do not "solve" this by upgrading the Cloudflare plan.** A paid plan lifts the
+build ceiling, but the ceiling is not the real limit:
+
+- **TLEs cannot get fresher.** Celestrak publishes GP data on a 2-hour cycle, so
+  a faster rebuild re-downloads byte-identical element sets.
+- **Space weather could be fresher in principle** — solar wind updates by the
+  minute — but `SPACE_WEATHER_STALENESS.fresh_within` is 3 hours, so the health
+  panel reports FRESH either way. **The page would look identical.**
+- **Faster rebuilds make the worst failure mode more likely,** since every build
+  is another cold-cache round of Celestrak requests against a rate limiter that
+  is already intermittently refusing us (§10.3).
+
+So a paid plan buys no visible change and raises failure risk. The only way to
+get genuinely live space weather is **per-source cadence** — poll SWPC often,
+TLEs rarely — which requires client-side fetching or a backend and therefore
+contradicts the static-site design in §2. Out of scope; record the reasoning so
+the question is not reopened.
+
 **Accepted tradeoff, state it in `DECISIONS.md`:** at a 2-hour cadence, *one*
 missed run puts space weather at 4 hours and the site reports STALE. That is
 correct behaviour, not a regression — the page is telling the truth about its
