@@ -49,4 +49,13 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
-filterwarnings = ["error::DeprecationWarning"]
+filterwarnings = [
+    # Our own deprecation warnings are errors -- we want to hear about them.
+    "error::DeprecationWarning",
+    # ...except this one. skyfield 1.54's find_events() assigns to ndarray.dtype,
+    # which NumPy 2.5 deprecates. It is a real latent break (a future NumPy will
+    # make it an error and pass prediction will stop working), but it is upstream
+    # code we do not control. Tracked in DECISIONS.md; remove this line once
+    # skyfield ships a fix, and the tests will tell us if it regresses.
+    "ignore:Setting the dtype on a NumPy array has been deprecated:DeprecationWarning",
+]

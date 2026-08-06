@@ -128,6 +128,15 @@ def _classify(
     age = now - result.last_success
     age_text = format_duration(age)
 
+    # Data can be both old *and* cut off from upstream. Reporting only the age
+    # would hide the more actionable half -- an operator wants to know we have
+    # lost contact, not just that the numbers are old.
+    contact_lost = (
+        f" Upstream was also unreachable this run ({result.error})."
+        if result.outcome == Outcome.CACHE_FALLBACK
+        else ""
+    )
+
     # 3. Age-driven classification.
     if age > policy.stale_within:
         return (
@@ -135,7 +144,7 @@ def _classify(
             age,
             f"Last successful fetch was {age_text} ago, beyond the "
             f"{format_duration(policy.stale_within)} limit. Data shown is not "
-            f"operationally current.",
+            f"operationally current.{contact_lost}",
         )
 
     if age > policy.fresh_within:
@@ -143,7 +152,8 @@ def _classify(
             State.STALE,
             age,
             f"Last successful fetch was {age_text} ago, past the "
-            f"{format_duration(policy.fresh_within)} freshness window.",
+            f"{format_duration(policy.fresh_within)} freshness window."
+            f"{contact_lost}",
         )
 
     # 4. Young data, but did we actually reach upstream this run?
