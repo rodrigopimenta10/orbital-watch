@@ -169,7 +169,32 @@ def test_fetch_never_raises_even_on_unexpected_errors(tmp_path, monkeypatch):
     result = fetch_json("demo", "https://example.invalid/data.json", tmp_path)
 
     assert result.outcome is Outcome.FAILED
-    assert "something nobody anticipated" in result.error
+    assert "RuntimeError" in result.error
+
+
+def test_unclassified_error_text_is_not_published(tmp_path, monkeypatch):
+    """An unrecognised exception's message must not reach health.json.
+
+    That string is served verbatim from a public site. A URLError raised
+    through a proxy configured with credentials in its URL would otherwise
+    carry them straight into the published output. The exception type is
+    enough to categorise the failure; the message belongs in the logs.
+    """
+    leaked = "http://user:hunter2@proxy.internal:3128 refused"
+
+    def _explode(request, timeout=None):
+        raise RuntimeError(leaked)
+
+    monkeypatch.setattr("urllib.request.urlopen", _explode)
+
+    result = fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+
+    assert result.outcome is Outcome.FAILED
+    assert leaked not in result.error
+    assert "hunter2" not in result.error
+    assert "proxy.internal" not in result.error
+    # Still useful: the caller can see what kind of failure it was.
+    assert "RuntimeError" in result.error
 
 
 def test_malformed_json_does_not_overwrite_a_good_cache(tmp_path, monkeypatch):

@@ -494,7 +494,15 @@ def _describe_error(exc: Exception, timeout: float) -> str:
         return f"Malformed JSON: {exc.msg}"
     if isinstance(exc, ValueError):
         return f"Rejected payload: {exc}"
-    return f"{type(exc).__name__}: {exc}"
+    # Deliberately does not interpolate the message for unrecognised errors.
+    # This string is published verbatim in health.json on a public site, and an
+    # arbitrary exception text is the one place build-environment detail could
+    # leak into it -- a URLError raised through a proxy configured with
+    # credentials in the URL would carry them straight through. The type name
+    # is enough to categorise the failure; the full message stays in the logs,
+    # which are not published.
+    log.debug("unclassified fetch error: %s: %s", type(exc).__name__, exc)
+    return f"Unexpected {type(exc).__name__} (see build logs)"
 
 
 def format_duration(delta: timedelta) -> str:
