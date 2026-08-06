@@ -1,0 +1,23 @@
+# Cloudflare Pages response headers.
+# Copied verbatim into dist/ by the build, and consumed by Pages at deploy time.
+#
+# The site is static files plus same-origin JSON: no forms, no cookies, no
+# auth, no third-party anything. The policy below says exactly that, so any
+# future change that introduces an external dependency fails loudly here
+# rather than quietly widening the attack surface.
+
+/*
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Cross-Origin-Opener-Policy: same-origin
+  Permissions-Policy: geolocation=(), camera=(), microphone=(), payment=(), usb=(), interest-cohort=()
+
+# The generated JSON is rewritten hourly. Let a browser reuse it briefly, but
+# never serve a stale copy from cache once the next build has landed.
+/data/*
+  Cache-Control: public, max-age=300, must-revalidate
+
+# Fingerprint-free asset names, so they cannot be cached indefinitely.
+/assets/*
+  Cache-Control: public, max-age=3600, must-revalidate

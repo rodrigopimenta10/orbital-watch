@@ -1,141 +1,72 @@
-name: Update data and deploy
+name: Trigger hourly rebuild
+
+# Cloudflare Pages builds the site from this repository, so a rebuild is just
+# a request to Cloudflare rather than a build here. That means this workflow
+# needs no checkout, no Python, no dependencies and no third-party actions —
+# and therefore has essentially no supply-chain surface of its own.
+#
+# Cadence rationale (see DECISIONS.md):
+#   * SWPC data has a 3h freshness window in our config. Hourly keeps it
+#     comfortably fresh and leaves headroom to miss a run or two.
+#   * This does NOT mean Celestrak is called hourly. The fetcher refuses to
+#     re-request a GP group whose cache is younger than 6h. On Cloudflare that
+#     cache is cold every build, so the effective ceiling is one request per
+#     group per build — which is why the schedule, not just the code, has to
+#     stay conservative.
 
 on:
   schedule:
-    # Hourly, on the hour (UTC).
-    #
-    # Cadence rationale (see DECISIONS.md):
-    #   * SWPC data has a 3h freshness window in our config. Running hourly
-    #     keeps it comfortably fresh and leaves headroom to miss a run or two
-    #     without the site going stale.
-    #   * This does NOT mean Celestrak is called hourly. The fetcher refuses to
-    #     re-request a GP group whose cache is younger than 6h, so hourly
-    #     scheduling costs Celestrak at most 4 requests per group per day.
-    #     Workflow cadence and upstream politeness are deliberately decoupled:
-    #     the rate limit is enforced in code, not by the schedule.
     - cron: "0 * * * *"
   workflow_dispatch:
-  # Redeploy when the site itself changes, not just when the data does.
-  push:
-    branches: [main]
-    paths:
-      - "web/**"
-      - "src/**"
-      - ".github/workflows/update-data.yml"
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+# Nothing in this workflow reads or writes repository content.
+permissions: {}
 
 # Never cancel an in-flight deploy: a half-published site is worse than a
 # slightly delayed one.
 concurrency:
-  group: pages
+  group: pages-deploy
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Fetch and build
+  trigger:
+    name: Ping Cloudflare Pages deploy hook
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-
-      # setup-uv stopped publishing floating major tags (@v8 onward) for
-      # supply-chain reasons, so this is pinned to an exact release.
-      - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
-        with:
-          enable-cache: true
-
-      - name: Set up Python
-        run: uv python install 3.12
-
-      - name: Install dependencies
-        run: uv sync --locked --dev
-
-      # The upstream response cache is what makes degradation graceful in
-      # production: if Celestrak or SWPC is down during a scheduled run, the
-      # build falls back to whatever the previous run stored. Without this the
-      # cache would be empty on every run and any outage would blank a panel.
-      #
-      # The key always changes so each run writes a fresh entry; restore-keys
-      # pulls the most recent previous one.
-      - name: Restore upstream cache
-        uses: actions/cache@v6
-        with:
-          path: .cache
-          key: upstream-cache-${{ github.run_id }}
-          restore-keys: |
-            upstream-cache-
-
-      - name: Build site
-        run: uv run python -m orbital_watch.build --verbose
-
-      # The build never fails on upstream problems by design, so surface the
-      # health result in the job summary where it is actually visible.
-      - name: Report source health
-        if: always()
-        run: |
-          uv run python - <<'PY'
-          import json, os, pathlib
-
-          path = pathlib.Path("dist/data/health.json")
-          if not path.exists():
-              print("No health.json produced -- the build did not complete.")
-              raise SystemExit(1)
-
-          health = json.loads(path.read_text())
-          lines = [
-              "## Data update summary",
-              "",
-              f"**Overall state:** `{health['overall']}`",
-              "",
-              "| Source | State | Outcome | Last success |",
-              "| --- | --- | --- | --- |",
-          ]
-          for source in health["sources"]:
-              lines.append(
-                  f"| {source['label']} | `{source['state']}` | "
-                  f"`{source['outcome']}` | {source['last_success'] or 'never'} |"
-              )
-
-          degraded = [s for s in health["sources"] if s["state"] != "fresh"]
-          if degraded:
-              lines += ["", "### Degraded sources", ""]
-              lines += [
-                  f"- **{s['label']}** ({s['state']}): {s['detail']}" for s in degraded
-              ]
-
-          summary = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary:
-              pathlib.Path(summary).write_text("\n".join(lines) + "\n")
-          print("\n".join(lines))
-          PY
-
-      - name: Verify build output
+      - name: Trigger rebuild
+        env:
+          # Created in the Cloudflare dashboard (Pages project → Settings →
+          # Builds & deployments → Deploy hooks) and stored as a GitHub Actions
+          # secret. It is a capability URL: anyone holding it can trigger a
+          # build, so it is never committed, echoed, or written to logs.
+          DEPLOY_HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}
         run: |
           set -euo pipefail
-          for file in meta.json sky.json passes.json space_weather.json health.json; do
-            test -s "dist/data/$file" || { echo "missing or empty: $file"; exit 1; }
-            python3 -c "import json,sys; json.load(open('dist/data/$file'))"
-          done
-          test -s dist/index.html
-          echo "Build output verified."
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: dist
+          if [ -z "${DEPLOY_HOOK}" ]; then
+            echo "CLOUDFLARE_DEPLOY_HOOK is not set."
+            echo
+            echo "Add it under Settings → Secrets and variables → Actions."
+            echo "Until then Cloudflare still rebuilds on every push to main;"
+            echo "only the hourly refresh is missing."
+            exit 1
+          fi
 
-  deploy:
-    name: Deploy to GitHub Pages
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v5
+          # --fail turns a non-2xx into a non-zero exit. Output goes to a file
+          # rather than stdout so a hook URL echoed back in an error body can
+          # never land in the public build log.
+          status=$(curl --silent --show-error --fail-with-body \
+                        --max-time 30 --retry 3 --retry-delay 10 \
+                        --output /tmp/hook-response.json \
+                        --write-out '%{http_code}' \
+                        -X POST "${DEPLOY_HOOK}") || {
+            echo "Deploy hook failed with HTTP ${status:-000}."
+            exit 1
+          }
+
+          echo "Deploy hook accepted (HTTP ${status}). Cloudflare is rebuilding."
+          echo "### Rebuild triggered" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Cloudflare Pages accepted the deploy hook at $(date -u +%FT%TZ)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Per-source health is reported on the site itself and in the" >> "$GITHUB_STEP_SUMMARY"
+          echo "Cloudflare build log." >> "$GITHUB_STEP_SUMMARY"

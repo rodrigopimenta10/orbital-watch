@@ -1,0 +1,17 @@
+# Cloudflare Pages project configuration.
+#
+# Only the build *output* directory lives here; the build *command* is set in
+# the Cloudflare dashboard (Pages has no wrangler field for it). See README
+# "Deployment" for the exact command.
+#
+# Note that once this file exists, Cloudflare treats it as the source of truth
+# for the fields it declares — you can no longer edit them in the dashboard.
+# That is the point: the deploy configuration is reviewed in pull requests
+# rather than clicked into a web form and forgotten.
+#
+# This project has no Pages Functions, no bindings, no KV, no secrets. It is
+# static files and pre-generated JSON, which is why this file is four lines.
+
+name = "orbital-watch"
+pages_build_output_dir = "dist"
+compatibility_date = "2026-08-06"

@@ -3,8 +3,7 @@
 A public dashboard that tracks which satellites are passing over a ground
 station and correlates those passes with live space-weather conditions.
 
-**Live site:** _not yet deployed — see [Deployment](#deployment). Once GitHub
-Pages is enabled the URL is `https://<user>.github.io/orbital-watch/`._
+**Live site:** **[orbital.rodrigopimenta.com](https://orbital.rodrigopimenta.com)**
 
 ![The Orbital Watch dashboard: operational assessment banner, space weather tiles, and Kp history chart](docs/dashboard.jpg)
 
@@ -47,22 +46,22 @@ It is a portfolio project, not an operational tool.
             └──────────┬───────────────┘
                        ▼
          ┌──────────────────────────────┐
-         │  scheduled GitHub Action     │   hourly
-         │  fetch → cache → propagate   │
-         │  → health → write JSON       │
+         │  Cloudflare Pages build       │  hourly, via
+         │  fetch → propagate → health   │  a deploy hook
+         │  → write JSON  (seed backstop)│
          └──────────────┬───────────────┘
                         ▼
          ┌──────────────────────────────┐
          │  static JSON + HTML/CSS/JS   │   dist/
          └──────────────┬───────────────┘
                         ▼
-                 GitHub Pages
+               Cloudflare Pages
                         │
                         ▼
                     browser          ← never calls an upstream API
 ```
 
-A scheduled Python job fetches upstream data, computes positions and passes,
+A Python build job fetches upstream data, computes positions and passes,
 evaluates the health of every source, and writes five JSON files into the build
 output. The frontend loads those files and renders. **The browser never
 contacts Celestrak or NOAA.**
@@ -70,9 +69,9 @@ contacts Celestrak or NOAA.**
 That indirection is the point, and it buys three things:
 
 1. **An upstream outage cannot take the site down.** If Celestrak is
-   unreachable at 03:00, the scheduled run falls back to cached element sets,
-   the site still renders every panel, and the health panel says the data is
-   stale and why. Compare a live-proxy design, where the same outage produces
+   unreachable at 03:00, the run falls back to cached element sets — or, on a
+   cold build container, to the committed seed snapshot — the site still
+   renders every panel, and the health panel says the data is stale and why. Compare a live-proxy design, where the same outage produces
    a spinner or a stack trace in front of whoever is looking.
 2. **Hosting costs nothing and cannot fall over.** Static files on a CDN. No
    server, no serverless function, no database, no secrets.
@@ -112,7 +111,8 @@ answer is testable in isolation.
 | Cache younger than the refetch floor | `cache_fresh` | Cached data | **fresh** — upstream deliberately not contacted |
 | Upstream says nothing changed | `not_modified` | Cached data | **fresh** |
 | Upstream down, cache warm | `cache_fallback` | Cached data still renders | **stale** — with the connection error |
-| Upstream down, no cache | `failed` | That panel empties, others unaffected | **failed** — with the reason |
+| Upstream down, no cache, seed present | `seed` | Committed snapshot renders | **stale** — never *fresh*, whatever its age |
+| Upstream down, no cache, no seed | `failed` | That panel empties, others unaffected | **failed** — with the reason |
 | Data older than the staleness limit | — | Data still renders | **failed** — "not operationally current" |
 | Malformed / non-JSON response | `cache_fallback` | Cached data | **stale** — cache is *not* overwritten |
 
@@ -265,27 +265,105 @@ hard failure.
 
 ## Deployment
 
-Deploys to GitHub Pages via Actions — artifact upload and `deploy-pages`, not a
-`gh-pages` branch (a checked-in `.gitignore` on that branch silently drops
-files).
+Hosted on **Cloudflare Pages** at
+[orbital.rodrigopimenta.com](https://orbital.rodrigopimenta.com), built
+directly from this repository. There are no secrets in the repo and none are
+needed to build it.
 
-1. Push to GitHub.
-2. **Settings → Pages → Source: GitHub Actions.**
-3. Run **Update data and deploy** manually once, or wait for the hourly
-   schedule.
+### 1. Connect the repository
 
-`.github/workflows/`:
+In the Cloudflare dashboard: **Workers & Pages → Create → Pages → Connect to
+Git**, pick this repository, then set:
 
-- **`ci.yml`** — `ruff check`, `ruff format --check`, `pytest` on every push
-  and PR, plus a step that builds with all sockets blocked and asserts the
-  result is a complete site reporting total upstream failure.
-- **`update-data.yml`** — hourly fetch, rebuild, and deploy, with
-  `workflow_dispatch` for manual runs. Uses `concurrency: pages` with
-  `cancel-in-progress: false`, so a half-published site is never the result of
-  two overlapping runs. The upstream cache persists between runs via
-  `actions/cache` — without it every run would start cold and any outage would
-  blank a panel. Per-source health is written to the job summary, since the
-  build deliberately does not fail on upstream problems.
+| Setting | Value |
+|---|---|
+| Framework preset | **None** |
+| Build command | `pip install uv && uv sync --frozen && uv run python -m orbital_watch.build` |
+| Build output directory | `dist` |
+| Root directory | *(leave blank)* |
+| Production branch | `main` |
+
+No environment variables are required. `PYTHON_VERSION` is not needed either —
+the committed `.python-version` pins the interpreter, and Cloudflare's build
+image reads it.
+
+`wrangler.toml` declares `pages_build_output_dir = "dist"`. Once that file
+exists Cloudflare treats it as the source of truth for the output directory,
+so the dashboard field for it becomes read-only. That is deliberate: the
+deploy configuration is reviewed in pull requests instead of being clicked
+into a web form and forgotten. The build *command* has no wrangler equivalent
+and stays in the dashboard.
+
+### 2. Point the custom domain at it
+
+**Pages project → Custom domains → Set up a custom domain →**
+`orbital.rodrigopimenta.com`.
+
+Cloudflare then wants one DNS record:
+
+```
+Type    Name       Target
+CNAME   orbital    <your-project>.pages.dev
+```
+
+If `rodrigopimenta.com` uses Cloudflare DNS, the record is created for you and
+proxied automatically. If the domain is hosted elsewhere, add that CNAME with
+the current registrar. TLS is provisioned automatically; there is nothing to
+configure and no certificate to renew.
+
+### 3. Add the hourly rebuild
+
+Cloudflare rebuilds on every push, but the data needs refreshing on a
+schedule too. That is a **deploy hook**:
+
+1. **Pages project → Settings → Builds & deployments → Deploy hooks →**
+   create one for `main`. Cloudflare gives you a URL.
+2. That URL is a capability — anyone holding it can trigger a build — so it
+   goes in **GitHub → Settings → Secrets and variables → Actions** as
+   `CLOUDFLARE_DEPLOY_HOOK`, never in the repository.
+
+`.github/workflows/update-data.yml` then POSTs to it hourly. The workflow
+declares `permissions: {}` and uses no third-party actions, because pinging a
+URL needs neither. Without the secret the workflow fails with an explanatory
+message and the site simply stops refreshing hourly — pushes still deploy.
+
+### Why the build fetches its own data
+
+Cloudflare build containers are ephemeral, so unlike a CI runner there is no
+`.cache/` carried between builds — every build starts cold. A cold build
+during an upstream outage would publish an empty dashboard, which is exactly
+the failure this project exists to avoid.
+
+`seed/` is the answer: a small committed snapshot used only when there is no
+cache **and** upstream is unreachable. It is honest by construction rather
+than by disclaimer — `seed/manifest.json` records each snapshot's real capture
+time, that timestamp is what the health panel classifies, and a seed never
+reports **fresh** no matter how recent it is, because it is served precisely
+when we reached nobody. So a seeded build shows real satellites while stating
+plainly that the data is not live.
+
+### Workflows
+
+- **`ci.yml`** — `ruff check`, `ruff format --check`, and `pytest` on a
+  3.11/3.12 matrix for every push and PR, plus a step that builds with all
+  sockets blocked and asserts the result is a complete site reporting total
+  upstream failure. Actions are pinned to commit SHAs rather than tags, since
+  a tag can be re-pointed at other code.
+- **`update-data.yml`** — hourly deploy-hook trigger, plus
+  `workflow_dispatch`. `concurrency: cancel-in-progress: false`, so two
+  overlapping runs can never produce a half-published site.
+
+### Deploying from the command line instead
+
+The Git integration above is the intended path. For a one-off manual deploy:
+
+```bash
+uv run python -m orbital_watch.build
+npx wrangler pages deploy dist --project-name orbital-watch
+```
+
+That needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in your
+environment. Do not commit them.
 
 ---
 

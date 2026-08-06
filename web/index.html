@@ -10,13 +10,13 @@
     />
     <meta name="author" content="Rodrigo Pimenta" />
     <meta name="color-scheme" content="light dark" />
-    <link rel="canonical" href="https://rodrigopimenta10.github.io/orbital-watch/" />
+    <link rel="canonical" href="https://orbital.rodrigopimenta.com/" />
 
     <!-- Social cards. This gets shared as a link, so the preview is part of
          the deliverable: without these, a share renders as a bare URL. -->
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Orbital Watch" />
-    <meta property="og:url" content="https://rodrigopimenta10.github.io/orbital-watch/" />
+    <meta property="og:url" content="https://orbital.rodrigopimenta.com/" />
     <meta
       property="og:title"
       content="Orbital Watch — satellite passes correlated with space weather"
@@ -27,7 +27,7 @@
     />
     <meta
       property="og:image"
-      content="https://rodrigopimenta10.github.io/orbital-watch/assets/og.jpg"
+      content="https://orbital.rodrigopimenta.com/assets/og.jpg"
     />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
@@ -37,21 +37,10 @@
     />
     <meta name="twitter:card" content="summary_large_image" />
 
-    <!-- Restore the stored theme before first paint. Deferring this to
-         DOMContentLoaded makes the page paint in the OS theme and then snap
-         to the chosen one, which reads as a bug. -->
-    <script>
-      (function () {
-        try {
-          var t = localStorage.getItem("orbital-watch-theme");
-          if (t === "light" || t === "dark") {
-            document.documentElement.setAttribute("data-theme", t);
-          }
-        } catch (e) {
-          /* private mode: fall through to the OS preference */
-        }
-      })();
-    </script>
+    <!-- Blocking on purpose: restores the stored theme before first paint, so
+         the page does not flash the OS theme and snap to the chosen one.
+         External rather than inline so the CSP can stay `script-src 'self'`. -->
+    <script src="assets/theme.js"></script>
 
     <link rel="stylesheet" href="assets/style.css" />
     <link

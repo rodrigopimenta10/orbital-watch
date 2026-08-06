@@ -295,3 +295,57 @@ changing one workflow setting.
 Elevation of 82 m is Rockville's approximate ground elevation; the brief gives
 only lat/lon, and 0 m would introduce a small but pointless bias in the
 elevation mask.
+
+---
+
+## 13. Hosting: Cloudflare Pages, custom domain, committed seed snapshot
+
+**Decision.** Cloudflare Pages, building from the repository, served at
+`orbital.rodrigopimenta.com`. GitHub Actions no longer builds or deploys; it
+only pings a deploy hook on a schedule.
+
+**Why a custom domain.** `<user>.github.io/orbital-watch` and
+`<project>.pages.dev` are both borrowed addresses — they break if the repo is
+renamed, the account changes, or the host does. A domain I control is the only
+stable identifier, which matters for a link that is meant to stay good for
+years. The subdomain form also means one domain covers every future project
+rather than one domain per project.
+
+**What Cloudflare Pages changes, and the problem it created.** The build now
+runs in an ephemeral container. There is no persistent `.cache/` between
+builds, which is what the whole graceful-degradation story rested on: fetch
+fails → fall back to the cache written by the previous run. On Cloudflare
+every build starts cold, so a single upstream hiccup during a deploy would
+have published an empty dashboard — precisely the failure this project exists
+to demonstrate against.
+
+**The fix: a committed seed snapshot** (`seed/`, ~108 KB), used only when
+there is no cache *and* upstream is unreachable. The brief anticipated this
+("implement the fetcher with a clearly-marked fixture fallback so the build
+still succeeds"); the Cloudflare move is what made it necessary rather than
+optional.
+
+The part I care about is that it is honest **by construction**, not by
+disclaimer:
+
+- `seed/manifest.json` records each snapshot's true capture time, and that
+  timestamp — not the build time — is what the health panel classifies. A
+  months-old seed therefore ages into FAILED on its own, with no special case.
+- A seed **never** reports FRESH regardless of how recently it was captured,
+  for the same reason a cache fallback never does: it is served precisely
+  because we reached nobody. Recency of the snapshot is beside the point.
+
+The alternative was keeping GitHub Actions as the builder (it has
+`actions/cache`) and pushing to Cloudflare with `wrangler pages deploy`. That
+preserves the warm cache, but it needs a Cloudflare API token in CI, splits
+the build across two providers, and makes the deploy path something you cannot
+reproduce locally. Given the seed removes the reason to want the warm cache,
+the simpler topology wins. The wrangler path is documented in the README as a
+fallback.
+
+**Secrets.** The deploy hook URL is a capability — anyone holding it can
+trigger a build — so it lives in GitHub Actions secrets, never in the repo,
+and the workflow writes curl output to a file rather than stdout so an error
+body containing the URL cannot land in a public log. The workflow declares
+`permissions: {}` and uses no third-party actions, because pinging a URL needs
+neither.
