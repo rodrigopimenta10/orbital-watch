@@ -71,15 +71,20 @@ def configure_logging(verbose: bool = False) -> None:
 # --------------------------------------------------------------------------
 
 
-def collect_satellites(cache_dir: Path, ts) -> tuple[list, list]:
+def collect_satellites(cache_dir: Path, ts) -> tuple[list, list, list]:
     """Fetch every tracked group and build propagatable satellites.
 
-    Returns (tracked_satellites, source_health). A group that fails
-    contributes zero satellites and one FAILED health entry -- it does not
-    stop the others.
+    Returns (tracked_satellites, source_health, group_coverage). A group that
+    fails contributes zero satellites and one FAILED health entry -- it does
+    not stop the others.
+
+    ``group_coverage`` records how many objects each group offered versus how
+    many we actually propagate, so the page can state its own sampling rather
+    than implying it tracks everything.
     """
     tracked: list = []
     reports: list[health.SourceHealth] = []
+    coverage: list[dict] = []
 
     for group in TRACKED_GROUPS:
         result = celestrak.fetch_group(group, cache_dir)
@@ -93,15 +98,35 @@ def collect_satellites(cache_dir: Path, ts) -> tuple[list, list]:
                 group.key,
                 result.error,
             )
+            coverage.append(
+                {
+                    "key": group.key,
+                    "label": group.label,
+                    "available": 0,
+                    "tracked": 0,
+                    "sampled": False,
+                }
+            )
             continue
 
+        available = len(result.data)
         selected = celestrak.select_objects(result.data, group)
-        tracked.extend(build_satellites(selected, group, ts))
+        built = build_satellites(selected, group, ts)
+        tracked.extend(built)
+        coverage.append(
+            {
+                "key": group.key,
+                "label": group.label,
+                "available": available,
+                "tracked": len(built),
+                "sampled": len(built) < available,
+            }
+        )
 
     log.info(
         "tracking %d satellites across %d group(s)", len(tracked), len(TRACKED_GROUPS)
     )
-    return tracked, reports
+    return tracked, reports, coverage
 
 
 # --------------------------------------------------------------------------
@@ -409,10 +434,10 @@ def run_build(
     # Since the whole promise of this build is that it completes, no single
     # stage is allowed to be the thing that stops it.
     try:
-        tracked, tle_reports = collect_satellites(cache_dir, ts)
+        tracked, tle_reports, coverage = collect_satellites(cache_dir, ts)
     except Exception:
         log.exception("satellite collection failed; continuing with no satellites")
-        tracked, tle_reports = [], []
+        tracked, tle_reports, coverage = [], [], []
 
     try:
         weather, weather_reports = collect_space_weather(cache_dir)
@@ -462,6 +487,7 @@ def run_build(
             "kp_elevated_threshold": KP_ELEVATED_THRESHOLD,
             "kp_storm_threshold": KP_STORM_THRESHOLD,
         },
+        "coverage": coverage,
         "counts": {
             "tracked_satellites": len(tracked),
             "above_horizon": len(overhead),

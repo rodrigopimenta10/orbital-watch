@@ -3,15 +3,60 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Orbital Watch</title>
+    <title>Orbital Watch — satellite passes &amp; space weather</title>
     <meta
       name="description"
-      content="Satellite passes over a ground station, correlated with live space-weather conditions."
+      content="A static operations dashboard: which satellites are over a ground station, when they next pass, and what geomagnetic activity is doing to drag and link margin. Reports its own data freshness."
     />
+    <meta name="author" content="Rodrigo Pimenta" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="canonical" href="https://rodrigopimenta10.github.io/orbital-watch/" />
+
+    <!-- Social cards. This gets shared as a link, so the preview is part of
+         the deliverable: without these, a share renders as a bare URL. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Orbital Watch" />
+    <meta property="og:url" content="https://rodrigopimenta10.github.io/orbital-watch/" />
+    <meta
+      property="og:title"
+      content="Orbital Watch — satellite passes correlated with space weather"
+    />
+    <meta
+      property="og:description"
+      content="Which satellites are overhead, when they next pass, and what geomagnetic activity is doing to orbital drag and link margin. Static site, no backend, reports its own data freshness."
+    />
+    <meta
+      property="og:image"
+      content="https://rodrigopimenta10.github.io/orbital-watch/assets/og.jpg"
+    />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta
+      property="og:image:alt"
+      content="The Orbital Watch dashboard showing the operational assessment banner, space weather tiles and a Kp index history chart."
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <!-- Restore the stored theme before first paint. Deferring this to
+         DOMContentLoaded makes the page paint in the OS theme and then snap
+         to the chosen one, which reads as a bug. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("orbital-watch-theme");
+          if (t === "light" || t === "dark") {
+            document.documentElement.setAttribute("data-theme", t);
+          }
+        } catch (e) {
+          /* private mode: fall through to the OS preference */
+        }
+      })();
+    </script>
+
     <link rel="stylesheet" href="assets/style.css" />
     <link
       rel="icon"
-      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#128225;</text></svg>"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%F0%9F%93%A1%3C/text%3E%3C/svg%3E"
     />
   </head>
   <body>
@@ -25,13 +70,33 @@
           </p>
         </div>
         <div class="masthead-right">
-          <span id="overall-status"></span>
+          <span id="overall-status" aria-label="Overall data source status"></span>
           <button id="theme-toggle" type="button" aria-label="Toggle colour theme">
             Theme
           </button>
         </div>
       </header>
 
+      <noscript>
+        <div class="banner error-box" style="margin-top: 1.25rem">
+          <h3>JavaScript is required to render this dashboard</h3>
+          <p>
+            The page is static and reads pre-generated JSON in the browser, so
+            with scripting disabled there is nothing to display. The underlying
+            data is plain JSON and readable directly:
+            <a href="data/health.json">health.json</a>,
+            <a href="data/sky.json">sky.json</a>,
+            <a href="data/passes.json">passes.json</a>,
+            <a href="data/space_weather.json">space_weather.json</a>.
+          </p>
+        </div>
+      </noscript>
+
+      <!-- Raised by app.js when the page's data is older than the rebuild
+           cadence, i.e. when the scheduled job has probably stopped. -->
+      <div id="staleness-banner"></div>
+
+      <main>
       <!-- Populated by app.js. If the JSON cannot be loaded, each section
            replaces itself with an explicit error rather than sitting blank. -->
 
@@ -51,12 +116,12 @@
           observation time.
         </p>
         <div class="grid grid-tiles" id="weather-tiles"></div>
-        <div class="card" id="kp-chart-card" style="margin-top: 1rem"></div>
+        <div class="card chart-card" id="kp-chart-card"></div>
       </section>
 
       <section aria-labelledby="sky-heading">
         <h2 id="sky-heading">Sky view</h2>
-        <p class="section-note" id="sky-note">
+        <p class="section-note">
           Tracked satellites above the horizon at the time of the last build.
         </p>
         <div class="card" id="sky"></div>
@@ -64,7 +129,7 @@
 
       <section aria-labelledby="passes-heading">
         <h2 id="passes-heading">Next passes</h2>
-        <p class="section-note" id="passes-note">
+        <p class="section-note">
           Upcoming passes over the ground station, soonest first.
         </p>
         <div class="card" id="passes"></div>
@@ -80,16 +145,31 @@
         </p>
         <div class="card" id="health"></div>
       </section>
+      </main>
 
       <footer>
         <p id="build-info"></p>
         <p>
           Orbital elements from
-          <a href="https://celestrak.org/" rel="noopener">Celestrak</a>. Space
-          weather from
-          <a href="https://www.swpc.noaa.gov/" rel="noopener">NOAA SWPC</a>.
-          Positions computed with SGP4. This is a portfolio project, not an
+          <a href="https://celestrak.org/" target="_blank" rel="noopener noreferrer"
+            >Celestrak</a
+          >. Space weather from
+          <a
+            href="https://www.swpc.noaa.gov/"
+            target="_blank"
+            rel="noopener noreferrer"
+            >NOAA SWPC</a
+          >. Positions computed with SGP4. This is a portfolio project, not an
           operational tool &mdash; do not use it to plan anything real.
+        </p>
+        <p>
+          Built by Rodrigo Pimenta &middot;
+          <a
+            href="https://github.com/rodrigopimenta10/orbital-watch"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Source on GitHub</a
+          >
         </p>
       </footer>
     </div>

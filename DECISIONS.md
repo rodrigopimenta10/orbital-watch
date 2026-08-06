@@ -8,14 +8,14 @@ change my mind.
 
 ## 1. Frontend: plain HTML/CSS/JS, no build step
 
-**Decision.** Hand-written HTML, CSS, and one ES5-compatible JavaScript file.
-No framework, no bundler, no Node at build time or runtime.
+**Decision.** Hand-written HTML, CSS, and one JavaScript file. No framework,
+no bundler, no Node at build time or runtime.
 
 **Why.** The brief requires static output and no Node server at runtime. A
 framework would satisfy that too, but it buys nothing here and costs
 real things:
 
-- The dashboard is four panels of read-only data with one chart. There is no
+- The dashboard is five panels of read-only data with one chart. There is no
   client-side routing, no shared mutable state, and no component reuse worth
   abstracting. React would be more lines of configuration than of application.
 - A bundler means `node_modules`, a lockfile, and a build step that can rot
@@ -46,8 +46,8 @@ demonstrate stubbornness rather than judgement.
 
 `skyfield` also does not cost accuracy: it calls the same `sgp4` routines
 underneath, which is why the verification test in `tests/test_propagate.py`
-can check against the published Vallado vectors and match to sub-millimetre
-precision.
+can check against the published Vallado vectors and match them to within
+1 mm in position and 10 µm/s in velocity.
 
 **Deliberate limitation.** I use only topocentric satellite geometry, which
 needs no planetary ephemeris. Anything involving the Sun — visual-illumination
@@ -102,10 +102,17 @@ of scope (brief §4.2).
 Most-recent-epoch is the selection rule because those element sets carry the
 least propagation error.
 
-**Honest limitation, stated on the page.** This means "next passes" is the next
-pass among *tracked* objects, not among all Starlink. For the stations and
-weather groups the coverage is effectively complete (22 and 74 objects); only
-Starlink is sampled.
+**Honest limitation, stated on the page.** This means "next passes" is the
+next pass among *tracked* objects, not among every object in orbit. The page
+says so itself, with real numbers, under both tables: the build publishes
+per-group coverage in `meta.json` and the frontend renders it — currently
+"all 22 space stations, all 74 weather satellites, 60 of 10,894 starlink".
+
+Only Starlink is actually sampled. The stations and weather caps sit above
+the live group sizes, so those are complete. (An earlier revision capped
+weather at 60 against a live group of 74, silently dropping 14 while the
+documentation claimed only Starlink was sampled. The cap is now 90, and the
+page publishes the numbers so the claim is checkable rather than trusted.)
 
 ---
 
@@ -245,11 +252,27 @@ colour alone.
 **Decision.** Bar chart with a labelled G1 threshold line. Colour restates the
 NOAA severity band but carries no information the chart would otherwise lack.
 
-**Why.** Adjacent status colours measure **ΔE 13.6** on the normal-vision scale
-(validated, not eyeballed) — below the 15 floor, meaning full-colour readers
-can struggle to separate them. That rules colour out as a primary encoding.
+**Why.** Kp bands are an *ordered* scale, not a set of unrelated categories, so
+the fills are a sequential ramp rather than a categorical palette. Adjacent
+steps in a sequential ramp are supposed to resemble each other — that
+resemblance is what makes the ramp read as ordered — which means hue can never
+carry the distinction on its own. Measured on the shipped ramp, the worst
+adjacent pair separates by **ΔE 8.1** unsimulated and as little as **0.7 under
+protanopia** (OKLab ×100; measured with the palette validator, not estimated).
+Two bands a protanope cannot tell apart is not a hypothetical.
+
+So the ramp is stepped for **monotonic lightness** — quiet is the lightest step
+and severe the darkest on the light theme, inverted on dark — on top of the
+conventional green/amber/red hues. Severity therefore survives greyscale,
+every form of colour blindness, and a bad projector, because it is encoded in
+lightness as well as hue.
+
 Bar height, the y-axis, and the labelled threshold line carry the actual
-meaning; colour is reinforcement for the reader who already knows the bands.
+magnitude. Colour is reinforcement for the reader who already knows the bands.
+
+The badge colours are a separate, darker ramp: they sit behind 0.75rem text, so
+they are held to WCAG AA 4.5:1 against their own surface, which the chart fills
+are not (fills sit behind no text).
 
 The threshold label is left-anchored because the newest bars sit at the
 right-hand end — and during a storm, when the threshold matters most, they are

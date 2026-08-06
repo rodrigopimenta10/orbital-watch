@@ -130,11 +130,16 @@ survives. There is a test for exactly this.
 
 ### Degradation is proven, not asserted
 
-`tests/test_sources.py` breaks each of the seven sources in turn under multiple
-failure modes (timeout, DNS failure, HTTP 500, HTTP 403), then breaks all of
-them at once, and asserts every time that the build completes and writes a
-complete, parseable site. The full-blackout test additionally asserts that the
-health block reports everything failed rather than pretending otherwise.
+`tests/test_sources.py` exercises this at two levels. At the fetch layer it
+breaks a source under four failure modes (timeout, DNS failure, HTTP 500,
+HTTP 403), with and without a warm cache. At the build level it breaks each
+of the seven sources in turn under timeout and HTTP 500, then breaks all
+seven at once, and asserts every time that the build completes and writes a
+complete, parseable site. The full-blackout test additionally asserts that
+the health block reports everything failed rather than pretending otherwise.
+A further set feeds deliberately wrong-shaped payloads — a dict where a list
+belongs, a list of scalars, a bare string — from both upstream and a stale
+cache, because a cache written by older code is routinely read by newer code.
 
 You can watch it happen for real:
 
@@ -159,7 +164,7 @@ same check runs in CI on every push.
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/rodrigopimenta10/orbital-watch.git
 cd orbital-watch
 
 # Install dependencies (creates .venv automatically)
@@ -195,7 +200,7 @@ ORBITAL_WATCH_LON=15.4075 \
 ## Tests
 
 ```bash
-uv run pytest              # 106 tests
+uv run pytest              # 116 tests
 uv run ruff check .        # lint
 uv run ruff format --check .
 ```
