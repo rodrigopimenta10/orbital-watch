@@ -1,0 +1,446 @@
+/* Orbital Watch - static dashboard styling.
+ *
+ * Theme-aware: the OS preference is the default signal, and an explicit
+ * data-theme stamp on :root wins in both directions.
+ *
+ * Colour roles come from a validated palette. Status colours (good / warning /
+ * serious / critical) are reserved for source health and geomagnetic state and
+ * are never reused as decoration. They always ship alongside a text label, so
+ * state is never carried by colour alone.
+ */
+
+:root {
+  color-scheme: light;
+
+  --surface-1: #fcfcfb;
+  --page: #f9f9f7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.1);
+
+  --series-1: #2a78d6;
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --radius: 10px;
+  --gap: 1rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.1);
+    --series-1: #3987e5;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --page: #0d0d0d;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.1);
+  --series-1: #3987e5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 4rem;
+}
+
+/* ---------------------------------------------------------------- header */
+
+.masthead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.masthead h1 {
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.masthead .sub {
+  margin: 0.15rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.masthead-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+#theme-toggle {
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35rem 0.7rem;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+#theme-toggle:hover {
+  color: var(--text-primary);
+}
+
+/* ------------------------------------------------------------- structure */
+
+section {
+  margin-top: 1.75rem;
+}
+
+h2 {
+  margin: 0 0 0.15rem;
+  font-size: 1rem;
+  font-weight: 620;
+  letter-spacing: -0.005em;
+}
+
+.section-note {
+  margin: 0 0 0.75rem;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+}
+
+.grid {
+  display: grid;
+  gap: var(--gap);
+}
+
+.grid-tiles {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.grid-2 {
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+}
+
+/* ------------------------------------------------------------ stat tiles */
+
+.tile .label {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tile .value {
+  font-size: 1.9rem;
+  font-weight: 600;
+  line-height: 1.15;
+  margin-top: 0.3rem;
+}
+
+.tile .value .unit {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-left: 0.15rem;
+}
+
+.tile .meta {
+  margin-top: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+/* Provenance: every number says where it came from and how old it is. */
+.provenance {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  margin-top: 0.25rem;
+}
+
+/* ---------------------------------------------------------------- status */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* The glyph is a shape as well as a colour, so the state survives greyscale,
+ * colour-blindness, and forced-colors mode. The text label is always present. */
+.status .glyph {
+  font-size: 0.9em;
+  line-height: 1;
+}
+
+.status-fresh {
+  color: var(--status-good);
+}
+.status-stale {
+  color: var(--status-serious);
+}
+/* Geomagnetic "elevated" -- warning tier, distinct from the health scale. */
+.status-elevated {
+  color: var(--status-warning);
+}
+.status-failed {
+  color: var(--status-critical);
+}
+.status-unknown {
+  color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------- banners */
+
+.banner {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem;
+  background: var(--surface-1);
+}
+
+.banner h3 {
+  margin: 0 0 0.3rem;
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.banner p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.87rem;
+}
+
+.banner ul {
+  margin: 0.6rem 0 0;
+  padding-left: 1.1rem;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.banner li {
+  margin-bottom: 0.2rem;
+}
+
+.banner-quiet {
+  border-left-color: var(--status-good);
+}
+.banner-elevated {
+  border-left-color: var(--status-warning);
+}
+.banner-storm {
+  border-left-color: var(--status-critical);
+}
+.banner-unknown {
+  border-left-color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------- tables */
+
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+thead th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0 0.6rem 0.45rem;
+  border-bottom: 1px solid var(--grid);
+  white-space: nowrap;
+}
+
+tbody td {
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--grid);
+  white-space: nowrap;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.name {
+  font-weight: 550;
+}
+
+.dim {
+  color: var(--text-muted);
+}
+
+.group-tag {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.05rem 0.4rem;
+}
+
+/* ----------------------------------------------------------------- chart */
+
+.chart-wrap {
+  overflow-x: auto;
+}
+
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+.chart-caption {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  margin-top: 0.4rem;
+}
+
+/* ------------------------------------------------------------ health rows */
+
+.health-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.4fr) auto minmax(200px, 2fr);
+  gap: 0.6rem 1rem;
+  align-items: start;
+  padding: 0.65rem 0;
+  border-bottom: 1px solid var(--grid);
+}
+
+.health-row:last-child {
+  border-bottom: none;
+}
+
+.health-name {
+  font-weight: 550;
+  font-size: 0.87rem;
+}
+
+.health-url {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  word-break: break-all;
+}
+
+.health-detail {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.health-when {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.thresholds {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--grid);
+}
+
+/* ------------------------------------------------------------- empty/err */
+
+.empty {
+  color: var(--text-secondary);
+  font-size: 0.87rem;
+  padding: 0.75rem 0;
+}
+
+.error-box {
+  border-left: 4px solid var(--status-critical);
+}
+
+footer {
+  margin-top: 2.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+footer a {
+  color: var(--text-secondary);
+}
+
+@media (max-width: 620px) {
+  .health-row {
+    grid-template-columns: 1fr;
+  }
+  .tile .value {
+    font-size: 1.6rem;
+  }
+}

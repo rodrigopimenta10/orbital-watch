@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orbital Watch</title>
+    <meta
+      name="description"
+      content="Satellite passes over a ground station, correlated with live space-weather conditions."
+    />
+    <link rel="stylesheet" href="assets/style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#128225;</text></svg>"
+    />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="masthead">
+        <div>
+          <h1>Orbital Watch</h1>
+          <p class="sub" id="site-sub">
+            Satellite passes over a ground station, correlated with live
+            space-weather conditions.
+          </p>
+        </div>
+        <div class="masthead-right">
+          <span id="overall-status"></span>
+          <button id="theme-toggle" type="button" aria-label="Toggle colour theme">
+            Theme
+          </button>
+        </div>
+      </header>
+
+      <!-- Populated by app.js. If the JSON cannot be loaded, each section
+           replaces itself with an explicit error rather than sitting blank. -->
+
+      <section id="correlation-section" aria-labelledby="correlation-heading">
+        <h2 id="correlation-heading">Operational assessment</h2>
+        <p class="section-note">
+          Why a ground-segment team watches geomagnetic activity alongside its
+          pass schedule.
+        </p>
+        <div id="correlation"></div>
+      </section>
+
+      <section aria-labelledby="weather-heading">
+        <h2 id="weather-heading">Space weather</h2>
+        <p class="section-note">
+          Current conditions from NOAA SWPC. Every value carries its own
+          observation time.
+        </p>
+        <div class="grid grid-tiles" id="weather-tiles"></div>
+        <div class="card" id="kp-chart-card" style="margin-top: 1rem"></div>
+      </section>
+
+      <section aria-labelledby="sky-heading">
+        <h2 id="sky-heading">Sky view</h2>
+        <p class="section-note" id="sky-note">
+          Tracked satellites above the horizon at the time of the last build.
+        </p>
+        <div class="card" id="sky"></div>
+      </section>
+
+      <section aria-labelledby="passes-heading">
+        <h2 id="passes-heading">Next passes</h2>
+        <p class="section-note" id="passes-note">
+          Upcoming passes over the ground station, soonest first.
+        </p>
+        <div class="card" id="passes"></div>
+      </section>
+
+      <section aria-labelledby="health-heading">
+        <h2 id="health-heading">System health</h2>
+        <p class="section-note">
+          Per-source fetch state. A source is <strong>fresh</strong> inside its
+          freshness window, <strong>stale</strong> past it or when upstream was
+          unreachable this run, and <strong>failed</strong> beyond its staleness
+          limit or with no data at all.
+        </p>
+        <div class="card" id="health"></div>
+      </section>
+
+      <footer>
+        <p id="build-info"></p>
+        <p>
+          Orbital elements from
+          <a href="https://celestrak.org/" rel="noopener">Celestrak</a>. Space
+          weather from
+          <a href="https://www.swpc.noaa.gov/" rel="noopener">NOAA SWPC</a>.
+          Positions computed with SGP4. This is a portfolio project, not an
+          operational tool &mdash; do not use it to plan anything real.
+        </p>
+      </footer>
+    </div>
+
+    <script src="assets/app.js"></script>
+  </body>
+</html>
