@@ -1,0 +1,52 @@
+[project]
+name = "orbital-watch"
+version = "0.1.0"
+description = "Satellite pass tracking correlated with live space-weather conditions, served as a static site."
+readme = "README.md"
+authors = [
+    { name = "Rodrigo Pimenta", email = "rodrigopimenta102@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    # Sole runtime dependency. Wraps the reference SGP4 implementation and adds
+    # topocentric geometry plus rise/culminate/set search. See DECISIONS.md.
+    # HTTP is stdlib urllib -- no requests, no httpx.
+    "skyfield>=1.49",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter, not the linter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately reach into internals to simulate failure modes.
+"tests/*" = ["SLF001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning"]
