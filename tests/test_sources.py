@@ -19,9 +19,11 @@ from pathlib import Path
 
 import pytest
 
+from orbital_watch import health
 from orbital_watch.build import build_correlation, collect_space_weather, run_build
 from orbital_watch.config import (
     DATA_SUBDIR,
+    TLE_STALENESS,
     Observer,
     SatelliteGroup,
     StalenessPolicy,
@@ -745,9 +747,11 @@ def test_build_survives_a_cache_holding_the_wrong_shape(tmp_path, monkeypatch, p
         observer=OBSERVER,
     )
 
-    health = assert_site_is_complete(tmp_path / "dist")
-    assert health["overall"] == "failed"
-    assert health["counts"]["fresh"] == 0
+    report = assert_site_is_complete(tmp_path / "dist")
+    # With no seed available the wrong-shaped cache degrades all the way to
+    # "no data" -- the point is that it does so without crashing.
+    assert report["overall"] == "failed"
+    assert report["counts"]["fresh"] == 0
 
 
 def test_build_survives_upstream_serving_the_wrong_shape(tmp_path, monkeypatch):
@@ -818,3 +822,142 @@ def test_health_output_carries_notes_and_elapsed(tmp_path, monkeypatch):
         assert "notes" in source
         assert isinstance(source["notes"], list)
         assert source["elapsed_seconds"] is not None
+
+
+def test_oversized_response_is_rejected_not_buffered(tmp_path, monkeypatch):
+    """A giant body must degrade like any bad payload, not exhaust memory.
+
+    This is the one upstream failure the module cannot otherwise survive: an
+    OOM kill terminates the process before any handler runs, so the cache
+    fallback never happens and the build dies. Capping the read turns it into
+    an ordinary rejected payload.
+    """
+    from orbital_watch.sources import fetch as fetch_module
+
+    monkeypatch.setattr(fetch_module, "MAX_RESPONSE_BYTES", 1024)
+    monkeypatch.setattr("urllib.request.urlopen", responder({"big.json": b"x" * 4096}))
+
+    result = fetch_json("big", "https://example.invalid/big.json", tmp_path)
+
+    assert result.outcome is Outcome.FAILED
+    assert "exceeded" in result.error
+
+
+def test_oversized_response_falls_back_to_cache(tmp_path, monkeypatch):
+    """And with a warm cache it degrades to cached data rather than nothing."""
+    from orbital_watch.sources import fetch as fetch_module
+
+    monkeypatch.setattr("urllib.request.urlopen", responder({"big.json": {"good": True}}))
+    fetch_json("big", "https://example.invalid/big.json", tmp_path)
+
+    monkeypatch.setattr(fetch_module, "MAX_RESPONSE_BYTES", 16)
+    monkeypatch.setattr("urllib.request.urlopen", responder({"big.json": b"y" * 4096}))
+    result = fetch_json("big", "https://example.invalid/big.json", tmp_path)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert result.data == {"good": True}
+    # And the oversized body did not overwrite the good cache.
+    assert json.loads((tmp_path / "big.json").read_text()) == {"good": True}
+
+
+# --------------------------------------------------------------------------
+# Seed snapshot: the last resort when there is no cache at all
+# --------------------------------------------------------------------------
+
+
+def test_seed_carries_a_cold_build_with_no_network(tmp_path, monkeypatch, real_seed_dir):
+    """Cold cache plus dead upstream must still yield a populated site.
+
+    This is the Cloudflare Pages case: build containers are ephemeral, so
+    every deploy starts with an empty cache. Without a seed, one upstream
+    hiccup during a deploy publishes an empty dashboard.
+    """
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        responder({}, default=urllib.error.URLError("offline")),
+    )
+
+    meta = run_build(
+        cache_dir=tmp_path / "cache",
+        build_dir=tmp_path / "dist",
+        web_dir=tmp_path / "nonexistent-web",
+        observer=OBSERVER,
+    )
+
+    health = assert_site_is_complete(tmp_path / "dist")
+
+    assert meta["counts"]["tracked_satellites"] > 0, "seed did not populate the build"
+    assert all(s["outcome"] == "seed" for s in health["sources"])
+    # Never fresh: a seed means we reached nobody.
+    assert health["counts"]["fresh"] == 0
+    assert all("not live" in s["detail"] for s in health["sources"])
+
+
+def test_seed_is_never_reported_as_fresh(tmp_path, monkeypatch):
+    """Even a snapshot captured seconds ago is not 'fresh'.
+
+    Freshness means we reached upstream. A seed is served precisely because we
+    could not, so recency of the snapshot is beside the point.
+    """
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir()
+    now = datetime.now(UTC)
+    (seed_dir / "demo.json").write_text(json.dumps([{"a": 1}]))
+    (seed_dir / "manifest.json").write_text(
+        json.dumps({"sources": {"demo": {"retrieved_at": now.isoformat()}}})
+    )
+
+    from orbital_watch.sources import fetch as fetch_module
+
+    monkeypatch.setattr(fetch_module, "SEED_DIR", seed_dir)
+    monkeypatch.setattr(
+        "urllib.request.urlopen", responder({}, default=TimeoutError("gone"))
+    )
+
+    result = fetch_json("demo", "https://example.invalid/demo.json", tmp_path / "c")
+    assert result.outcome is Outcome.SEED
+    assert result.ok
+
+    report = health.evaluate(result, TLE_STALENESS, label="Demo")
+    assert report.state is not health.State.FRESH
+    assert report.state is health.State.STALE
+
+
+def test_cache_is_preferred_over_seed(tmp_path, monkeypatch):
+    """A real cached payload always beats the committed snapshot."""
+    monkeypatch.setattr(
+        "urllib.request.urlopen", responder({"gp.php": [{"OBJECT_NAME": "CACHED"}]})
+    )
+    fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen", responder({}, default=TimeoutError("gone"))
+    )
+    result = fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert result.data == [{"OBJECT_NAME": "CACHED"}]
+
+
+def test_seed_with_a_stale_shape_is_rejected(tmp_path, monkeypatch):
+    """A snapshot whose shape predates the current parser is not usable."""
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir()
+    (seed_dir / "demo.json").write_text(json.dumps({"old": "shape"}))
+
+    from orbital_watch.sources import fetch as fetch_module
+
+    monkeypatch.setattr(fetch_module, "SEED_DIR", seed_dir)
+    monkeypatch.setattr(
+        "urllib.request.urlopen", responder({}, default=TimeoutError("gone"))
+    )
+
+    def _needs_a_list(data):
+        if not isinstance(data, list):
+            raise ValueError("expected a list")
+        return data
+
+    result = fetch_json(
+        "demo", "https://example.invalid/demo.json", tmp_path / "c", parser=_needs_a_list
+    )
+    assert result.outcome is Outcome.FAILED

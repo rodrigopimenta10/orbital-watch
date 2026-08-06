@@ -31,6 +31,14 @@ WEB_DIR = REPO_ROOT / "web"
 #: Build output. Static files + generated JSON; this is what gets deployed.
 BUILD_DIR = Path(os.environ.get("ORBITAL_WATCH_BUILD", REPO_ROOT / "dist"))
 
+#: Committed last-resort snapshot, used when there is no cache AND upstream
+#: is unreachable. Build environments without persistent disk (Cloudflare
+#: Pages containers are ephemeral) start cold every time, so without this a
+#: single upstream hiccup during a deploy would publish an empty site.
+#: Its manifest records each snapshot's true capture time, so the health
+#: panel ages it honestly rather than presenting it as current.
+SEED_DIR = Path(os.environ.get("ORBITAL_WATCH_SEED", REPO_ROOT / "seed"))
+
 #: Generated JSON lands here, under the build dir.
 DATA_SUBDIR = "data"
 

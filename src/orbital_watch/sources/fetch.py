@@ -29,7 +29,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from orbital_watch.config import HTTP_TIMEOUT_SECONDS, USER_AGENT
+from orbital_watch.config import HTTP_TIMEOUT_SECONDS, SEED_DIR, USER_AGENT
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,10 @@ class Outcome(StrEnum):
     CACHE_FRESH = "cache_fresh"
     #: Upstream failed; we served cache instead. Degraded but serving.
     CACHE_FALLBACK = "cache_fallback"
-    #: Upstream failed and there was no cache. No data at all.
+    #: Upstream failed, no cache existed, so we served the committed snapshot.
+    #: Renders something real but is by definition old -- see SEED_DIR.
+    SEED = "seed"
+    #: Upstream failed and there was nothing to fall back on. No data at all.
     FAILED = "failed"
 
 
@@ -81,6 +84,17 @@ class FetchResult:
 # build or -- much worse -- overwrites a good cache with a sentence. We detect
 # it and treat it as not-modified.
 _NOT_UPDATED_MARKER = "has not updated since your last successful"
+
+#: Ceiling on a single response body. The largest thing we legitimately fetch
+#: is the Starlink GP group at roughly 5 MB, so this leaves ample headroom
+#: while keeping a hostile or malfunctioning upstream from exhausting memory.
+#: An OOM kill is the one failure this module cannot convert into a cache
+#: fallback, because the process dies before any handler runs.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+#: Error bodies are only inspected for the Celestrak sentinel in their first
+#: few hundred characters, so they need far less room.
+_ERROR_BODY_BYTES = 64 * 1024
 
 
 class _CacheEntry:
@@ -230,7 +244,7 @@ def fetch_json(
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8", errors="replace")
+                raw = _read_capped(response).decode("utf-8", errors="replace")
         except urllib.error.HTTPError as http_error:
             # Celestrak serves the not-updated sentinel with a 403 status, not
             # a 200, so the body has to be inspected on the error path too.
@@ -324,8 +338,34 @@ def fetch_json(
                 notes=["Upstream unreachable; serving last cached payload."],
             )
 
+        seed_data, seed_time = _read_seed(name, parser)
+        if seed_data is not None:
+            log.warning(
+                "source=%s outcome=seed elapsed=%.3fs error=%s "
+                "(no cache; serving committed snapshot from %s)",
+                name,
+                elapsed,
+                detail,
+                seed_time.isoformat() if seed_time else "unknown",
+            )
+            return FetchResult(
+                name=name,
+                url=url,
+                data=seed_data,
+                outcome=Outcome.SEED,
+                last_success=seed_time,
+                elapsed_seconds=elapsed,
+                error=detail,
+                notes=[
+                    "Upstream unreachable and no cache exists; serving the "
+                    "committed seed snapshot. This is real data but it is not "
+                    "current, and the age below is its true capture time."
+                ],
+            )
+
         log.error(
-            "source=%s outcome=failed elapsed=%.3fs error=%s (no cache available)",
+            "source=%s outcome=failed elapsed=%.3fs error=%s "
+            "(no cache and no seed available)",
             name,
             elapsed,
             detail,
@@ -345,10 +385,89 @@ class _NotModified(Exception):
     """Upstream declined to send new data because nothing has changed."""
 
 
-def _read_error_body(error: urllib.error.HTTPError) -> str:
-    """Best-effort read of an HTTPError's body. Never raises."""
+def _read_seed(name: str, parser: Any) -> tuple[Any | None, datetime | None]:
+    """Load the committed snapshot for ``name``, or (None, None).
+
+    The seed exists for build environments with no persistent disk between
+    runs -- Cloudflare Pages containers are ephemeral, so every build starts
+    with a cold cache. Without a seed, one upstream hiccup during a deploy
+    publishes an empty site, which is precisely the failure this project is
+    built to avoid.
+
+    It is honest by construction rather than by disclaimer: the manifest
+    records each snapshot's true capture time, and that timestamp is what the
+    health panel classifies. A months-old seed therefore reports FAILED on age
+    automatically -- the page shows real satellites while stating plainly that
+    the data is not current.
+    """
+    path = SEED_DIR / f"{name}.json"
+    if not path.exists():
+        return None, None
     try:
-        return error.read().decode("utf-8", errors="replace")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("seed read failed path=%s error=%s", path, exc)
+        return None, None
+
+    if parser is not None:
+        try:
+            data = parser(data)
+        except Exception as exc:
+            log.warning("seed rejected by validator path=%s error=%s", path, exc)
+            return None, None
+
+    return data, _seed_captured_at(name)
+
+
+def _seed_captured_at(name: str) -> datetime | None:
+    """True capture time of a seed entry, from the committed manifest."""
+    try:
+        manifest = json.loads((SEED_DIR / "manifest.json").read_text(encoding="utf-8"))
+        raw = manifest["sources"][name]["retrieved_at"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+
+
+def _read_capped(response: Any, limit: int | None = None) -> bytes:
+    """Read at most ``limit`` bytes, rejecting anything larger.
+
+    An unbounded ``read()`` is the one failure mode this module's contract
+    cannot survive. Every other upstream problem raises an exception that the
+    handler below turns into a cache fallback; a multi-gigabyte body instead
+    gets the process OOM-killed, which is not catchable. The build dies, no
+    fallback happens, and the property this project exists to demonstrate
+    fails -- not because of a bug in the logic, but because the logic never
+    got to run.
+
+    Raising ValueError routes an oversized body through the normal rejected-
+    payload path, so it degrades to cached data like any other bad response.
+
+    The cap is read from the module at call time rather than bound as a default
+    argument, so it stays a single tunable value rather than one frozen when
+    this function was defined.
+    """
+    limit = MAX_RESPONSE_BYTES if limit is None else limit
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError(
+            f"response exceeded the {limit // (1024 * 1024)} MB cap; refusing to buffer it"
+        )
+    return body
+
+
+def _read_error_body(error: urllib.error.HTTPError) -> str:
+    """Best-effort read of an HTTPError's body. Never raises.
+
+    Only the first few hundred characters are ever inspected (for Celestrak's
+    not-updated sentinel), so this is capped far tighter than a success body.
+    """
+    try:
+        return error.read(_ERROR_BODY_BYTES).decode("utf-8", errors="replace")
     except Exception:
         # Diagnostic read only; a failure here must not mask the original error.
         return ""

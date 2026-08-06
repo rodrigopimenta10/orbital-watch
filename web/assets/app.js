@@ -25,8 +25,53 @@
    * to the hourly cadence so a single missed run is not alarming. */
   var REBUILD_ALARM_SECONDS = 3 * 3600;
 
-  /* Relative times ("in 4m") drift on a tab left open. Re-render them. */
+  /* Relative times ("in 4m") drift on a tab left open, and recomputed source
+   * states go out of date. Both need refreshing -- but re-rendering the page
+   * to do it destroys everything the user was doing: an open <details> snaps
+   * shut mid-paragraph, keyboard focus inside a scroll region is dropped, and
+   * horizontal scroll jumps back to column one. So the tick updates only the
+   * volatile text, in place, through the registry below. */
   var RETICK_MS = 30000;
+
+  /* Closures that refresh one piece of volatile text. Registered during
+   * render, replayed on every tick. Cleared before a full re-render so they
+   * cannot accumulate or point at detached nodes. */
+  var tickables = [];
+
+  function onTick(fn) {
+    tickables.push(fn);
+  }
+
+  function runTicks(now) {
+    for (var i = 0; i < tickables.length; i += 1) {
+      try {
+        tickables[i](now);
+      } catch (error) {
+        // One stale closure must not stop the rest from updating.
+        if (window.console) console.error("tick failed", error);
+      }
+    }
+  }
+
+  /** A node whose text is recomputed from the clock on every tick. */
+  function live(tag, className, compute) {
+    var node = el(tag, className, compute(new Date()));
+    onTick(function (now) {
+      node.textContent = compute(now);
+    });
+    return node;
+  }
+
+  /** A holder whose contents are rebuilt from the clock on every tick. */
+  function liveNode(tag, className, build) {
+    var holder = el(tag, className);
+    holder.appendChild(build(new Date()));
+    onTick(function (now) {
+      clear(holder);
+      holder.appendChild(build(now));
+    });
+    return holder;
+  }
 
   // ---------------------------------------------------------------- utils
 
@@ -39,6 +84,11 @@
 
   function clear(node) {
     while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  /** Own-property test. Bare `obj[key]` also finds "constructor", "toString". */
+  function has(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
   }
 
   /** Fetch JSON, resolving to {ok, data, error} rather than throwing. */
@@ -84,7 +134,12 @@
   /** Format a number, or "—" if it is missing or not finite. */
   function num(value, digits) {
     if (typeof value !== "number" || !isFinite(value)) return "—";
-    return value.toFixed(digits === undefined ? 0 : digits);
+    var places = digits === undefined ? 0 : digits;
+    var text = value.toFixed(places);
+    // (-0.04).toFixed(1) is "-0.0" and (-0.4).toFixed(0) is "-0". NOAA reports
+    // Bz values that small routinely, and "-0.0 nT" reads as a rendering bug.
+    if (/^-0(\.0*)?$/.test(text)) text = text.slice(1);
+    return text;
   }
 
   /** Thousands-separated integer, locale-stable so it reads the same anywhere. */
@@ -102,6 +157,7 @@
   }
 
   function humanDuration(seconds) {
+    if (typeof seconds !== "number" || !isFinite(seconds)) return "unknown";
     var s = Math.abs(Math.round(seconds));
     if (s < 60) return s + "s";
     if (s < 3600) return Math.floor(s / 60) + "m";
@@ -155,7 +211,7 @@
   }
 
   function statusBadge(state) {
-    var key = STATUS_GLYPH[state] ? state : "unknown";
+    var key = has(STATUS_GLYPH, state) ? state : "unknown";
     return badge("status-" + key, STATUS_GLYPH[key], key);
   }
 
@@ -171,7 +227,7 @@
   };
 
   function severityBadge(severity) {
-    var spec = SEVERITY[severity] || SEVERITY.unknown;
+    var spec = has(SEVERITY, severity) ? SEVERITY[severity] : SEVERITY.unknown;
     return badge(spec.cls, spec.glyph, spec.label);
   }
 
@@ -189,15 +245,27 @@
   // panel stays honest no matter how long the page outlives its build.
 
   function stateNow(source, now) {
-    if (!source || !source.last_success) return "failed";
+    if (!source) return "failed";
+
+    // Mirrors health.py::_classify step 1 -- no data at all is FAILED. The
+    // build always pairs a null payload with a null last_success, and it
+    // records the state it computed, so trust that here.
+    if (source.state === "failed" && !source.last_success) return "failed";
+
     var t = parseTime(source.last_success);
-    if (!t) return "failed";
+    if (!t) {
+      // health.py step 2: data we cannot date is STALE, not failed -- we are
+      // serving something real, we just cannot say how old it is. Reporting
+      // "failed" here would also make the divergence note below blame elapsed
+      // time for a state that has nothing to do with elapsed time.
+      return source.state === "failed" ? "failed" : "stale";
+    }
 
     var thresholds = source.thresholds || {};
     var fresh = thresholds.fresh_within_seconds;
     var stale = thresholds.stale_within_seconds;
     if (typeof fresh !== "number" || typeof stale !== "number") {
-      return source.state || "unknown";
+      return has(STATUS_GLYPH, source.state) ? source.state : "unknown";
     }
 
     var age = (now - t) / 1000;
@@ -209,9 +277,12 @@
     return "fresh";
   }
 
+  /* Worst-first. "unknown" outranks "fresh": a source we cannot assess must
+   * never let the top-level badge claim everything is fine. */
   function worstState(states) {
     if (states.indexOf("failed") !== -1) return "failed";
     if (states.indexOf("stale") !== -1) return "stale";
+    if (states.indexOf("unknown") !== -1) return "unknown";
     return states.length ? "fresh" : "unknown";
   }
 
@@ -412,7 +483,7 @@
     clear(card);
     var w = payload.weather || {};
     var history = (w.kp_history || []).filter(function (p) {
-      return p && typeof p.kp === "number" && isFinite(p.kp);
+      return p && typeof p.kp === "number" && isFinite(p.kp) && parseTime(p.time);
     });
 
     card.appendChild(el("div", "label", "Planetary Kp — recent history"));
@@ -481,7 +552,9 @@
     var barW = Math.max(3, slot - 2);
 
     history.forEach(function (point, index) {
-      var kp = point.kp;
+      // Clamped: NOAA caps Kp at 9, but a bar drawn from an out-of-range value
+      // would escape the viewBox and be silently clipped rather than noticed.
+      var kp = Math.max(0, Math.min(maxKp, point.kp));
       var barH = Math.max(1, (kp / maxKp) * plotH);
       var x = pad.left + index * slot + (slot - barW) / 2;
       var rect = svgEl("rect", {
@@ -493,7 +566,7 @@
         fill: kpColor(kp),
       });
       var title = svgEl("title");
-      title.textContent = utcStamp(point.time) + " — Kp " + num(kp, 2);
+      title.textContent = utcStamp(point.time) + " — Kp " + num(point.kp, 2);
       rect.appendChild(title);
       svg.appendChild(rect);
     });
@@ -725,6 +798,13 @@
               "system health below."
         )
       );
+      container.appendChild(
+        el(
+          "div",
+          "provenance",
+          "Generated " + utcStamp(payload.generated_at) + " UTC."
+        )
+      );
       return;
     }
 
@@ -747,7 +827,17 @@
       row.appendChild(el("td", "name", p.name || "unknown"));
       row.appendChild(groupTag(p.group || "—"));
       row.appendChild(el("td", null, utcStamp(p.start).slice(0, 16)));
-      row.appendChild(el("td", "num dim", relative(p.start, now)));
+      row.appendChild(
+        live("td", "num dim", function (t) {
+          var start = parseTime(p.start);
+          var end = parseTime(p.end);
+          // A pass that has begun but not ended is neither "in 3m" nor
+          // "3m ago" -- it is happening. Saying so is both accurate and the
+          // most operationally useful thing the column can show.
+          if (start && end && start <= t && t <= end) return "in progress";
+          return relative(p.start, t);
+        })
+      );
       row.appendChild(el("td", "num", num(p.peak_elevation_deg, 0) + "°"));
       row.appendChild(el("td", "num", num(p.duration_minutes, 1) + " min"));
       row.appendChild(
@@ -761,6 +851,11 @@
             (p.end_compass || "?")
         )
       );
+      // The table is built once; rows retire themselves as time passes.
+      onTick(function (t) {
+        var end = parseTime(p.end);
+        row.hidden = !!(end && end < t);
+      });
       built.tbody.appendChild(row);
     });
 
@@ -776,11 +871,23 @@
           " h ahead from the last build at " +
           utcStamp(payload.generated_at) +
           " UTC." +
-          (elapsed
-            ? " " + elapsed + " pass(es) from this build have already elapsed " +
-              "and are hidden."
-            : "")
+          ""
       )
+    );
+    container.appendChild(
+      live("div", "provenance", function (t) {
+        var gone = all.filter(function (item) {
+          var end = parseTime(item.end);
+          return end && end < t;
+        }).length;
+        if (!gone) return "";
+        return (
+          gone +
+          " of " +
+          all.length +
+          " passes in this build have already elapsed and are hidden."
+        );
+      })
     );
     var note = coverageNote(meta);
     if (note) container.appendChild(el("div", "provenance", note));
@@ -801,13 +908,9 @@
       return;
     }
 
-    var counts = { fresh: 0, stale: 0, failed: 0 };
-
+    // Per-state counts are computed by the live summary at the foot of this
+    // panel rather than here, so they stay correct as states age.
     sources.forEach(function (source) {
-      var live = stateNow(source, now);
-      if (counts[live] === undefined) counts[live] = 0;
-      counts[live] += 1;
-
       var row = el("div", "health-row");
 
       var left = el("div");
@@ -816,34 +919,44 @@
       row.appendChild(left);
 
       var middle = el("div");
-      middle.appendChild(statusBadge(live));
       middle.appendChild(
-        el(
-          "div",
-          "health-when",
-          source.last_success ? relative(source.last_success, now) : "never succeeded"
-        )
+        liveNode("div", null, function (t) {
+          return statusBadge(stateNow(source, t));
+        })
+      );
+      middle.appendChild(
+        live("div", "health-when", function (t) {
+          return source.last_success
+            ? relative(source.last_success, t)
+            : "never succeeded";
+        })
       );
       row.appendChild(middle);
 
       var right = el("div");
-      right.appendChild(el("div", "health-detail", source.detail || ""));
+      // Prefixed deliberately. This sentence was written by the build and can
+      // contain an age baked into the text ("cache is 1h 3m old"), which would
+      // otherwise sit next to a live, ticking age and contradict it. Saying
+      // whose account it is reconciles the two honestly.
+      if (source.detail) {
+        right.appendChild(el("div", "health-detail", "At build: " + source.detail));
+      }
 
       // If age has pushed the state past what the build recorded, say so
       // rather than silently disagreeing with the detail text above.
-      if (source.state && live !== source.state) {
-        right.appendChild(
-          el(
-            "div",
-            "health-when",
+      right.appendChild(
+        live("div", "health-when", function (t) {
+          var current = stateNow(source, t);
+          if (!source.state || current === source.state) return "";
+          return (
             "Recomputed in-browser: was " +
-              source.state +
-              " at build time, now " +
-              live +
-              " given the elapsed time."
-          )
-        );
-      }
+            source.state +
+            " at build time, now " +
+            current +
+            "."
+          );
+        })
+      );
 
       if (source.last_success) {
         right.appendChild(
@@ -865,7 +978,8 @@
             humanSeconds(thresholds.stale_within_seconds) +
             " · outcome: " +
             (source.outcome || "unknown") +
-            (typeof source.elapsed_seconds === "number"
+            (typeof source.elapsed_seconds === "number" &&
+            isFinite(source.elapsed_seconds)
               ? " · fetched in " + source.elapsed_seconds.toFixed(2) + "s"
               : "")
         )
@@ -879,26 +993,34 @@
     });
 
     container.appendChild(
-      el(
-        "div",
-        "thresholds",
-        "Overall: " +
-          worstState(
-            sources.map(function (s) {
-              return stateNow(s, now);
-            })
-          ) +
+      live("div", "thresholds", function (t) {
+        var states = sources.map(function (source) {
+          return stateNow(source, t);
+        });
+        var tally = { fresh: 0, stale: 0, failed: 0, unknown: 0 };
+        states.forEach(function (state) {
+          if (has(tally, state)) tally[state] += 1;
+          else tally.unknown += 1;
+        });
+        var parts = [
+          tally.fresh + " fresh",
+          tally.stale + " stale",
+          tally.failed + " failed",
+        ];
+        // Only mentioned when non-zero, but never silently dropped from the
+        // count -- rows that render must be accounted for in the total.
+        if (tally.unknown) parts.push(tally.unknown + " unknown");
+        return (
+          "Overall: " +
+          worstState(states) +
           " — " +
-          counts.fresh +
-          " fresh, " +
-          counts.stale +
-          " stale, " +
-          counts.failed +
-          " failed. Thresholds are build-time constants, published here so the " +
-          "state is checkable rather than asserted. States are recomputed in " +
-          "your browser from the timestamps above, so they stay truthful even " +
-          "if the scheduled rebuild stops."
-      )
+          parts.join(", ") +
+          ". Thresholds are build-time constants, published here so the state " +
+          "is checkable rather than asserted. States are recomputed in your " +
+          "browser from the timestamps above, so they stay truthful even if " +
+          "the scheduled rebuild stops."
+        );
+      })
     );
   }
 
@@ -936,60 +1058,89 @@
     var health = results[4];
     var now = new Date();
 
+    // Anything registered by a previous render points at DOM that is about to
+    // be replaced. Drop it so closures cannot accumulate across renders.
+    tickables.length = 0;
+
     var metaData = meta.ok ? meta.data : null;
 
     if (metaData && metaData.observer) {
       var o = metaData.observer;
-      document.getElementById("site-sub").textContent =
-        "Ground station: " +
-        o.name +
-        " (" +
-        num(o.latitude_deg, 4) +
-        "°, " +
-        num(o.longitude_deg, 4) +
-        "°) · built " +
-        utcStamp(metaData.generated_at) +
-        " UTC (" +
-        relative(metaData.generated_at, now) +
-        ")";
+      var subEl = document.getElementById("site-sub");
+      var infoEl = document.getElementById("build-info");
 
-      document.getElementById("build-info").textContent =
-        "Data generated " +
-        utcStamp(metaData.generated_at) +
-        " UTC (" +
-        relative(metaData.generated_at, now) +
-        ") in " +
-        num(metaData.build_seconds, 2) +
-        "s. This page is static: it reads pre-generated JSON and makes no " +
-        "upstream calls, so an upstream outage cannot take it down — it only " +
-        "makes the data below older, which the health panel reports.";
-    } else if (!meta.ok) {
-      document.getElementById("build-info").textContent =
-        "Build metadata could not be loaded (" +
-        meta.error +
-        "), so the generation time is unknown.";
+      function subText(t) {
+        return (
+          "Ground station: " +
+          o.name +
+          " (" +
+          num(o.latitude_deg, 4) +
+          "°, " +
+          num(o.longitude_deg, 4) +
+          "°) · built " +
+          utcStamp(metaData.generated_at) +
+          " UTC (" +
+          relative(metaData.generated_at, t) +
+          ")"
+        );
+      }
+
+      function infoText(t) {
+        return (
+          "Data generated " +
+          utcStamp(metaData.generated_at) +
+          " UTC (" +
+          relative(metaData.generated_at, t) +
+          ") in " +
+          num(metaData.build_seconds, 2) +
+          "s. This page is static: it reads pre-generated JSON and makes no " +
+          "upstream calls, so an upstream outage cannot take it down — it only " +
+          "makes the data below older, which the health panel reports."
+        );
+      }
+
+      subEl.textContent = subText(now);
+      infoEl.textContent = infoText(now);
+      onTick(function (t) {
+        subEl.textContent = subText(t);
+        infoEl.textContent = infoText(t);
+      });
+    } else {
+      document.getElementById("build-info").textContent = meta.ok
+        ? "Build metadata loaded but did not contain an observer block, so the " +
+          "ground station and generation time cannot be shown."
+        : "Build metadata could not be loaded (" +
+          meta.error +
+          "), so the generation time is unknown.";
     }
 
-    guard(document.getElementById("staleness-banner"), "Staleness check", function () {
-      renderStalenessBanner(
-        document.getElementById("staleness-banner"),
-        metaData,
-        now
-      );
+    var stalenessEl = document.getElementById("staleness-banner");
+    guard(stalenessEl, "Staleness check", function () {
+      renderStalenessBanner(stalenessEl, metaData, now);
+      onTick(function (t) {
+        renderStalenessBanner(stalenessEl, metaData, t);
+      });
     });
+
+    var healthSources =
+      health.ok && health.data && Array.isArray(health.data.sources)
+        ? health.data.sources
+        : null;
 
     var overall = document.getElementById("overall-status");
     clear(overall);
     overall.appendChild(
-      statusBadge(
-        health.ok
-          ? worstState(
-              (health.data.sources || []).map(function (s) {
-                return stateNow(s, now);
-              })
-            )
-          : "unknown"
-      )
+      liveNode("span", null, function (t) {
+        return statusBadge(
+          healthSources
+            ? worstState(
+                healthSources.map(function (source) {
+                  return stateNow(source, t);
+                })
+              )
+            : "unknown"
+        );
+      })
     );
 
     var correlationEl = document.getElementById("correlation");
@@ -1009,12 +1160,20 @@
     } else {
       showError(
         correlationEl,
+        "Operational assessment unavailable",
+        weather.error +
+          ". Space weather could not be loaded, so no geomagnetic assessment " +
+          "can be made."
+      );
+      // The error must also appear in the Space weather section itself --
+      // otherwise that heading renders above an empty void with no reason.
+      clear(tilesEl);
+      chartEl.style.display = "";
+      showError(
+        chartEl,
         "Space weather data could not be loaded",
         weather.error + ". The build may not have run, or the file is missing."
       );
-      clear(tilesEl);
-      clear(chartEl);
-      chartEl.style.display = "none";
     }
 
     var skyEl = document.getElementById("sky");
@@ -1063,13 +1222,11 @@
     ])
       .then(function (results) {
         render(results);
-        // Relative times and recomputed states drift on a tab left open.
+        // Refresh only the volatile text. A full re-render here would collapse
+        // an open <details>, drop keyboard focus out of a scroll region, and
+        // reset horizontal scroll -- every 30 seconds, forever.
         window.setInterval(function () {
-          try {
-            render(results);
-          } catch (e) {
-            /* a re-render fault must not kill the already-rendered page */
-          }
+          runTicks(new Date());
         }, RETICK_MS);
       })
       .catch(function (error) {

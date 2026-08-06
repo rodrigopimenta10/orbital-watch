@@ -37,6 +37,31 @@ def block_network(monkeypatch):
     return _forbidden
 
 
+@pytest.fixture(autouse=True)
+def isolate_seed(monkeypatch, tmp_path_factory):
+    """Point the seed directory at an empty dir unless a test opts in.
+
+    The committed ``seed/`` snapshot is a deployment feature: it keeps a build
+    with no persistent cache from publishing an empty site. But it would also
+    quietly rescue every degradation test, turning "upstream is down and we
+    have nothing" into "upstream is down and we served the snapshot" — so the
+    hard-failure paths would stop being covered at all.
+
+    Tests that mean to exercise the seed set ``SEED_DIR`` themselves.
+    """
+    empty = tmp_path_factory.mktemp("no-seed")
+    monkeypatch.setattr("orbital_watch.sources.fetch.SEED_DIR", empty)
+    return empty
+
+
+@pytest.fixture
+def real_seed_dir(monkeypatch) -> Path:
+    """Opt back in to the committed seed snapshot."""
+    seed = Path(__file__).parent.parent / "seed"
+    monkeypatch.setattr("orbital_watch.sources.fetch.SEED_DIR", seed)
+    return seed
+
+
 def load_fixture(name: str):
     """Load a committed fixture captured from the real upstream API."""
     return json.loads((FIXTURES / name).read_text())

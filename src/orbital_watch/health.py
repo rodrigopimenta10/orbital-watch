@@ -140,9 +140,10 @@ def _classify(
     # Data can be both old *and* cut off from upstream. Reporting only the age
     # would hide the more actionable half -- an operator wants to know we have
     # lost contact, not just that the numbers are old.
+    lost_contact_outcomes = (Outcome.CACHE_FALLBACK, Outcome.SEED)
     contact_lost = (
         f" Upstream was also unreachable this run ({result.error})."
-        if result.outcome == Outcome.CACHE_FALLBACK
+        if result.outcome in lost_contact_outcomes
         else ""
     )
 
@@ -166,6 +167,19 @@ def _classify(
         )
 
     # 4. Young data, but did we actually reach upstream this run?
+    if result.outcome == Outcome.SEED:
+        # Never FRESH, even if the snapshot happens to be recent. A seed is
+        # served only when upstream was unreachable *and* no cache existed --
+        # we are as out of contact as it is possible to be, and the committed
+        # snapshot will drift further from reality with every day it is used.
+        return (
+            State.STALE,
+            age,
+            f"Upstream unreachable and no cache available ({result.error}); "
+            f"serving the committed seed snapshot captured {age_text} ago. "
+            f"This is real data but it is not live.",
+        )
+
     if result.outcome == Outcome.CACHE_FALLBACK:
         return (
             State.STALE,
