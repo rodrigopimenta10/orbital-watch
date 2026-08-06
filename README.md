@@ -322,21 +322,48 @@ Type    Name       Target
 CNAME   orbital    <project>.pages.dev
 ```
 
-### 3. Add the hourly rebuild
+### 3. Add the scheduled refresh
 
-Cloudflare rebuilds on every push, but the data needs refreshing on a
-schedule too. That is a **deploy hook**:
+Cloudflare rebuilds on every push, but the data needs refreshing on a schedule
+too. That is a **Cloudflare Worker Cron Trigger** in `infra/refresh-worker/`,
+which POSTs a Pages **deploy hook** every two hours.
 
-1. **Pages project → Settings → Builds & deployments → Deploy hooks →**
-   create one for `main`. Cloudflare gives you a URL.
-2. That URL is a capability — anyone holding it can trigger a build — so it
-   goes in **GitHub → Settings → Secrets and variables → Actions** as
-   `CLOUDFLARE_DEPLOY_HOOK`, never in the repository.
+1. **Pages project → Settings → Builds & deployments → Deploy hooks →** create
+   one for `main`. Cloudflare gives you a URL.
+2. Deploy the Worker and give it that URL as a secret:
 
-`.github/workflows/update-data.yml` then POSTs to it hourly. The workflow
-declares `permissions: {}` and uses no third-party actions, because pinging a
-URL needs neither. Without the secret the workflow fails with an explanatory
-message and the site simply stops refreshing hourly — pushes still deploy.
+   ```bash
+   cd infra/refresh-worker
+   npx wrangler secret put DEPLOY_HOOK     # paste the deploy hook URL
+   npx wrangler secret put GITHUB_TOKEN    # optional, see below
+   npx wrangler deploy
+   ```
+
+The hook URL is a capability — anyone holding it can trigger a build — so it
+lives only as a Worker secret, never in the repository.
+
+**Why the scheduler is on Cloudflare rather than GitHub Actions.** It used to
+be an Actions cron. On 2026-08-06 Actions went into a major outage, the site's
+data went stale for more than three hours, and the staleness banner fired —
+while Cloudflare, which actually serves the site, was healthy throughout. Only
+the scheduler was down, and it took the freshness story with it. Worse, that
+workflow had never fired once in its entire life: `gh run list` showed zero
+runs. Host and scheduler now live on the same platform, so a refresh can only
+stop for a reason that would have taken the site down anyway. See
+[DECISIONS.md](DECISIONS.md) §14.
+
+**The Worker also watches the watchman.** After triggering, it reads the
+deployed `/data/health.json` and compares `generated_at` to now. Because the
+build it just started cannot have finished, that timestamp describes the
+*previous* cycle — which is exactly the question worth asking: did the last
+refresh actually publish? If the data is older than three times the cadence it
+reports loudly, opening a GitHub issue when `GITHUB_TOKEN` is set and logging
+at error level regardless. Without that check the only signal that refreshes
+had stopped was a visitor noticing the banner, which is how the original
+outage was found.
+
+`ci.yml` stays on GitHub Actions. Tests and linting belong with the code host;
+it is only the production refresh path that must not depend on it.
 
 ### Why the build fetches its own data
 

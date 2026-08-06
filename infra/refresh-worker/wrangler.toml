@@ -1,0 +1,38 @@
+# Scheduler for the site's data refresh.
+#
+# This exists because the previous scheduler did not. The hourly GitHub Actions
+# cron that was supposed to trigger rebuilds never fired once, and when Actions
+# went into a major outage on 2026-08-06 the site's data went stale for over
+# three hours while Cloudflare — which actually hosts the site — stayed healthy
+# the whole time. Host and scheduler now live on the same platform, so a refresh
+# can only stop for a reason that would have taken the site down anyway.
+#
+# Deploy:
+#   cd infra/refresh-worker
+#   npx wrangler secret put DEPLOY_HOOK      # Pages → Deploy hooks → the URL
+#   npx wrangler secret put GITHUB_TOKEN     # optional; enables dead-man alerts
+#   npx wrangler deploy
+#
+# Neither secret is ever committed. DEPLOY_HOOK in particular is a capability
+# URL: anyone holding it can trigger a build.
+
+name = "orbital-watch-refresh"
+main = "src/index.js"
+compatibility_date = "2026-08-06"
+
+# Every 2 hours, on the hour. See DECISIONS.md §15 for why this number and not
+# hourly: Cloudflare Pages Free allows 500 builds/month and hourly needs 720,
+# so the old cadence would have run out of allowance around day 20 and the site
+# would have silently frozen. Celestrak also only regenerates GP data every
+# 2 hours, so polling faster cannot return newer element sets.
+[triggers]
+crons = ["0 */2 * * *"]
+
+[vars]
+# Public, non-secret configuration.
+SITE_URL = "https://orbital.rodrigopimenta.com"
+# Alert if the deployed data is older than this. Three times the cadence, so a
+# single missed or slow build is not enough to page anyone.
+MAX_DATA_AGE_SECONDS = "21600"
+# Repository to open a dead-man's issue against, when GITHUB_TOKEN is set.
+GITHUB_REPO = "rodrigopimenta10/orbital-watch"
