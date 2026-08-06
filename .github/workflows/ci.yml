@@ -55,34 +55,83 @@ jobs:
       - name: Tests
         run: uv run pytest -v
 
-      # Proves the definition-of-done requirement directly: a clean clone with
-      # no cache and no reachable upstream still produces a complete site.
+      # Proves the definition-of-done requirement directly, in both of the
+      # shapes it can take: with the committed seed available, and without it.
+      # These are genuinely different guarantees -- the seed keeps a cold
+      # build container serving real data, and its absence must still produce
+      # a complete site rather than a crash.
       - name: Build must survive a total upstream blackout
         run: |
           uv run python - <<'PY'
-          import socket, sys, json, pathlib, logging
+          import json
+          import pathlib
+          import socket
+          import tempfile
 
-          def _unreachable(*args, **kwargs):
+
+          def unreachable(*args, **kwargs):
               raise OSError(101, "Network is unreachable (simulated)")
 
-          socket.socket.connect = _unreachable
-          socket.create_connection = _unreachable
-          socket.getaddrinfo = _unreachable
 
-          from orbital_watch.build import main
-          code = main(["--build-dir", "dist-offline", "--cache-dir", ".cache-offline"])
-          assert code == 0, f"build exited {code} with no network"
+          socket.socket.connect = unreachable
+          socket.create_connection = unreachable
+          socket.getaddrinfo = unreachable
 
-          data = pathlib.Path("dist-offline/data")
-          expected = ["meta.json", "sky.json", "passes.json",
-                      "space_weather.json", "health.json"]
-          for name in expected:
-              payload = json.loads((data / name).read_text())
-              assert payload, f"{name} is empty"
+          EXPECTED = [
+              "meta.json",
+              "sky.json",
+              "passes.json",
+              "space_weather.json",
+              "health.json",
+          ]
 
-          health = json.loads((data / "health.json").read_text())
-          assert health["overall"] == "failed", health["overall"]
-          assert health["counts"]["fresh"] == 0
-          print(f"OK: offline build wrote {len(expected)} files and "
-                f"reported {health['counts']['failed']} failed sources")
+
+          def build(tag, seed_dir=None):
+              """Run the real entry point and return its health block."""
+              import importlib
+
+              import orbital_watch.config as config
+              import orbital_watch.sources.fetch as fetch
+
+              if seed_dir is not None:
+                  config.SEED_DIR = pathlib.Path(seed_dir)
+                  fetch.SEED_DIR = pathlib.Path(seed_dir)
+
+              from orbital_watch.build import main
+
+              out = f"dist-offline-{tag}"
+              code = main(["--build-dir", out, "--cache-dir", f".cache-{tag}"])
+              assert code == 0, f"[{tag}] build exited {code} with no network"
+
+              data = pathlib.Path(out) / "data"
+              for name in EXPECTED:
+                  payload = json.loads((data / name).read_text())
+                  assert payload, f"[{tag}] {name} is empty"
+
+              return json.loads((data / "health.json").read_text())
+
+
+          # 1. Seed present: real data still renders, but nothing claims to be
+          #    fresh, because we reached no upstream at all.
+          seeded = build("seeded")
+          assert seeded["counts"]["fresh"] == 0, seeded["counts"]
+          assert all(
+              s["outcome"] == "seed" for s in seeded["sources"]
+          ), [s["outcome"] for s in seeded["sources"]]
+          print(
+              f"OK seeded: {len(EXPECTED)} files, "
+              f"overall={seeded['overall']}, all sources served from seed"
+          )
+
+          # 2. No seed at all: the site must still be complete and must report
+          #    total failure rather than pretending.
+          with tempfile.TemporaryDirectory() as empty:
+              bare = build("bare", seed_dir=empty)
+          assert bare["overall"] == "failed", bare["overall"]
+          assert bare["counts"]["fresh"] == 0, bare["counts"]
+          assert bare["counts"]["failed"] == len(bare["sources"])
+          print(
+              f"OK bare: {len(EXPECTED)} files, "
+              f"{bare['counts']['failed']} sources reported failed"
+          )
           PY
