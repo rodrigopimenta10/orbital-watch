@@ -215,3 +215,224 @@ Do not consider the project complete until every box is checked:
 Commit in logical increments with real messages. Don't produce one enormous commit.
 
 If you hit an upstream API that has changed shape or gone away: implement against a committed fixture, mark it clearly in `DECISIONS.md`, and keep going. Do not stall.
+
+---
+
+# 10. Post-deploy hardening — work items (added Aug 6, 2026, after the first live outage)
+
+The site is live at `orbital.rodrigopimenta.com` and the pipeline works. This
+section is the remaining work, in priority order, discovered by an actual
+failure rather than by review. **Read all of §10 before starting** — items 1 and
+2 interact, and doing 2 without 1 will exceed a hard billing limit.
+
+Two bugs found the same day are already fixed and are recorded here only so they
+are not reintroduced:
+
+- **Health classification must stay on wall-clock time unless a clock is
+  explicitly pinned.** Threading the build's *start* time into
+  `health.evaluate` made sources fetched during the build resolve to a negative
+  age, which rendered as "Fetched from upstream in the future ago" on the live
+  site. `run_build` now passes `health_now` (the caller's explicit `now`, or
+  `None`), and `health.classify` clamps age at zero.
+- **`test_seed_carries_a_cold_build_with_no_network` must derive its clock from
+  `seed/manifest.json`.** Age is evaluated before outcome in `classify`, so once
+  the committed seed ages past a freshness window it reports STALE for being
+  old and the seed-specific wording never appears. Against a live clock this
+  test passes only for a few hours after each re-seed. Do not "fix" a future
+  failure of this test by relaxing the assertion.
+
+---
+
+## 10.1 Move the rebuild trigger off GitHub Actions — HIGHEST PRIORITY
+
+**The failure.** On Aug 6 GitHub Actions went into `major_outage`. The site's
+data went stale for over three hours and the staleness banner fired. Cloudflare
+— which hosts the site — was healthy the entire time. Only the scheduler was
+down, and it took the whole freshness story with it.
+
+Worse: `gh run list --workflow=update-data.yml` returns **zero runs**. The
+hourly trigger has never executed once since it was committed, so the deploy
+hook path is entirely unverified in production.
+
+**Why this is a design flaw, not bad luck.** `DECISIONS.md` §13 rejected
+building in Actions and deploying with `wrangler` partly to avoid "splitting the
+build across two providers." But the current topology still spans two providers
+— just for the *trigger* instead of the build. The stated principle and the
+implementation disagree, and the seam is exactly where it broke.
+
+**Required change.** Replace the GitHub Actions cron with a **Cloudflare Worker
+Cron Trigger** that POSTs the existing Pages deploy hook. Host and scheduler
+then live on one platform, and Cron Triggers are included on the Workers free
+plan.
+
+- Add the Worker under `infra/refresh-worker/` (or similar) with its own
+  `wrangler.toml` declaring a `[triggers] crons = [...]` entry.
+- Store the deploy hook URL as a Worker **secret** (`wrangler secret put`),
+  never in the repo. It remains a capability URL: anyone holding it can trigger
+  a build.
+- The Worker's `scheduled()` handler does one `fetch(hook, { method: "POST" })`.
+  Keep it that small — no dependencies, nothing to audit.
+- **Delete `.github/workflows/update-data.yml`** once the Worker is verified
+  firing. Do not leave both active; two schedulers means double the builds
+  against the budget in §10.2.
+- Document the swap in `DECISIONS.md`, explicitly correcting §13's
+  two-provider reasoning rather than quietly contradicting it.
+- Keep `ci.yml` on GitHub Actions. Tests and linting belong with the code host;
+  it is only the *production refresh path* that must not depend on it.
+
+## 10.2 Fix the refresh cadence — the current one exceeds a hard limit
+
+**The current `cron: "0 * * * *"` is not sustainable and must be changed.**
+
+Cloudflare Pages Free allows **500 builds per month**
+(<https://developers.cloudflare.com/pages/platform/limits/>). Every build counts,
+whether triggered by cron or by a `git push`.
+
+| Cadence | Builds/month | Headroom vs 500 |
+|---|---|---|
+| Hourly (current) | 720 | **−220 — over the cap** |
+| Every 90 min | 480 | 20 — too tight to absorb pushes |
+| **Every 2 hours** | **360** | **140 — correct choice** |
+| Every 3 hours | 240 | 260 — wastefully conservative |
+
+Hourly overruns the allowance around day 20 of each month, after which rebuilds
+simply stop — the site would silently freeze and drift into STALE with no
+failure anywhere to look at.
+
+**Set the cadence to every 2 hours** (`0 */2 * * *`). Independent reasons this
+is the right number, not just an affordable one:
+
+- Celestrak refreshes GP data **every 2 hours**, so polling faster cannot return
+  newer element sets. Hourly was requesting data that did not exist yet.
+- It halves pressure on Celestrak's rate limiter (see §10.3).
+- It stays inside the 3-hour SWPC freshness window, so a normal run always
+  reports FRESH.
+- 140 builds/month of headroom absorbs ordinary development pushes.
+
+**Accepted tradeoff, state it in `DECISIONS.md`:** at a 2-hour cadence, *one*
+missed run puts space weather at 4 hours and the site reports STALE. That is
+correct behaviour, not a regression — the page is telling the truth about its
+own data. **Do not widen `SPACE_WEATHER_STALENESS.fresh_within` to hide it.**
+The 3-hour window is principled: Kp is a 3-hourly index. Loosening a threshold
+to suppress an honest signal would destroy the one thing this project is for.
+
+## 10.3 Make Celestrak failure the expected case, not the exception
+
+**Observed:** in the 22:30 UTC build, all three Celestrak groups timed out at
+20s and fell back to the committed seed, while all four SWPC sources succeeded.
+The next build at 22:40 got all seven live. So it is intermittent throttling of
+Cloudflare's egress, not a hard block.
+
+**Root cause is structural.** `fetch` refuses to re-request a GP group whose
+cache is under 6 hours old — but Cloudflare build containers are ephemeral, so
+the cache is cold on *every* build and that floor never applies in production.
+The politeness guarantee exists only in local runs. `DECISIONS.md` §3
+half-acknowledges this ("the schedule, not just the code, has to stay
+conservative") without resolving it.
+
+Moving to a 2-hour cadence (§10.2) reduces the pressure but does not fix the
+mechanism. Pick one of these and record the choice:
+
+**Option A — commit the TLE snapshot on a schedule (recommended).** A scheduled
+job fetches GP data every 6 hours and commits it to the repo; the Pages build
+reads from the repo and *never calls Celestrak*. This is the "data in git"
+pattern.
+- Makes the 6-hour floor real, because a single job owns all fetching.
+- Makes builds deterministic and fully reproducible offline.
+- Gives free history: the committed snapshots become a time series.
+- Cost: the refresher needs write access and its own schedule, and every
+  refresh is a commit, which triggers a build — so it must be counted against
+  the §10.2 budget, not added on top of it.
+
+**Option B — persist the cache in Cloudflare KV or R2.** The build reads and
+writes the cache to KV, so the 6-hour floor works across builds.
+- Smaller change to the pipeline's shape and no commit noise.
+- Cost: adds a stateful dependency, and the "no backend" claim in the README
+  needs rewording to stay accurate.
+
+**Do not** simply raise `HTTP_TIMEOUT_SECONDS`. The request is being throttled,
+not running slowly; a longer timeout converts a fast seed fallback into a slow
+one and lengthens every build.
+
+## 10.4 Reliability: what to actually harden, and what not to promise
+
+The goal is **honest degradation under every failure**, not "100% uptime."
+100% is not purchasable here at any price: Celestrak, NOAA SWPC, and Cloudflare
+are all outside our control, and the project's entire thesis is that a system
+should report its own health truthfully rather than pretend. A dashboard that
+never admits staleness is the failure mode this repo exists to argue against.
+
+The existing design is already correct on the important axis — per-source
+isolation, cache fallback, seed fallback, a build that cannot fail, and a health
+panel that classifies rather than asserts. **Do not add machinery that
+undermines that.** Specifically: do not add retry storms against rate-limited
+upstreams, and do not let any new fallback report FRESH.
+
+Genuine gaps worth closing, highest value first:
+
+1. **Nothing watches the watchman.** If the refresh trigger stops firing, the
+   only signal is a visitor noticing the banner. Add a dead-man's check: the
+   Worker from §10.1 fetches `/data/health.json` after triggering, and if
+   `generated_at` is older than ~3× the cadence, it reports loudly — a
+   GitHub issue via API, or an email. This is the single highest-value
+   reliability addition, and it is the failure that actually happened.
+2. **The seed can rot silently.** It ages into FAILED correctly, but nothing
+   prompts a refresh. Add a CI check that fails when `seed/manifest.json` is
+   older than ~30 days, so the repo tells you before the site does.
+3. **A partial build can publish.** Confirm the deploy is atomic: if
+   `build` writes `dist/` incrementally and Cloudflare uploads mid-write, a
+   half-built site could go live. Build to a temp directory and move it into
+   place, or assert every required artifact exists before the step exits
+   non-zero.
+4. **No synthetic check on the public URL.** Everything verified so far has
+   been verified locally or by hand. Add a scheduled check asserting HTTP 200
+   *and correct content-type* on `/`, `/data/health.json`, and the other data
+   endpoints. A 200 alone proves nothing — an SPA fallback returns 200 with
+   `text/html` for a missing asset, which is exactly how the portfolio site
+   shipped a blank page the same day.
+5. **Timeout budget is unbounded in aggregate.** Seven sources × 20s means a
+   worst case near 140s of network wait before propagation starts. Set an
+   overall deadline so a degraded-everything build still finishes promptly.
+
+## 10.5 Polish before it goes on LinkedIn Featured and gets left alone
+
+Assume a hiring engineer opens the repo and spends 90 seconds. Optimise for
+that, then stop — this project is going into low-maintenance mode.
+
+- **Say the quiet part out loud in the README.** The strongest thing here is
+  that the site reports its own degradation honestly. State that as a design
+  thesis in the opening lines, above the feature list. Right now a reader has
+  to infer it.
+- **Screenshot a degraded state, not just a healthy one.** A health panel
+  showing STALE with a real explanation demonstrates the thesis far better than
+  seven green rows. Most portfolio projects only ever show the happy path.
+- **Add a CI status badge** once §10.1 lands and CI is reliably green. Skip it
+  while runs are being cancelled by outages — a red badge is worse than none.
+- **`DECISIONS.md` is the differentiator; make it findable.** Link it from the
+  README's first screenful with one line on why it exists. Most candidates
+  cannot show their reasoning at all.
+- **Add the two bugs from Aug 6 to `DECISIONS.md`** as short entries — the
+  negative-age regression and the time-dependent test. A repo that records its
+  own mistakes and the reasoning behind the fixes reads as far more senior than
+  one with a clean, silent history.
+- **Do not add features.** No new panels, no new sources. The next marginal
+  hour is worth more on the AWS/Terraform project, which closes an actual
+  screening gap.
+
+## 10.6 Definition of done for §10
+
+- [ ] Rebuilds are triggered by Cloudflare, not GitHub Actions, and the trigger
+      has demonstrably fired on schedule at least twice.
+- [ ] `update-data.yml` deleted; `ci.yml` retained.
+- [ ] Cadence is every 2 hours and the projected monthly build count is
+      documented against the 500 limit.
+- [ ] One of §10.3 Option A or B implemented, with the choice and its tradeoff
+      recorded in `DECISIONS.md`.
+- [ ] A dead-man's check exists that notices a missing refresh without a human
+      looking at the page.
+- [ ] Synthetic check asserts status **and content-type** on every public
+      endpoint.
+- [ ] `DECISIONS.md` records: the trigger move (correcting §13), the cadence
+      change, the Celestrak decision, and the two Aug 6 bugs.
+- [ ] `uv run pytest` and `uv run ruff check .` both clean.
+- [ ] Live site shows 7/7 fresh after a scheduled — not pushed — rebuild.
