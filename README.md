@@ -52,9 +52,9 @@ It is a portfolio project, not an operational tool.
             └──────────┬───────────────┘
                        ▼
          ┌──────────────────────────────┐
-         │  Cloudflare Pages build       │  hourly, via
-         │  fetch → propagate → health   │  a deploy hook
-         │  → write JSON  (seed backstop)│
+         │  Cloudflare Pages build      │  hourly, via
+         │  fetch → propagate → health  │  a deploy hook
+         │  → write JSON (seed backstop)│
          └──────────────┬───────────────┘
                         ▼
          ┌──────────────────────────────┐
@@ -77,8 +77,9 @@ That indirection is the point, and it buys three things:
 1. **An upstream outage cannot take the site down.** If Celestrak is
    unreachable at 03:00, the run falls back to cached element sets — or, on a
    cold build container, to the committed seed snapshot — the site still
-   renders every panel, and the health panel says the data is stale and why. Compare a live-proxy design, where the same outage produces
-   a spinner or a stack trace in front of whoever is looking.
+   renders every panel, and the health panel says the data is stale and why.
+   Compare a live-proxy design, where the same outage puts a spinner or a
+   stack trace in front of whoever is looking.
 2. **Hosting costs nothing and cannot fall over.** Static files on a CDN. No
    server, no serverless function, no database, no secrets.
 3. **"Last updated" becomes a real claim.** Because every fetch is recorded
@@ -273,8 +274,10 @@ hard failure.
 
 Hosted on **Cloudflare Pages** at
 [orbital.rodrigopimenta.com](https://orbital.rodrigopimenta.com), built
-directly from this repository. There are no secrets in the repo and none are
-needed to build it.
+directly from this repository. The domain is registered through Cloudflare
+Registrar with its DNS on the same account, which keeps the custom-domain
+step to a confirmation rather than a DNS edit. There are no secrets in the
+repo and none are needed to build it.
 
 ### 1. Connect the repository
 
@@ -302,20 +305,22 @@ and stays in the dashboard.
 
 ### 2. Point the custom domain at it
 
-**Pages project → Custom domains → Set up a custom domain →**
-`orbital.rodrigopimenta.com`.
+**Pages project → Custom domains → Set up a domain →**
+`orbital.rodrigopimenta.com` → **Continue** → confirm the record.
 
-Cloudflare then wants one DNS record:
+`rodrigopimenta.com` is registered through Cloudflare and its zone is on the
+same account, so there is no DNS record to add by hand: Cloudflare creates the
+proxied `CNAME orbital → <project>.pages.dev` for you once you confirm. Because
+this is a subdomain rather than an apex, no nameserver change is involved
+either. TLS is provisioned automatically — nothing to configure, no
+certificate to renew.
+
+The equivalent record, if the zone ever moves to another DNS provider:
 
 ```
 Type    Name       Target
-CNAME   orbital    <your-project>.pages.dev
+CNAME   orbital    <project>.pages.dev
 ```
-
-If `rodrigopimenta.com` uses Cloudflare DNS, the record is created for you and
-proxied automatically. If the domain is hosted elsewhere, add that CNAME with
-the current registrar. TLS is provisioned automatically; there is nothing to
-configure and no certificate to renew.
 
 ### 3. Add the hourly rebuild
 
