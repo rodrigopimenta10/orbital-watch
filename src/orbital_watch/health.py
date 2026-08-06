@@ -134,7 +134,11 @@ def _classify(
             "Serving data of unknown age; retrieval timestamp is missing.",
         )
 
-    age = now - result.last_success
+    # Clamped at zero. A source fetched *after* the reference instant is not
+    # "negatively old" -- it was retrieved during this build. Without the clamp
+    # a pinned clock produces a negative age and `format_duration` renders the
+    # phrase "in the future", which then reads as "in the future ago".
+    age = max(now - result.last_success, timedelta(0))
     age_text = format_duration(age)
 
     # Data can be both old *and* cut off from upstream. Reporting only the age

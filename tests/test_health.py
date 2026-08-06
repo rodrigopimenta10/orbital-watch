@@ -150,6 +150,22 @@ def test_data_with_unknown_retrieval_time_is_never_fresh():
     assert "unknown age" in health.detail
 
 
+def test_fetch_after_the_reference_instant_is_age_zero_not_negative():
+    """A source retrieved after `now` is age 0, never negatively old.
+
+    Regression: when the build pinned health classification to its own start
+    time, sources fetched during the build landed *after* that instant. The
+    resulting negative age rendered as "Fetched from upstream in the future
+    ago" and shipped to the live site.
+    """
+    result = make_result(outcome=Outcome.LIVE, age=-timedelta(minutes=1))
+    health = evaluate(result, POLICY, label="Test", now=NOW)
+
+    assert health.state is State.FRESH
+    assert health.age_seconds == 0
+    assert "future" not in health.detail
+
+
 def test_old_cache_fallback_is_failed_not_merely_stale():
     """Age beats outcome: data too old is FAILED even though we have bytes."""
     result = make_result(

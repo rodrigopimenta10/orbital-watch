@@ -435,6 +435,14 @@ def run_build(
 ) -> dict:
     """Execute the full pipeline and write the site. Returns the manifest."""
     started = datetime.now(UTC)
+
+    # An explicit `now` pins health classification too, so a replay or a test
+    # evaluates the whole page against one instant. Left unset, health keeps its
+    # own wall clock on purpose: sources are fetched *during* the build, so
+    # measuring them against build start reports a source retrieved seconds ago
+    # as having a negative age -- which is how "in the future ago" reached
+    # production once.
+    health_now = now
     now = now or started
     log.info(
         "build start observer=%s lat=%.4f lon=%.4f",
@@ -451,19 +459,14 @@ def run_build(
     # shape predates the current parser, an upstream that changed structure.
     # Since the whole promise of this build is that it completes, no single
     # stage is allowed to be the thing that stops it.
-    # `now` is threaded into health classification as well as propagation so a
-    # single instant governs the whole page. Letting health call its own
-    # `datetime.now()` meant reported ages were measured against a different
-    # moment than the pass predictions -- invisible on a fast build, wrong on a
-    # slow one, and impossible to pin down in a test.
     try:
-        tracked, tle_reports, coverage = collect_satellites(cache_dir, ts, now=now)
+        tracked, tle_reports, coverage = collect_satellites(cache_dir, ts, now=health_now)
     except Exception:
         log.exception("satellite collection failed; continuing with no satellites")
         tracked, tle_reports, coverage = [], [], []
 
     try:
-        weather, weather_reports = collect_space_weather(cache_dir, now=now)
+        weather, weather_reports = collect_space_weather(cache_dir, now=health_now)
     except Exception:
         log.exception("space weather collection failed; continuing without it")
         weather, weather_reports = empty_weather(), []
