@@ -29,7 +29,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from orbital_watch.config import HTTP_TIMEOUT_SECONDS, SEED_DIR, USER_AGENT
+from orbital_watch.config import (
+    HTTP_TIMEOUT_SECONDS,
+    NETWORK_BUDGET_SECONDS,
+    SEED_DIR,
+    USER_AGENT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +104,30 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 #: Error bodies are only inspected for the Celestrak sentinel in their first
 #: few hundred characters, so they need far less room.
 _ERROR_BODY_BYTES = 64 * 1024
+
+
+class NetworkBudget:
+    """A shared wall-clock allowance across every fetch in one build.
+
+    Per-call timeouts bound each request, but with every upstream hanging they
+    serialise: N sources x 20s is minutes of dead waiting before propagation
+    starts. This caps the *sum*. Each caller asks :meth:`per_call_timeout` for
+    the smaller of its own default and what remains; once the budget is spent,
+    calls get a 1-second timeout -- enough to succeed against a healthy local
+    resolver-cached endpoint, short enough that a dead one costs almost
+    nothing further.
+
+    Never blocks a fetch outright: a build with an exhausted budget still
+    *attempts* every source, because an attempt is also how the health panel
+    learns and reports what is wrong.
+    """
+
+    def __init__(self, total_seconds: float = NETWORK_BUDGET_SECONDS) -> None:
+        self._deadline = time.monotonic() + total_seconds
+
+    def per_call_timeout(self, default: float = HTTP_TIMEOUT_SECONDS) -> float:
+        remaining = self._deadline - time.monotonic()
+        return max(1.0, min(default, remaining))
 
 
 class _CacheEntry:

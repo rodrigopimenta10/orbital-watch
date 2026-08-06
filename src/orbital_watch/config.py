@@ -112,6 +112,15 @@ USER_AGENT = (
 #: Hard ceiling on any single network call. No unbounded waits, ever.
 HTTP_TIMEOUT_SECONDS = 20.0
 
+#: Ceiling on total network wait across the whole build. Per-call timeouts
+#: alone are not enough: with every source down, N sources x 20s serialises
+#: into minutes of waiting before propagation even starts. Once this budget is
+#: spent, remaining fetches get whatever is left (minimum 1s), so a
+#: degraded-everything build still finishes promptly. The value covers all
+#: SWPC sources timing out fully with room to spare -- it only bites when
+#: several sources hang in sequence, which is exactly the case it exists for.
+NETWORK_BUDGET_SECONDS = 60.0
+
 CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
 
 #: Celestrak refreshes GP data every 2 hours and rate-limits repeat callers.

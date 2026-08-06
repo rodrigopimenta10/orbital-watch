@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from orbital_watch.config import (
+    HTTP_TIMEOUT_SECONDS,
     KP_ELEVATED_THRESHOLD,
     KP_STORM_THRESHOLD,
     SWPC_KP_URL,
@@ -38,37 +39,46 @@ def _validate_nonempty_list(data: object) -> list:
     return data
 
 
-def fetch_kp(cache_dir: Path) -> FetchResult:
+def fetch_kp(cache_dir: Path, *, timeout: float = HTTP_TIMEOUT_SECONDS) -> FetchResult:
     """Planetary K-index, 3-hourly, roughly a week of history."""
     return fetch_json(
         name="swpc_kp",
+        timeout=timeout,
         url=SWPC_KP_URL,
         cache_dir=cache_dir,
         parser=_validate_nonempty_list,
     )
 
 
-def fetch_solar_wind(cache_dir: Path) -> FetchResult:
+def fetch_solar_wind(
+    cache_dir: Path, *, timeout: float = HTTP_TIMEOUT_SECONDS
+) -> FetchResult:
     """Current solar wind bulk speed."""
     return fetch_json(
         name="swpc_solar_wind",
+        timeout=timeout,
         url=SWPC_SOLAR_WIND_URL,
         cache_dir=cache_dir,
         parser=_validate_nonempty_list,
     )
 
 
-def fetch_mag_field(cache_dir: Path) -> FetchResult:
+def fetch_mag_field(
+    cache_dir: Path, *, timeout: float = HTTP_TIMEOUT_SECONDS
+) -> FetchResult:
     """Interplanetary magnetic field: total (Bt) and north-south (Bz) in GSM."""
     return fetch_json(
         name="swpc_mag_field",
+        timeout=timeout,
         url=SWPC_MAG_FIELD_URL,
         cache_dir=cache_dir,
         parser=_validate_nonempty_list,
     )
 
 
-def fetch_solar_cycle(cache_dir: Path) -> FetchResult:
+def fetch_solar_cycle(
+    cache_dir: Path, *, timeout: float = HTTP_TIMEOUT_SECONDS
+) -> FetchResult:
     """Observed solar cycle indices; we only use the recent tail (F10.7, SSN)."""
 
     def _tail(data: object) -> list:
@@ -77,6 +87,7 @@ def fetch_solar_cycle(cache_dir: Path) -> FetchResult:
 
     return fetch_json(
         name="swpc_solar_cycle",
+        timeout=timeout,
         url=SWPC_SOLAR_CYCLE_URL,
         cache_dir=cache_dir,
         parser=_tail,

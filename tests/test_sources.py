@@ -985,3 +985,50 @@ def test_seed_with_a_stale_shape_is_rejected(tmp_path, monkeypatch):
         "demo", "https://example.invalid/demo.json", tmp_path / "c", parser=_needs_a_list
     )
     assert result.outcome is Outcome.FAILED
+
+
+def test_failed_build_leaves_previous_output_untouched(
+    tmp_path, monkeypatch, celestrak_snapshot
+):
+    """A build that dies mid-write must not destroy the published site.
+
+    Output is assembled in a staging directory and swapped in only once every
+    required artifact exists. Without that, anything reading build_dir during
+    a build -- an uploader, a local server -- could publish a half-written
+    mixture of this run and the last.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", responder(ALL_SOURCES_OK))
+    build_dir = tmp_path / "dist"
+
+    run_build(
+        cache_dir=tmp_path / "cache",
+        build_dir=build_dir,
+        web_dir=tmp_path / "nonexistent-web",
+        observer=OBSERVER,
+    )
+    original = (build_dir / DATA_SUBDIR / "meta.json").read_text()
+
+    # Make the *second* build die while writing its final artifact.
+    from orbital_watch import build as build_module
+
+    real_write = build_module.write_json
+
+    def _explode_on_health(path, payload):
+        if path.name == "health.json":
+            raise OSError("disk full (simulated)")
+        real_write(path, payload)
+
+    monkeypatch.setattr(build_module, "write_json", _explode_on_health)
+
+    with pytest.raises(OSError):
+        run_build(
+            cache_dir=tmp_path / "cache",
+            build_dir=build_dir,
+            web_dir=tmp_path / "nonexistent-web",
+            observer=OBSERVER,
+        )
+
+    # The first build's output is still complete and untouched.
+    health_payload = assert_site_is_complete(build_dir)
+    assert health_payload["sources"], "previous health.json should still be intact"
+    assert (build_dir / DATA_SUBDIR / "meta.json").read_text() == original

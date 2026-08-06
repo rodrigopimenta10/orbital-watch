@@ -49,7 +49,7 @@ from orbital_watch.propagate import (
     timescale,
 )
 from orbital_watch.sources import celestrak, swpc
-from orbital_watch.sources.fetch import format_duration
+from orbital_watch.sources.fetch import NetworkBudget, format_duration
 
 log = logging.getLogger("orbital_watch.build")
 
@@ -173,7 +173,11 @@ def collect_space_weather(
     """Fetch and interpret space weather. Degrades field by field."""
     reports: list[health.SourceHealth] = []
 
-    kp_result = swpc.fetch_kp(cache_dir)
+    # One budget across all four fetches: individually bounded calls still
+    # serialise into minutes when everything hangs, and the budget caps the sum.
+    budget = NetworkBudget()
+
+    kp_result = swpc.fetch_kp(cache_dir, timeout=budget.per_call_timeout())
     reports.append(
         health.evaluate(
             kp_result,
@@ -183,7 +187,7 @@ def collect_space_weather(
         )
     )
 
-    wind_result = swpc.fetch_solar_wind(cache_dir)
+    wind_result = swpc.fetch_solar_wind(cache_dir, timeout=budget.per_call_timeout())
     reports.append(
         health.evaluate(
             wind_result,
@@ -193,7 +197,7 @@ def collect_space_weather(
         )
     )
 
-    mag_result = swpc.fetch_mag_field(cache_dir)
+    mag_result = swpc.fetch_mag_field(cache_dir, timeout=budget.per_call_timeout())
     reports.append(
         health.evaluate(
             mag_result,
@@ -203,7 +207,7 @@ def collect_space_weather(
         )
     )
 
-    cycle_result = swpc.fetch_solar_cycle(cache_dir)
+    cycle_result = swpc.fetch_solar_cycle(cache_dir, timeout=budget.per_call_timeout())
     reports.append(
         health.evaluate(
             cycle_result,
@@ -521,12 +525,23 @@ def run_build(
         },
     }
 
+    # Assemble the whole site in a staging directory beside the target, then
+    # swap it into place at the end. Writing into build_dir directly would
+    # leave a window where the directory holds a half-built site -- some files
+    # from this run, some from the last, or missing outright -- and anything
+    # that reads it mid-write (an upload step, a local server) publishes that
+    # mixture. The swap makes "the build output exists" and "the build output
+    # is complete" the same fact.
+    staging = build_dir.parent / (build_dir.name + ".staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+
     # Frontend first, generated data second. copy_frontend uses
     # dirs_exist_ok=True, so doing it the other way round would let a stray
     # web/data/ directory silently overwrite the JSON we just computed.
-    copy_frontend(web_dir, build_dir)
+    copy_frontend(web_dir, staging)
 
-    data_dir = build_dir / DATA_SUBDIR
+    data_dir = staging / DATA_SUBDIR
     write_json(data_dir / "meta.json", meta)
     write_json(
         data_dir / "sky.json",
@@ -559,6 +574,38 @@ def run_build(
         data_dir / "health.json",
         {"generated_at": started.isoformat(), **health_block},
     )
+
+    # Verify completeness before the swap, so a partial staging directory can
+    # never become the published output. This is the assertion, not a hope:
+    # every artifact the frontend loads must exist and be non-empty.
+    required = [
+        data_dir / name
+        for name in (
+            "meta.json",
+            "sky.json",
+            "passes.json",
+            "space_weather.json",
+            "health.json",
+        )
+    ]
+    if web_dir.exists():
+        required.append(staging / "index.html")
+    missing = [str(p) for p in required if not p.exists() or p.stat().st_size == 0]
+    if missing:
+        # Genuinely fatal -- our own writes failed. Leave the previous build
+        # output untouched rather than replacing it with a broken one.
+        raise OSError(f"staging incomplete, refusing to publish: {missing}")
+
+    # Swap via a retired-name rename rather than delete-then-move, so there is
+    # no instant at which build_dir does not exist at all.
+    retired = build_dir.parent / (build_dir.name + ".previous")
+    if retired.exists():
+        shutil.rmtree(retired)
+    if build_dir.exists():
+        build_dir.replace(retired)
+    staging.replace(build_dir)
+    if retired.exists():
+        shutil.rmtree(retired)
 
     log.info(
         "build complete elapsed=%.2fs tracked=%d above_horizon=%d passes=%d health=%s",

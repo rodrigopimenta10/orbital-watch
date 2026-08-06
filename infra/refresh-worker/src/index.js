@@ -57,9 +57,61 @@ async function triggerRebuild(env) {
   }
 }
 
+/**
+ * Synthetic check on every public endpoint: status AND content-type.
+ *
+ * A 200 alone proves nothing. Pages serves an SPA-style fallback for missing
+ * assets, returning 200 with text/html — which is exactly how a blank page
+ * once shipped while every naive check stayed green. Asserting the
+ * content-type distinguishes "the endpoint exists" from "the fallback
+ * swallowed a 404".
+ */
+const ENDPOINTS = [
+  { path: "/", type: "text/html" },
+  { path: "/data/health.json", type: "application/json" },
+  { path: "/data/meta.json", type: "application/json" },
+  { path: "/data/sky.json", type: "application/json" },
+  { path: "/data/passes.json", type: "application/json" },
+  { path: "/data/space_weather.json", type: "application/json" },
+  { path: "/assets/app.js", type: "javascript" },
+  { path: "/assets/style.css", type: "text/css" },
+];
+
+async function checkEndpoints(env) {
+  const failures = [];
+  for (const endpoint of ENDPOINTS) {
+    try {
+      const response = await fetch(env.SITE_URL + endpoint.path, {
+        cf: { cacheTtl: 0 },
+      });
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok) {
+        failures.push(`${endpoint.path}: HTTP ${response.status}`);
+      } else if (!contentType.includes(endpoint.type)) {
+        failures.push(
+          `${endpoint.path}: expected ${endpoint.type}, got "${contentType}" ` +
+            `(a 200 with the wrong type is the SPA fallback eating a 404)`,
+        );
+      }
+    } catch (error) {
+      failures.push(`${endpoint.path}: ${error.name}`);
+    }
+  }
+  return failures;
+}
+
 async function checkPreviousCycle(env) {
   const maxAge = Number(env.MAX_DATA_AGE_SECONDS || 21600);
   const url = `${env.SITE_URL}/data/health.json`;
+
+  const endpointFailures = await checkEndpoints(env);
+  if (endpointFailures.length) {
+    return alert(
+      env,
+      `Synthetic check failed on ${endpointFailures.length} endpoint(s):\n` +
+        endpointFailures.map((f) => `- ${f}`).join("\n"),
+    );
+  }
 
   let payload;
   try {
