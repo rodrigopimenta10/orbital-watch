@@ -1,0 +1,139 @@
+name: Update data and deploy
+
+on:
+  schedule:
+    # Hourly, on the hour (UTC).
+    #
+    # Cadence rationale (see DECISIONS.md):
+    #   * SWPC data has a 3h freshness window in our config. Running hourly
+    #     keeps it comfortably fresh and leaves headroom to miss a run or two
+    #     without the site going stale.
+    #   * This does NOT mean Celestrak is called hourly. The fetcher refuses to
+    #     re-request a GP group whose cache is younger than 6h, so hourly
+    #     scheduling costs Celestrak at most 4 requests per group per day.
+    #     Workflow cadence and upstream politeness are deliberately decoupled:
+    #     the rate limit is enforced in code, not by the schedule.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+  # Redeploy when the site itself changes, not just when the data does.
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "src/**"
+      - ".github/workflows/update-data.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel an in-flight deploy: a half-published site is worse than a
+# slightly delayed one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Fetch and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      # The upstream response cache is what makes degradation graceful in
+      # production: if Celestrak or SWPC is down during a scheduled run, the
+      # build falls back to whatever the previous run stored. Without this the
+      # cache would be empty on every run and any outage would blank a panel.
+      #
+      # The key always changes so each run writes a fresh entry; restore-keys
+      # pulls the most recent previous one.
+      - name: Restore upstream cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: upstream-cache-${{ github.run_id }}
+          restore-keys: |
+            upstream-cache-
+
+      - name: Build site
+        run: uv run python -m orbital_watch.build --verbose
+
+      # The build never fails on upstream problems by design, so surface the
+      # health result in the job summary where it is actually visible.
+      - name: Report source health
+        if: always()
+        run: |
+          uv run python - <<'PY'
+          import json, os, pathlib
+
+          path = pathlib.Path("dist/data/health.json")
+          if not path.exists():
+              print("No health.json produced -- the build did not complete.")
+              raise SystemExit(1)
+
+          health = json.loads(path.read_text())
+          lines = [
+              "## Data update summary",
+              "",
+              f"**Overall state:** `{health['overall']}`",
+              "",
+              "| Source | State | Outcome | Last success |",
+              "| --- | --- | --- | --- |",
+          ]
+          for source in health["sources"]:
+              lines.append(
+                  f"| {source['label']} | `{source['state']}` | "
+                  f"`{source['outcome']}` | {source['last_success'] or 'never'} |"
+              )
+
+          degraded = [s for s in health["sources"] if s["state"] != "fresh"]
+          if degraded:
+              lines += ["", "### Degraded sources", ""]
+              lines += [
+                  f"- **{s['label']}** ({s['state']}): {s['detail']}" for s in degraded
+              ]
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              pathlib.Path(summary).write_text("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+
+      - name: Verify build output
+        run: |
+          set -euo pipefail
+          for file in meta.json sky.json passes.json space_weather.json health.json; do
+            test -s "dist/data/$file" || { echo "missing or empty: $file"; exit 1; }
+            python3 -c "import json,sys; json.load(open('dist/data/$file'))"
+          done
+          test -s dist/index.html
+          echo "Build output verified."
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ruff + pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      # The suite blocks network access at the fixture level, so this step
+      # passing is also evidence that nothing here depends on a live API.
+      - name: Tests
+        run: uv run pytest -v
+
+      # Proves the definition-of-done requirement directly: a clean clone with
+      # no cache and no reachable upstream still produces a complete site.
+      - name: Build must survive a total upstream blackout
+        run: |
+          uv run python - <<'PY'
+          import socket, sys, json, pathlib, logging
+
+          def _unreachable(*args, **kwargs):
+              raise OSError(101, "Network is unreachable (simulated)")
+
+          socket.socket.connect = _unreachable
+          socket.create_connection = _unreachable
+          socket.getaddrinfo = _unreachable
+
+          from orbital_watch.build import main
+          code = main(["--build-dir", "dist-offline", "--cache-dir", ".cache-offline"])
+          assert code == 0, f"build exited {code} with no network"
+
+          data = pathlib.Path("dist-offline/data")
+          expected = ["meta.json", "sky.json", "passes.json",
+                      "space_weather.json", "health.json"]
+          for name in expected:
+              payload = json.loads((data / name).read_text())
+              assert payload, f"{name} is empty"
+
+          health = json.loads((data / "health.json").read_text())
+          assert health["overall"] == "failed", health["overall"]
+          assert health["counts"]["fresh"] == 0
+          print(f"OK: offline build wrote {len(expected)} files and "
+                f"reported {health['counts']['failed']} failed sources")
+          PY

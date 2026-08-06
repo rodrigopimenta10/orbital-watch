@@ -203,11 +203,23 @@ def fetch_json(
         request = urllib.request.Request(
             url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as http_error:
+            # Celestrak serves the not-updated sentinel with a 403 status, not
+            # a 200, so the body has to be inspected on the error path too.
+            # Without this, "nothing has changed since your last download" --
+            # a completely benign condition -- is reported as a hard failure
+            # and the source shows FAILED on the health panel while a perfectly
+            # good cache sits unused.
+            body = _read_error_body(http_error)
+            if _NOT_UPDATED_MARKER in body[:400]:
+                raise _NotModified(_first_line(body)) from http_error
+            raise
 
         if _NOT_UPDATED_MARKER in raw[:400]:
-            raise _NotModified(raw.strip().splitlines()[0] if raw.strip() else "")
+            raise _NotModified(_first_line(raw))
 
         data = json.loads(raw)
         if parser is not None:
@@ -305,7 +317,21 @@ def fetch_json(
 
 
 class _NotModified(Exception):
-    """Upstream answered 200 but declined to send new data."""
+    """Upstream declined to send new data because nothing has changed."""
+
+
+def _read_error_body(error: urllib.error.HTTPError) -> str:
+    """Best-effort read of an HTTPError's body. Never raises."""
+    try:
+        return error.read().decode("utf-8", errors="replace")
+    except Exception:
+        # Diagnostic read only; a failure here must not mask the original error.
+        return ""
+
+
+def _first_line(text: str) -> str:
+    stripped = text.strip()
+    return stripped.splitlines()[0] if stripped else ""
 
 
 def _describe_error(exc: Exception) -> str:

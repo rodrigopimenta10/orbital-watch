@@ -210,6 +210,58 @@ def test_celestrak_not_updated_sentinel_is_treated_as_not_modified(tmp_path, mon
     assert json.loads((tmp_path / "gp.json").read_text()) == [{"OBJECT_NAME": "SAT"}]
 
 
+def test_not_updated_sentinel_is_detected_even_with_an_http_403(tmp_path, monkeypatch):
+    """Celestrak sends the not-updated sentinel with a 403, not a 200.
+
+    Observed against the live API: re-requesting a group inside its refresh
+    window returns HTTP 403 whose *body* is the "GP data has not updated"
+    sentence. Checking the body only on the success path misses it entirely,
+    and a benign "nothing changed" gets reported as a hard failure while a
+    good cache sits unused. Regression test for that.
+    """
+    monkeypatch.setattr(
+        "urllib.request.urlopen", responder({"gp.php": [{"OBJECT_NAME": "SAT"}]})
+    )
+    fetch_json("gp", "https://celestrak.org/gp.php?GROUP=starlink", tmp_path)
+
+    sentinel = fixture_bytes("celestrak_not_updated.txt")
+
+    def _forbidden_with_sentinel(request, timeout=None):
+        raise urllib.error.HTTPError(
+            "https://celestrak.org/gp.php",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(sentinel),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _forbidden_with_sentinel)
+    result = fetch_json("gp", "https://celestrak.org/gp.php?GROUP=starlink", tmp_path)
+
+    assert result.outcome is Outcome.NOT_MODIFIED
+    assert result.data == [{"OBJECT_NAME": "SAT"}]
+    assert result.ok
+
+
+def test_a_genuine_403_is_still_a_failure(tmp_path, monkeypatch):
+    """Only the sentinel body is forgiven -- a real 403 must still degrade."""
+
+    def _plain_forbidden(request, timeout=None):
+        raise urllib.error.HTTPError(
+            "https://celestrak.org/gp.php",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b"go away"),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _plain_forbidden)
+    result = fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
+
+    assert result.outcome is Outcome.FAILED
+    assert "403" in result.error
+
+
 def test_rate_limit_guard_skips_the_network_entirely(tmp_path, monkeypatch):
     """A young cache means we do not call Celestrak at all."""
     monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": [{"a": 1}]}))
