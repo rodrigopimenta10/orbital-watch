@@ -55,6 +55,27 @@ def isolate_seed(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture
+def celestrak_snapshot(isolate_seed) -> Path:
+    """Populate the isolated snapshot with Celestrak groups.
+
+    Builds read Celestrak from the committed snapshot rather than the network,
+    so any test that expects a *healthy* build needs one present. SWPC entries
+    are deliberately left out, so space-weather degradation paths keep working.
+    """
+    stamp = datetime.now(UTC).isoformat()
+    sources = {}
+    for key, fixture in (
+        ("celestrak_stations", "celestrak_stations.json"),
+        ("celestrak_weather", "celestrak_weather.json"),
+        ("celestrak_starlink", "celestrak_starlink.json"),
+    ):
+        (isolate_seed / f"{key}.json").write_text((FIXTURES / fixture).read_text())
+        sources[key] = {"retrieved_at": stamp}
+    (isolate_seed / "manifest.json").write_text(json.dumps({"sources": sources}))
+    return isolate_seed
+
+
+@pytest.fixture
 def real_seed_dir(monkeypatch) -> Path:
     """Opt back in to the committed seed snapshot."""
     seed = Path(__file__).parent.parent / "seed"

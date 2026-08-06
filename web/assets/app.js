@@ -271,9 +271,14 @@
     var age = (now - t) / 1000;
     if (age > stale) return "failed";
     if (age > fresh) return "stale";
-    // Inside the freshness window by age -- but if we could not reach
-    // upstream on the run that produced this page, it is not fresh.
-    if (source.outcome === "cache_fallback") return "stale";
+    // Inside the freshness window by age -- but if the build could not reach
+    // upstream on the run that produced this page, it is not fresh. That
+    // covers cache_fallback and seed alike; both mean contact was lost. It
+    // does NOT cover "snapshot", which is the intended source (a scheduled
+    // refresher owns that upstream) and is judged purely by its age above.
+    if (source.outcome === "cache_fallback" || source.outcome === "seed") {
+      return "stale";
+    }
     return "fresh";
   }
 

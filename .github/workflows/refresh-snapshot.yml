@@ -1,0 +1,75 @@
+name: Refresh TLE snapshot
+
+# Fetches Celestrak GP data and commits it to seed/. This is the ONLY thing in
+# the project that talks to Celestrak — builds read the committed snapshot and
+# never call it (see DECISIONS.md §16).
+#
+# Running this on GitHub Actions is a deliberate exception to the rule that
+# the production refresh path must not depend on Actions (DECISIONS.md §14).
+# The distinction: if the *rebuild* trigger dies, the site freezes silently —
+# that path lives on a Cloudflare Worker. If *this* cron dies, the snapshot
+# simply ages, the health panel reports STALE and then FAILED with its true
+# capture time, and site rebuilds keep publishing all the while. Missing runs
+# degrade honestly instead of failing silently, which is the property that
+# actually matters. And a scheduled commit needs repository write access,
+# which Actions has natively and a Worker would need a long-lived PAT for.
+#
+# Every 6 hours, matching CELESTRAK_MIN_REFETCH_INTERVAL. The refresher also
+# enforces that floor itself against the manifest, so an extra manual run is
+# harmless — it will skip groups that are still young.
+#
+# The commit message carries [CI Skip], which Cloudflare Pages recognises, so
+# a snapshot commit does NOT consume a Pages build. The next scheduled rebuild
+# (within 2 hours) picks up the new element sets. This is what keeps the §10.2
+# build budget at 360/month rather than 480.
+
+on:
+  schedule:
+    - cron: "30 1,7,13,19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-snapshot
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Refresh snapshot
+        run: uv run python -m orbital_watch.refresh --verbose
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- seed/; then
+            echo "Snapshot unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "orbital-watch-refresh"
+          git config user.email "noreply@rodrigopimenta.com"
+          git add seed/
+          # [CI Skip] keeps this commit from consuming a Cloudflare Pages
+          # build; the next scheduled rebuild picks the new snapshot up.
+          git commit -m "Refresh TLE snapshot [CI Skip]
+
+          Automated Celestrak GP refresh. See seed/manifest.json for
+          per-group capture times and record counts."
+          git pull --rebase origin main
+          git push origin main

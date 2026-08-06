@@ -45,7 +45,11 @@ class Outcome(StrEnum):
     CACHE_FRESH = "cache_fresh"
     #: Upstream failed; we served cache instead. Degraded but serving.
     CACHE_FALLBACK = "cache_fallback"
-    #: Upstream failed, no cache existed, so we served the committed snapshot.
+    #: Read from the committed snapshot by design, without contacting
+    #: upstream at all. Not a degradation: a scheduled refresher owns that
+    #: traffic. Whether it is *fresh* is decided by the snapshot's age.
+    SNAPSHOT = "snapshot"
+    #: Upstream failed, no cache existed, so we fell back to the snapshot.
     #: Renders something real but is by definition old -- see SEED_DIR.
     SEED = "seed"
     #: Upstream failed and there was nothing to fall back on. No data at all.
@@ -383,6 +387,59 @@ def fetch_json(
 
 class _NotModified(Exception):
     """Upstream declined to send new data because nothing has changed."""
+
+
+def load_snapshot(name: str, url: str, *, parser: Any = None) -> FetchResult:
+    """Serve a source from the committed snapshot, with no network at all.
+
+    Used for sources where a scheduled refresher owns all upstream traffic and
+    the build simply reads what it committed. The result is deliberately still
+    a :class:`FetchResult` carrying the snapshot's real capture time, so the
+    health panel classifies it by age exactly as it classifies everything else
+    — a snapshot that stops being refreshed ages into STALE and then FAILED on
+    its own, with no special case anywhere.
+
+    The outcome is :attr:`Outcome.SNAPSHOT` rather than LIVE because we did not
+    contact anyone. Whether that is *fresh* is a question of age, and the
+    health module answers it.
+    """
+    started = time.monotonic()
+    data, captured = _read_seed(name, parser)
+    elapsed = time.monotonic() - started
+
+    if data is None:
+        log.error(
+            "source=%s outcome=failed elapsed=%.3fs error=snapshot-missing", name, elapsed
+        )
+        return FetchResult(
+            name=name,
+            url=url,
+            data=None,
+            outcome=Outcome.FAILED,
+            last_success=None,
+            elapsed_seconds=elapsed,
+            error="No committed snapshot available for this source.",
+        )
+
+    log.info(
+        "source=%s outcome=snapshot elapsed=%.3fs captured=%s",
+        name,
+        elapsed,
+        captured.isoformat() if captured else "unknown",
+    )
+    return FetchResult(
+        name=name,
+        url=url,
+        data=data,
+        outcome=Outcome.SNAPSHOT,
+        last_success=captured,
+        elapsed_seconds=elapsed,
+        notes=[
+            "Served from the committed snapshot; the build does not call this "
+            "upstream. A scheduled refresher owns all traffic to it, which is "
+            "what makes the refetch floor real on ephemeral build containers."
+        ],
+    )
 
 
 def _read_seed(name: str, parser: Any) -> tuple[Any | None, datetime | None]:

@@ -207,6 +207,23 @@ def _classify(
             f"upstream was deliberately not contacted.",
         )
 
+    if result.outcome == Outcome.SNAPSHOT:
+        # Unlike a seed, a snapshot is the *intended* source rather than a
+        # fallback, so age alone decides. A scheduled refresher owns contact
+        # with this upstream; the build reading what that refresher committed
+        # is the design working, not a degradation. If the refresher stops,
+        # the snapshot ages past the thresholds above and this reports STALE
+        # then FAILED on its own -- which is the honest signal, and needs no
+        # special case to produce.
+        return (
+            State.FRESH,
+            age,
+            f"Served from the committed snapshot captured {age_text} ago, "
+            f"within the {format_duration(policy.fresh_within)} freshness "
+            f"window. The build does not call this upstream; a scheduled "
+            f"refresher owns that traffic.",
+        )
+
     return State.FRESH, age, f"Fetched from upstream {age_text} ago."
 
 

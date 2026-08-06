@@ -1,10 +1,12 @@
 """Celestrak GP (general perturbations) element sets.
 
-We pull named groups rather than the full catalogue, cache aggressively, and
-refuse to re-fetch a group whose cache is younger than
-:data:`~orbital_watch.config.CELESTRAK_MIN_REFETCH_INTERVAL`. Celestrak
-rate-limits abusive clients and blocks them outright; being a well-behaved
-consumer of a free public service is a requirement, not a nicety.
+We pull named groups rather than the full catalogue. Celestrak rate-limits
+abusive clients and blocks them outright, so being a well-behaved consumer of
+a free public service is a requirement, not a nicety.
+
+The load-bearing detail is *who* does the pulling. Builds read a committed
+snapshot and never contact Celestrak; one scheduled refresher owns every
+request. See :func:`fetch_group` for why that inversion was necessary.
 """
 
 from __future__ import annotations
@@ -14,12 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
-from orbital_watch.config import (
-    CELESTRAK_GP_URL,
-    CELESTRAK_MIN_REFETCH_INTERVAL,
-    SatelliteGroup,
-)
-from orbital_watch.sources.fetch import FetchResult, fetch_json
+from orbital_watch.config import CELESTRAK_GP_URL, SatelliteGroup
+from orbital_watch.sources.fetch import FetchResult, fetch_json, load_snapshot
 
 log = logging.getLogger(__name__)
 
@@ -76,13 +74,51 @@ def _validate_gp_payload(data: object) -> list[dict]:
     return usable
 
 
-def fetch_group(group: SatelliteGroup, cache_dir: Path) -> FetchResult:
-    """Fetch one Celestrak GP group, cached and rate-limit-aware."""
-    return fetch_json(
+def fetch_group(
+    group: SatelliteGroup, cache_dir: Path, *, allow_network: bool = False
+) -> FetchResult:
+    """Load one Celestrak GP group.
+
+    By default this reads the **committed snapshot** and never touches the
+    network. That is a deliberate inversion of the obvious design, and the
+    reason is structural rather than stylistic.
+
+    ``fetch`` refuses to re-request a group whose cache is under
+    the refetch floor old — but Cloudflare Pages build
+    containers are ephemeral, so the cache is cold on *every* production build
+    and that floor never applied where it mattered. The politeness guarantee
+    existed only in local runs. In practice every build hit Celestrak three
+    times, and Celestrak intermittently throttled Cloudflare's egress: in one
+    observed build all three groups timed out at 20s and fell back to the seed,
+    while the build ten minutes later got all three live.
+
+    So a single scheduled job now owns all Celestrak traffic (see
+    :func:`orbital_watch.refresh.refresh_snapshot`), commits what it fetches,
+    and the build reads that. The refetch floor becomes real because one owner
+    enforces it, builds stop depending on a rate-limited third party, and they
+    become reproducible offline. The cost is that element sets are as old as
+    the last snapshot — which the health panel reports, because the snapshot
+    carries its true capture time.
+
+    ``allow_network=True`` is for the refresher itself.
+    """
+    if allow_network:
+        # No min_refetch_interval here. The refresher enforces the floor
+        # itself, against the snapshot's manifest timestamp, which is the only
+        # state that actually persists between runs. Applying the cache-based
+        # floor as well would let a warm local cache silently block a refresh
+        # the refresher had already decided was due -- two mechanisms guarding
+        # the same thing, with the weaker one winning.
+        return fetch_json(
+            name=f"celestrak_{group.key}",
+            url=group_url(group.key),
+            cache_dir=cache_dir,
+            parser=_validate_gp_payload,
+        )
+
+    return load_snapshot(
         name=f"celestrak_{group.key}",
         url=group_url(group.key),
-        cache_dir=cache_dir,
-        min_refetch_interval=CELESTRAK_MIN_REFETCH_INTERVAL,
         parser=_validate_gp_payload,
     )
 

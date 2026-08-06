@@ -30,6 +30,7 @@ from orbital_watch.config import (
 )
 from orbital_watch.sources import celestrak, swpc
 from orbital_watch.sources.fetch import Outcome, fetch_json, format_duration
+from tests.helpers import FakeResponse, fixture_bytes, responder  # noqa: F401
 
 OBSERVER = Observer("Test Site", 39.0840, -77.1528, 82.0)
 
@@ -37,48 +38,6 @@ OBSERVER = Observer("Test Site", 39.0840, -77.1528, 82.0)
 # --------------------------------------------------------------------------
 # Fake HTTP plumbing
 # --------------------------------------------------------------------------
-
-
-class FakeResponse(io.BytesIO):
-    """Minimal stand-in for the object urlopen returns."""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-        return False
-
-
-def responder(mapping: dict[str, object], *, default=None):
-    """Build a fake urlopen that serves payloads by URL substring.
-
-    A mapping value may be bytes/str (served verbatim), a JSON-able object, or
-    an Exception instance (raised, to simulate that source failing).
-    """
-
-    def _urlopen(request, timeout=None):
-        url = request.full_url if hasattr(request, "full_url") else str(request)
-        for needle, payload in mapping.items():
-            if needle in url:
-                if isinstance(payload, Exception):
-                    raise payload
-                if isinstance(payload, bytes):
-                    return FakeResponse(payload)
-                if isinstance(payload, str):
-                    return FakeResponse(payload.encode())
-                return FakeResponse(json.dumps(payload).encode())
-        if default is None:
-            raise urllib.error.URLError("no route to host (unmapped in test)")
-        if isinstance(default, Exception):
-            raise default
-        return FakeResponse(json.dumps(default).encode())
-
-    return _urlopen
-
-
-def fixture_bytes(name: str) -> bytes:
-    return (Path(__file__).parent / "fixtures" / name).read_bytes()
 
 
 ALL_SOURCES_OK = {
@@ -348,7 +307,7 @@ def test_unusable_gp_payloads_are_rejected(tmp_path, monkeypatch, payload):
     monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": payload}))
     group = SatelliteGroup(key="stations", label="Stations", max_objects=10)
 
-    result = celestrak.fetch_group(group, tmp_path)
+    result = celestrak.fetch_group(group, tmp_path, allow_network=True)
 
     assert result.outcome is Outcome.FAILED
     assert result.data is None
@@ -360,7 +319,7 @@ def test_partially_valid_gp_payload_keeps_the_good_records(tmp_path, monkeypatch
     monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": mixed}))
     group = SatelliteGroup(key="stations", label="Stations", max_objects=100)
 
-    result = celestrak.fetch_group(group, tmp_path)
+    result = celestrak.fetch_group(group, tmp_path, allow_network=True)
 
     assert result.ok
     assert len(result.data) == len(good)
@@ -613,7 +572,9 @@ def test_build_survives_total_upstream_blackout(tmp_path, monkeypatch):
     assert weather["correlation"]["severity"] == "unknown"
 
 
-def test_build_serves_cached_data_when_upstream_dies(tmp_path, seeded_cache):
+def test_build_serves_cached_data_when_upstream_dies(
+    tmp_path, seeded_cache, celestrak_snapshot
+):
     """With a warm cache and a dead network, we still publish real numbers.
 
     This is the normal degraded state in production: the scheduled job runs,
@@ -642,13 +603,20 @@ def test_build_serves_cached_data_when_upstream_dies(tmp_path, seeded_cache):
     # Real satellites came out of the cache.
     assert meta["counts"]["tracked_satellites"] > 0
     # But nothing claims to be fresh -- we could not reach anyone.
-    assert health["counts"]["fresh"] == 0
-    assert health["overall"] == "stale"
-    assert all(s["outcome"] == "cache_fallback" for s in health["sources"])
-    assert all("unreachable" in s["detail"].lower() for s in health["sources"])
+    # Celestrak is snapshot-only now, so only the SWPC sources exercise the
+    # cache-fallback path. That is the point of the change: a dead network can
+    # no longer touch the element sets at all.
+    swpc = [s for s in health["sources"] if s["name"].startswith("swpc_")]
+    assert swpc, "expected SWPC sources in the health report"
+    assert all(s["outcome"] == "cache_fallback" for s in swpc)
+    assert all("unreachable" in s["detail"].lower() for s in swpc)
+    assert all(s["state"] != "fresh" for s in swpc)
+    assert health["overall"] in ("stale", "failed")
 
 
-def test_build_completes_when_everything_is_healthy(tmp_path, monkeypatch):
+def test_build_completes_when_everything_is_healthy(
+    tmp_path, monkeypatch, celestrak_snapshot
+):
     """The happy path still works -- degradation handling has not broken it."""
     monkeypatch.setattr("urllib.request.urlopen", responder(ALL_SOURCES_OK))
 
@@ -913,9 +881,17 @@ def test_seed_carries_a_cold_build_with_no_network(tmp_path, monkeypatch, real_s
     )
 
     manifest = json.loads((real_seed_dir / "manifest.json").read_text())
+    # Pin to the newest *SWPC* capture: those are the entries exercising the
+    # seed path here (Celestrak reads the snapshot by design, not as a
+    # fallback). The refresher updates the Celestrak entries independently, so
+    # taking the max across all sources would pick a Celestrak time hours
+    # after the SWPC captures -- putting the SWPC seeds past their 3h window
+    # at the pinned instant, firing the age wording instead of the seed
+    # wording, and failing this test for reasons unrelated to what it tests.
     newest_capture = max(
         datetime.fromisoformat(entry["retrieved_at"])
-        for entry in manifest["sources"].values()
+        for name, entry in manifest["sources"].items()
+        if name.startswith("swpc_")
     )
 
     meta = run_build(
@@ -929,10 +905,16 @@ def test_seed_carries_a_cold_build_with_no_network(tmp_path, monkeypatch, real_s
     health = assert_site_is_complete(tmp_path / "dist")
 
     assert meta["counts"]["tracked_satellites"] > 0, "seed did not populate the build"
-    assert all(s["outcome"] == "seed" for s in health["sources"])
-    # Never fresh: a seed means we reached nobody.
-    assert health["counts"]["fresh"] == 0
-    assert all("not live" in s["detail"] for s in health["sources"])
+    # Celestrak comes from the snapshot by design; SWPC falls back to the seed
+    # because its upstream is unreachable and there is no cache.
+    outcomes = {s["name"]: s["outcome"] for s in health["sources"]}
+    assert all(outcomes[n] == "snapshot" for n in outcomes if n.startswith("celestrak_"))
+    assert all(outcomes[n] == "seed" for n in outcomes if n.startswith("swpc_"))
+    # A seed means we reached nobody, so nothing served from one may be fresh.
+    seeded = [s for s in health["sources"] if s["outcome"] == "seed"]
+    assert seeded
+    assert all(s["state"] != "fresh" for s in seeded)
+    assert all("not live" in s["detail"] for s in seeded)
 
 
 def test_seed_is_never_reported_as_fresh(tmp_path, monkeypatch):
