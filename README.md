@@ -402,7 +402,10 @@ src/orbital_watch/
 ├── health.py            freshness state machine
 └── build.py             entry point: writes dist/data/*.json
 web/                     static frontend, copied verbatim into dist/
+  _headers               Cloudflare Pages response headers (CSP, caching)
+seed/                    last-resort snapshot for builds with no cache
 tests/fixtures/          real API responses, committed
+wrangler.toml            Cloudflare Pages build output directory
 ```
 
 Design decisions and their rationale are in [DECISIONS.md](DECISIONS.md).
