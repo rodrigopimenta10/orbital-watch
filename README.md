@@ -1,9 +1,21 @@
 # Orbital Watch
 
+[![CI](https://github.com/rodrigopimenta10/orbital-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/rodrigopimenta10/orbital-watch/actions/workflows/ci.yml)
+
 A public dashboard that tracks which satellites are passing over a ground
 station and correlates those passes with live space-weather conditions.
 
+**The design thesis: a monitoring system must report its own degradation as
+honestly as it reports its data.** Every number on the page carries its source
+and age; every upstream source is classified fresh, stale, or failed against
+published thresholds; and no fallback — cache, snapshot, or seed — is ever
+allowed to claim freshness it does not have. The interesting engineering here
+is not the orbital mechanics, it is what happens when things break.
+
 **Live site:** **[orbital.rodrigopimenta.com](https://orbital.rodrigopimenta.com)**
+· **[DECISIONS.md](DECISIONS.md)** — every design decision with its rationale
+and the failures that forced it, which is the half of engineering a repo
+usually hides.
 
 ![The Orbital Watch dashboard: operational assessment banner, space weather tiles, and Kp history chart](docs/dashboard.jpg)
 
@@ -12,6 +24,14 @@ source reports its state, its last success, the thresholds that define that
 state, and how long the fetch took:
 
 ![The system health panel: per-source state, last success time, freshness thresholds and fetch duration for all seven upstream sources](docs/health-panel.jpg)
+
+And the same panel during a real degradation — NOAA SWPC unreachable, the site
+serving five-hour-old cached space weather and saying so, while the element
+sets stay fresh from the committed snapshot. This mixed state is the thesis in
+one image; a dashboard that only ever shows seven green rows is just asserting
+its own health, not reporting it:
+
+![The health panel degraded: three Celestrak sources fresh from the snapshot, four NOAA SWPC sources stale with the connection error and the age of the cached data they are serving](docs/health-degraded.jpg)
 
 ---
 

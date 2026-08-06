@@ -349,3 +349,150 @@ and the workflow writes curl output to a file rather than stdout so an error
 body containing the URL cannot land in a public log. The workflow declares
 `permissions: {}` and uses no third-party actions, because pinging a URL needs
 neither.
+
+---
+
+## 14. The refresh trigger moved to a Cloudflare Worker — §13's reasoning was wrong
+
+**Decision.** Rebuilds are triggered by a Cloudflare Worker Cron Trigger
+(`infra/refresh-worker/`) POSTing the Pages deploy hook. The GitHub Actions
+workflow that previously did this is deleted.
+
+**The failure that forced it.** On 2026-08-06 GitHub Actions went into a
+`major_outage`. The site's data went stale for over three hours and the
+staleness banner fired — while Cloudflare, which hosts the site, was healthy
+the entire time. Only the scheduler was down, and it took the whole freshness
+story with it. Worse: that workflow had *never fired once* — the Actions API
+showed zero runs since it was committed, so the deploy-hook path was entirely
+unverified in production.
+
+**Correcting §13, not quietly contradicting it.** §13 rejected building in
+Actions partly to avoid "splitting the build across two providers." But the
+topology it chose still spanned two providers — just for the *trigger* instead
+of the build — and the seam is exactly where it broke. The principle was
+right; §13 simply failed to apply it to the scheduler. Host and scheduler now
+live on one platform, so a refresh can only stop for a reason that would have
+taken the site down anyway.
+
+**What stays on Actions, and why that is consistent.** `ci.yml` (tests belong
+with the code host; CI going down does not affect the live site) and the
+snapshot refresher (§16 — its failure mode is honest aging, not silent
+freezing, and it needs repository write access that a Worker would need a
+long-lived PAT to obtain).
+
+**The Worker also watches the watchman.** The original failure was silent — the
+only signal was a visitor noticing the banner. On every tick the Worker checks
+the *previous* cycle: it fetches the deployed `health.json` and, if
+`generated_at` is older than 3× the cadence, opens a GitHub issue (deduplicated
+against an existing open one) or at minimum logs at error level. It also runs a
+synthetic check on all eight public endpoints asserting status **and**
+content-type — a 200 alone is worthless, because the Pages SPA fallback
+answers 200 `text/html` for a missing asset, which is exactly how a blank page
+once shipped while naive checks stayed green.
+
+---
+
+## 15. Cadence: every 2 hours, because hourly exceeded a hard limit
+
+**Decision.** The Worker cron is `0 */2 * * *`.
+
+**Why hourly was not sustainable.** Cloudflare Pages Free allows **500 builds
+per month**, and every build counts — cron-triggered or push-triggered. Hourly
+is 720/month: the allowance would run out around day 20, after which rebuilds
+simply stop and the site silently freezes with no failure anywhere to look at.
+
+| Cadence | Builds/month | Headroom vs 500 |
+|---|---|---|
+| Hourly | 720 | −220 — over the cap |
+| Every 90 min | 480 | 20 — too tight to absorb pushes |
+| **Every 2 hours** | **360** | **140** |
+| Every 3 hours | 240 | wastefully conservative |
+
+Snapshot-refresh commits (§16) carry `[CI Skip]`, which Pages recognises, so
+they cost zero builds — the budget stays 360 + development pushes.
+
+**Two hours is independently right, not just affordable.** Celestrak
+regenerates GP data every 2 hours, so polling faster returned data that did
+not exist yet; the slower cadence also halves pressure on their rate limiter;
+and it stays inside SWPC's 3-hour freshness window, so a normal run reports
+FRESH.
+
+**Accepted tradeoff.** At this cadence, *one* missed run puts space weather at
+4 hours old and the site reports STALE. That is correct behaviour, not a
+regression — the page is telling the truth about its own data.
+`SPACE_WEATHER_STALENESS.fresh_within` stays at 3 hours because Kp is a
+3-hourly index; loosening a threshold to suppress an honest signal would
+destroy the one thing this project is for.
+
+---
+
+## 16. Builds read Celestrak from a committed snapshot; one refresher owns fetching
+
+**Decision.** §10.3 Option A. The build never contacts Celestrak: it reads
+`seed/`, which a scheduled job (`refresh-snapshot.yml`, every 6 hours)
+refreshes and commits. The new `SNAPSHOT` outcome is classified purely by
+age — the intended source, not a fallback.
+
+**Why the old design's politeness guarantee was fictional.** The 6-hour
+refetch floor was enforced against the on-disk cache, and Cloudflare Pages
+build containers are ephemeral: cold cache on every build, so the floor never
+applied in production and every build hit Celestrak three times. Celestrak
+throttled intermittently — one observed build had all three groups time out at
+20s and fall back to the seed while SWPC succeeded; the build ten minutes
+later got everything live. §3's "the schedule, not just the code, has to stay
+conservative" half-acknowledged the problem without resolving it. The floor is
+now enforced by the refresher against the manifest timestamp — the only state
+that actually persists between runs — which makes it real for the first time.
+
+**What it buys beyond politeness.** Builds are deterministic and reproducible
+offline, and the committed snapshots double as a coarse TLE time series.
+
+**Two bugs the implementation surfaced, both worth recording:**
+
+1. **NOT_MODIFIED must advance the confirmation time.** Celestrak answers
+   "not updated since your last download" when we already hold its newest
+   element sets. Recording the payload's original download time would age a
+   snapshot upstream had *just confirmed current* — STALE while holding the
+   freshest data in existence. The manifest records when currency was last
+   confirmed, which is the question the health panel is actually asking.
+   Per-satellite element age is reported separately from the EPOCH field, so
+   this hides nothing.
+2. **A failed refresh must not count as a refresh.** The fetch helper falls
+   back to cache and then seed — and the seed *is* the snapshot. Without a
+   guard, a refresher that could never reach Celestrak again would read its
+   own output, write it back, advance the timestamp, and report a fresh
+   snapshot forever: precisely the species of dishonesty this project exists
+   to argue against. Only `LIVE` or `NOT_MODIFIED` outcomes update the
+   manifest.
+
+**Why the refresher runs on GitHub Actions after §14 moved the trigger off
+it.** The rule from §14 is about failure modes, not providers. If the rebuild
+trigger dies, the site freezes *silently* — so it lives with the host. If the
+snapshot refresher dies, the snapshot ages and the health panel reports STALE
+then FAILED with its true capture time, while rebuilds keep publishing —
+honest degradation, observed by both the dead-man check and a CI check that
+fails when the manifest is older than 30 days. And a scheduled commit needs
+repository write access, which Actions has natively.
+
+---
+
+## 17. Two production bugs from 2026-08-06, recorded so they stay fixed
+
+**Negative data age.** Threading the build's *start* time into health
+classification made sources fetched during the build resolve to a negative
+age, which rendered as "Fetched from upstream in the future ago" on the live
+site. Two fixes, deliberately layered: `run_build` passes the caller's
+explicit clock (or wall-clock), and `health` clamps age at zero regardless —
+belt and braces, because this string ships to the public page. Regression
+tests pin both.
+
+**A test that rots with the fixture it reads.** The cold-build seed test
+asserted seed-specific wording in the health detail — but age is evaluated
+before outcome in classification, so once the committed seed aged past a
+source's freshness window, the age wording fired instead and the test failed
+permanently. Against a live clock it passed only for the few hours after each
+re-seed. The clock is now derived from `seed/manifest.json` (specifically the
+SWPC entries, since the Celestrak entries are refreshed on their own schedule
+and would skew the pinned instant). A test that fails on the age of a
+checked-in fixture rather than the behaviour under test is a trap for whoever
+touches the repo next — the failure looks exactly like a real regression.
