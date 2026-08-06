@@ -7,6 +7,12 @@ station and correlates those passes with live space-weather conditions.
 
 ![The Orbital Watch dashboard: operational assessment banner, space weather tiles, and Kp history chart](docs/dashboard.jpg)
 
+The system health panel, which is the part worth looking at closely — every
+source reports its state, its last success, the thresholds that define that
+state, and how long the fetch took:
+
+![The system health panel: per-source state, last success time, freshness thresholds and fetch duration for all seven upstream sources](docs/health-panel.jpg)
+
 ---
 
 ## Why it exists
