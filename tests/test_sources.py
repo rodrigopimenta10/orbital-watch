@@ -688,3 +688,133 @@ def test_staleness_policy_is_explicit_not_magic():
     for policy in (TLE_STALENESS, SPACE_WEATHER_STALENESS):
         assert isinstance(policy, StalenessPolicy)
         assert policy.fresh_within < policy.stale_within
+
+
+# --------------------------------------------------------------------------
+# Regressions: paths that used to abort the build
+# --------------------------------------------------------------------------
+#
+# Each of these was a real crash found by auditing the resilience contract.
+# They share a shape: the code that was supposed to *absorb* bad data was
+# itself unsafe against bad data, so a degraded input became a dead build --
+# the exact inversion of what this project claims.
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [
+        {"error": "oops"},  # dict where a list was expected
+        ["not-a-record"],  # list of scalars
+        [None],
+        [42],
+        "a bare string",
+        123,
+    ],
+)
+def test_build_survives_a_cache_holding_the_wrong_shape(tmp_path, monkeypatch, poison):
+    """A cache written by an older revision must not take the build down.
+
+    CI restores the previous run's cache by key prefix, so a payload written
+    by older code is routinely loaded by newer code. If the shape has changed
+    since, that must degrade to "no data", never to a crash.
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    stamp = json.dumps({"retrieved_at": datetime.now(UTC).isoformat()})
+    for name in (
+        "celestrak_stations",
+        "celestrak_weather",
+        "celestrak_starlink",
+        "swpc_kp",
+        "swpc_solar_wind",
+        "swpc_mag_field",
+        "swpc_solar_cycle",
+    ):
+        (cache_dir / f"{name}.json").write_text(json.dumps(poison))
+        (cache_dir / f"{name}.json.meta").write_text(stamp)
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        responder({}, default=urllib.error.URLError("offline")),
+    )
+
+    run_build(
+        cache_dir=cache_dir,
+        build_dir=tmp_path / "dist",
+        web_dir=tmp_path / "nonexistent-web",
+        observer=OBSERVER,
+    )
+
+    health = assert_site_is_complete(tmp_path / "dist")
+    assert health["overall"] == "failed"
+    assert health["counts"]["fresh"] == 0
+
+
+def test_build_survives_upstream_serving_the_wrong_shape(tmp_path, monkeypatch):
+    """Same guarantee when the garbage arrives live rather than from cache."""
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        responder({}, default={"totally": "unexpected"}),
+    )
+
+    run_build(
+        cache_dir=tmp_path / "cache",
+        build_dir=tmp_path / "dist",
+        web_dir=tmp_path / "nonexistent-web",
+        observer=OBSERVER,
+    )
+
+    assert_site_is_complete(tmp_path / "dist")
+
+
+def test_naive_timestamp_in_cache_metadata_does_not_raise(tmp_path, monkeypatch):
+    """A tz-naive meta timestamp used to raise TypeError out of fetch_json.
+
+    It happened on a path outside the main try block, so it escaped a function
+    whose entire contract is that it never raises.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": [{"a": 1}]}))
+    fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
+
+    # Naive: no timezone offset at all.
+    (tmp_path / "gp.json.meta").write_text(
+        json.dumps({"retrieved_at": "2026-08-06T12:00:00"})
+    )
+
+    result = fetch_json(
+        "gp",
+        "https://celestrak.org/gp.php",
+        tmp_path,
+        min_refetch_interval=timedelta(hours=6),
+    )
+    assert result.ok
+    assert result.last_success is not None
+    assert result.last_success.tzinfo is not None
+
+
+def test_timeout_error_reports_the_timeout_actually_used(tmp_path, monkeypatch):
+    """The health panel publishes this string, so it must not quote a default."""
+    monkeypatch.setattr(
+        "urllib.request.urlopen", responder({"x.json": TimeoutError("slow")})
+    )
+
+    result = fetch_json("x", "https://example.invalid/x.json", tmp_path, timeout=3.0)
+
+    assert result.error == "Timed out after 3s"
+
+
+def test_health_output_carries_notes_and_elapsed(tmp_path, monkeypatch):
+    """Operator-facing notes must reach health.json, not die in the dataclass."""
+    monkeypatch.setattr("urllib.request.urlopen", responder(ALL_SOURCES_OK))
+    run_build(
+        cache_dir=tmp_path / "cache",
+        build_dir=tmp_path / "dist",
+        web_dir=tmp_path / "nonexistent-web",
+        observer=OBSERVER,
+    )
+
+    health = json.loads((tmp_path / "dist" / DATA_SUBDIR / "health.json").read_text())
+    for source in health["sources"]:
+        assert "notes" in source
+        assert isinstance(source["notes"], list)
+        assert source["elapsed_seconds"] is not None

@@ -121,6 +121,8 @@ def build_satellites(
     tracked: list[TrackedSatellite] = []
     for record in records:
         try:
+            if not isinstance(record, dict):
+                raise TypeError(f"expected a GP record dict, got {type(record).__name__}")
             satrec = Satrec()
             omm.initialize(satrec, record)
             sat = EarthSatellite.from_satrec(satrec, ts)
@@ -138,10 +140,19 @@ def build_satellites(
                 )
             )
         except Exception as exc:
+            # Deliberately avoids record.get() here. This handler exists to
+            # absorb malformed records, so calling a dict method on one would
+            # make the handler itself raise -- turning "skip one satellite"
+            # into "abort the build", the exact opposite of its purpose.
+            label = (
+                record.get("OBJECT_NAME")
+                if isinstance(record, dict)
+                else repr(record)[:60]
+            )
             log.warning(
                 "skipping unpropagatable object group=%s name=%r error=%s",
                 group.key,
-                record.get("OBJECT_NAME"),
+                label,
                 exc,
             )
     log.info("group=%s built %d/%d satellites", group.key, len(tracked), len(records))
@@ -244,7 +255,14 @@ def _assemble_passes(
             pending = {_RISE: t}
         elif event == _CULMINATE:
             if _RISE in pending:
-                pending[_CULMINATE] = t
+                # A single pass can culminate more than once when the elevation
+                # curve wobbles. Keep the highest, not the last, so
+                # peak_elevation_deg is the actual maximum of the pass.
+                previous = pending.get(_CULMINATE)
+                if previous is None or _elevation_at(item, site, t) > _elevation_at(
+                    item, site, previous
+                ):
+                    pending[_CULMINATE] = t
         elif event == _SET:
             if _RISE in pending and _CULMINATE in pending:
                 built = _build_pass(item, site, pending[_RISE], pending[_CULMINATE], t)
@@ -255,6 +273,18 @@ def _assemble_passes(
             pending = {}
 
     return collected
+
+
+def _elevation_at(item: TrackedSatellite, site: GeographicPosition, t) -> float:
+    """Elevation in degrees, or -inf if it cannot be computed.
+
+    Returning -inf rather than raising keeps the caller's comparison total, so
+    a bad sample loses the max rather than aborting the pass search.
+    """
+    try:
+        return float((item.satellite - site).at(t).altaz()[0].degrees)
+    except Exception:
+        return float("-inf")
 
 
 def _build_pass(

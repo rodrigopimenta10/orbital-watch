@@ -5,7 +5,8 @@ Run with ``uv run python -m orbital_watch.build``.
 The contract this module upholds is the one that makes the whole project work:
 **it completes.** Any single upstream source can be down, slow, or returning
 nonsense, and this still produces a valid site with an honest account of what
-is missing. The only way it exits non-zero is if it cannot write files at all.
+is missing. No upstream failure can make it exit non-zero; it returns 1 only
+if it cannot write output at all, and 2 if our own code has a bug.
 """
 
 from __future__ import annotations
@@ -83,7 +84,7 @@ def collect_satellites(cache_dir: Path, ts) -> tuple[list, list]:
     for group in TRACKED_GROUPS:
         result = celestrak.fetch_group(group, cache_dir)
         reports.append(
-            health.evaluate(result, TLE_STALENESS, label=f"Celestrak - {group.label}")
+            health.evaluate(result, TLE_STALENESS, label=f"Celestrak — {group.label}")
         )
 
         if not result.ok:
@@ -108,39 +109,15 @@ def collect_satellites(cache_dir: Path, ts) -> tuple[list, list]:
 # --------------------------------------------------------------------------
 
 
-def collect_space_weather(cache_dir: Path) -> tuple[dict, list]:
-    """Fetch and interpret space weather. Degrades field by field."""
-    reports: list[health.SourceHealth] = []
+def empty_weather() -> dict[str, Any]:
+    """The space-weather block with every field absent.
 
-    kp_result = swpc.fetch_kp(cache_dir)
-    reports.append(
-        health.evaluate(
-            kp_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC - Planetary K-index"
-        )
-    )
-
-    wind_result = swpc.fetch_solar_wind(cache_dir)
-    reports.append(
-        health.evaluate(
-            wind_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC - Solar Wind Speed"
-        )
-    )
-
-    mag_result = swpc.fetch_mag_field(cache_dir)
-    reports.append(
-        health.evaluate(
-            mag_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC - IMF (Bt/Bz)"
-        )
-    )
-
-    cycle_result = swpc.fetch_solar_cycle(cache_dir)
-    reports.append(
-        health.evaluate(
-            cycle_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC - Solar Cycle"
-        )
-    )
-
-    weather: dict[str, Any] = {
+    A single definition of "we know nothing" means the frontend always receives
+    the same keys whether the fetch succeeded, partly succeeded, or the whole
+    stage fell over. Panels can then check one flag instead of guarding every
+    field individually.
+    """
+    return {
         "kp": None,
         "kp_label": None,
         "kp_description": None,
@@ -159,6 +136,41 @@ def collect_space_weather(cache_dir: Path) -> tuple[dict, list]:
         "solar_cycle_month": None,
         "available": False,
     }
+
+
+def collect_space_weather(cache_dir: Path) -> tuple[dict, list]:
+    """Fetch and interpret space weather. Degrades field by field."""
+    reports: list[health.SourceHealth] = []
+
+    kp_result = swpc.fetch_kp(cache_dir)
+    reports.append(
+        health.evaluate(
+            kp_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC — Planetary K-index"
+        )
+    )
+
+    wind_result = swpc.fetch_solar_wind(cache_dir)
+    reports.append(
+        health.evaluate(
+            wind_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC — Solar Wind Speed"
+        )
+    )
+
+    mag_result = swpc.fetch_mag_field(cache_dir)
+    reports.append(
+        health.evaluate(
+            mag_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC — IMF (Bt/Bz)"
+        )
+    )
+
+    cycle_result = swpc.fetch_solar_cycle(cache_dir)
+    reports.append(
+        health.evaluate(
+            cycle_result, SPACE_WEATHER_STALENESS, label="NOAA SWPC — Solar Cycle"
+        )
+    )
+
+    weather = empty_weather()
 
     if kp_result.ok:
         readings = swpc.parse_kp_series(kp_result.data)
@@ -251,7 +263,7 @@ def build_correlation(weather: dict) -> dict:
         return {
             "active": True,
             "severity": "storm",
-            "headline": f"Geomagnetic storm in progress - Kp {kp:g}",
+            "headline": f"Geomagnetic storm in progress — Kp {kp:g}",
             "detail": (
                 f"Kp is {kp:g}, at or above the storm threshold of "
                 f"{KP_STORM_THRESHOLD:g}. A ground-segment team would expect "
@@ -275,7 +287,7 @@ def build_correlation(weather: dict) -> dict:
         return {
             "active": True,
             "severity": "elevated",
-            "headline": f"Elevated geomagnetic activity - Kp {kp:g}",
+            "headline": f"Elevated geomagnetic activity — Kp {kp:g}",
             "detail": (
                 f"Kp is {kp:g}, at or above the elevated threshold of "
                 f"{KP_ELEVATED_THRESHOLD:g} but below the storm threshold of "
@@ -292,7 +304,7 @@ def build_correlation(weather: dict) -> dict:
     return {
         "active": False,
         "severity": "quiet",
-        "headline": f"Geomagnetic conditions nominal - Kp {kp:g}",
+        "headline": f"Geomagnetic conditions nominal — Kp {kp:g}",
         "detail": (
             f"Kp is {kp:g}, below the elevated threshold of "
             f"{KP_ELEVATED_THRESHOLD:g}. Drag and link conditions are nominal; "
@@ -308,7 +320,7 @@ def build_correlation(weather: dict) -> dict:
 # --------------------------------------------------------------------------
 
 
-def _sky_to_dict(position: SkyPosition) -> dict:
+def _sky_to_dict(position: SkyPosition, now: datetime) -> dict:
     return {
         "name": position.name,
         "norad_id": position.norad_id,
@@ -321,9 +333,9 @@ def _sky_to_dict(position: SkyPosition) -> dict:
         "sub_lon_deg": round(position.sub_lon_deg, 3),
         "altitude_km": round(position.altitude_km, 1),
         "tle_epoch": position.tle_epoch.isoformat(),
-        "tle_age_hours": round(
-            (datetime.now(UTC) - position.tle_epoch).total_seconds() / 3600.0, 1
-        ),
+        # Uses the build clock, not wall-clock: the reported element age has
+        # to describe the same instant the position was computed for.
+        "tle_age_hours": round((now - position.tle_epoch).total_seconds() / 3600.0, 1),
     }
 
 
@@ -391,8 +403,22 @@ def run_build(
     ts = timescale()
     site = site_from(observer)
 
-    tracked, tle_reports = collect_satellites(cache_dir, ts)
-    weather, weather_reports = collect_space_weather(cache_dir)
+    # Each stage is individually contained. fetch_json never raises, but the
+    # code that interprets what it returns still can -- a cached payload whose
+    # shape predates the current parser, an upstream that changed structure.
+    # Since the whole promise of this build is that it completes, no single
+    # stage is allowed to be the thing that stops it.
+    try:
+        tracked, tle_reports = collect_satellites(cache_dir, ts)
+    except Exception:
+        log.exception("satellite collection failed; continuing with no satellites")
+        tracked, tle_reports = [], []
+
+    try:
+        weather, weather_reports = collect_space_weather(cache_dir)
+    except Exception:
+        log.exception("space weather collection failed; continuing without it")
+        weather, weather_reports = empty_weather(), []
 
     # Propagation is pure computation on data we already hold, but a
     # pathological element set could still throw. The site is worth more than
@@ -443,6 +469,11 @@ def run_build(
         },
     }
 
+    # Frontend first, generated data second. copy_frontend uses
+    # dirs_exist_ok=True, so doing it the other way round would let a stray
+    # web/data/ directory silently overwrite the JSON we just computed.
+    copy_frontend(web_dir, build_dir)
+
     data_dir = build_dir / DATA_SUBDIR
     write_json(data_dir / "meta.json", meta)
     write_json(
@@ -451,7 +482,7 @@ def run_build(
             "generated_at": started.isoformat(),
             "observer": observer_block,
             "horizon_elevation_deg": HORIZON_ELEVATION_DEG,
-            "satellites": [_sky_to_dict(p) for p in overhead],
+            "satellites": [_sky_to_dict(p, now) for p in overhead],
         },
     )
     write_json(
@@ -476,8 +507,6 @@ def run_build(
         data_dir / "health.json",
         {"generated_at": started.isoformat(), **health_block},
     )
-
-    copy_frontend(web_dir, build_dir)
 
     log.info(
         "build complete elapsed=%.2fs tracked=%d above_horizon=%d passes=%d health=%s",
@@ -514,9 +543,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         run_build(cache_dir=args.cache_dir, build_dir=args.build_dir)
     except OSError:
-        # The only genuinely fatal class of error: we cannot write output.
+        # Cannot write output. Nothing useful can be produced, so fail loudly.
         log.exception("build failed: could not write output")
         return 1
+    except Exception:
+        # Anything else reaching here is a bug in our own code rather than an
+        # upstream problem -- every upstream failure mode is handled deeper in.
+        # Report it as a real failure so CI goes red instead of quietly
+        # deploying a stale site, but log it fully rather than dumping a bare
+        # traceback at whoever is reading the workflow output.
+        log.exception("build failed: unexpected internal error")
+        return 2
     return 0
 
 

@@ -37,11 +37,6 @@ def block_network(monkeypatch):
     return _forbidden
 
 
-@pytest.fixture
-def fixtures_dir() -> Path:
-    return FIXTURES
-
-
 def load_fixture(name: str):
     """Load a committed fixture captured from the real upstream API."""
     return json.loads((FIXTURES / name).read_text())

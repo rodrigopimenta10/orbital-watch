@@ -15,10 +15,14 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
 dependencies = [
-    # Sole runtime dependency. Wraps the reference SGP4 implementation and adds
-    # topocentric geometry plus rise/culminate/set search. See DECISIONS.md.
+    # Topocentric geometry and rise/culminate/set search. See DECISIONS.md.
     # HTTP is stdlib urllib -- no requests, no httpx.
     "skyfield>=1.49",
+    # Declared explicitly because propagate.py imports sgp4.api and sgp4.omm
+    # directly. It arrives transitively via skyfield today, but depending on
+    # a transitive dependency for a direct import breaks the day skyfield
+    # vendors or drops it.
+    "sgp4>=2.20",
 ]
 
 [build-system]

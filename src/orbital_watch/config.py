@@ -9,6 +9,7 @@ logic.
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -49,13 +50,45 @@ class Observer:
     elevation_m: float = 0.0
 
 
+def _env_float(name: str, default: float, *, low: float, high: float) -> float:
+    """Read a float from the environment, falling back loudly on bad input.
+
+    This runs at import time, before logging is configured, so a bare
+    ``float()`` here would abort the build with an unexplained ValueError
+    traceback -- a mistyped coordinate should not look like a crash. Out-of-
+    range values are rejected too: a longitude of 771528 (a missed decimal
+    point) would otherwise silently produce a site on the wrong side of the
+    planet and passes that are quietly nonsense.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        warnings.warn(
+            f"{name}={raw!r} is not a number; using default {default}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    if not low <= value <= high:
+        warnings.warn(
+            f"{name}={value} is outside [{low}, {high}]; using default {default}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    return value
+
+
 #: Default observer. Overridable via environment so the same build can be
 #: pointed at a different ground station without a code change.
 DEFAULT_OBSERVER = Observer(
     name=os.environ.get("ORBITAL_WATCH_SITE_NAME", "Rockville, MD"),
-    latitude_deg=float(os.environ.get("ORBITAL_WATCH_LAT", "39.0840")),
-    longitude_deg=float(os.environ.get("ORBITAL_WATCH_LON", "-77.1528")),
-    elevation_m=float(os.environ.get("ORBITAL_WATCH_ELEV_M", "82")),
+    latitude_deg=_env_float("ORBITAL_WATCH_LAT", 39.0840, low=-90.0, high=90.0),
+    longitude_deg=_env_float("ORBITAL_WATCH_LON", -77.1528, low=-180.0, high=180.0),
+    elevation_m=_env_float("ORBITAL_WATCH_ELEV_M", 82.0, low=-500.0, high=9000.0),
 )
 
 
@@ -78,10 +111,6 @@ CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
 #: of how often the build runs. See DECISIONS.md.
 CELESTRAK_MIN_REFETCH_INTERVAL = timedelta(hours=6)
 
-#: SWPC has no comparable restriction and its data is genuinely minute-scale,
-#: so we refresh it on every build.
-SWPC_MIN_REFETCH_INTERVAL = timedelta(minutes=0)
-
 
 @dataclass(frozen=True)
 class SatelliteGroup:
@@ -97,7 +126,7 @@ class SatelliteGroup:
 
 TRACKED_GROUPS: tuple[SatelliteGroup, ...] = (
     SatelliteGroup(key="stations", label="Space Stations", max_objects=40),
-    SatelliteGroup(key="weather", label="Weather Satellites", max_objects=60),
+    SatelliteGroup(key="weather", label="Weather Satellites", max_objects=90),
     SatelliteGroup(key="starlink", label="Starlink", max_objects=60),
 )
 

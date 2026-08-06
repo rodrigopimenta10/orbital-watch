@@ -48,10 +48,6 @@ class Outcome(StrEnum):
     #: Upstream failed and there was no cache. No data at all.
     FAILED = "failed"
 
-    @property
-    def is_degraded(self) -> bool:
-        return self in (Outcome.CACHE_FALLBACK, Outcome.FAILED)
-
 
 @dataclass
 class FetchResult:
@@ -77,12 +73,6 @@ class FetchResult:
     def ok(self) -> bool:
         return self.data is not None
 
-    @property
-    def age(self) -> timedelta | None:
-        if self.last_success is None:
-            return None
-        return datetime.now(UTC) - self.last_success
-
 
 # A Celestrak quirk worth spelling out: when you re-request a GP group inside
 # its 2-hour refresh window, it answers HTTP 200 with a plaintext body reading
@@ -100,21 +90,55 @@ class _CacheEntry:
         self.path = path
         self.meta_path = path.with_suffix(path.suffix + ".meta")
 
-    def read(self) -> tuple[Any | None, datetime | None]:
+    def read(self, parser: Any = None) -> tuple[Any | None, datetime | None]:
+        """Read the cached payload, validating it the same way live data is.
+
+        ``parser`` matters more than it looks. Cache entries outlive the code
+        that wrote them -- CI restores the previous run's cache by prefix, so a
+        payload written by an older revision is loaded by a newer one. If the
+        expected shape has changed since, handing that stale shape downstream
+        unvalidated is how a cache fallback turns into a build crash, which is
+        precisely the failure the cache exists to prevent. Validating on read
+        means a stale-shaped cache degrades to "no data" instead.
+        """
         if not self.path.exists():
             return None, None
         try:
-            data = json.loads(self.path.read_text())
+            data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("cache read failed path=%s error=%s", self.path, exc)
             return None, None
+
+        if parser is not None:
+            try:
+                data = parser(data)
+            except Exception as exc:
+                log.warning(
+                    "cached payload rejected by validator path=%s error=%s "
+                    "(shape likely written by an older revision)",
+                    self.path,
+                    exc,
+                )
+                return None, None
+
         return data, self._read_timestamp()
 
     def _read_timestamp(self) -> datetime | None:
+        stamp = self._read_timestamp_raw()
+        if stamp is None:
+            return None
+        # A meta file can legitimately hold a naive timestamp (hand-edited, or
+        # written by an older revision). Comparing that against an aware "now"
+        # raises TypeError, and this method is called from paths that are
+        # outside the main try block -- so an unnormalised value here would
+        # take down a function documented as never raising.
+        return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+
+    def _read_timestamp_raw(self) -> datetime | None:
         try:
-            meta = json.loads(self.meta_path.read_text())
+            meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
             return datetime.fromisoformat(meta["retrieved_at"])
-        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             # Fall back to mtime; less precise but better than claiming nothing.
             try:
                 ts = self.path.stat().st_mtime
@@ -128,10 +152,11 @@ class _CacheEntry:
             # Write via a temp file so an interrupted build cannot leave a
             # half-written cache that poisons the next run.
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(json.dumps(data))
+            tmp.write_text(json.dumps(data), encoding="utf-8")
             tmp.replace(self.path)
             self.meta_path.write_text(
-                json.dumps({"retrieved_at": retrieved_at.isoformat()})
+                json.dumps({"retrieved_at": retrieved_at.isoformat()}),
+                encoding="utf-8",
             )
         except OSError as exc:
             log.warning("cache write failed path=%s error=%s", self.path, exc)
@@ -174,7 +199,7 @@ def fetch_json(
     if min_refetch_interval is not None:
         cached_age = cache.age()
         if cached_age is not None and cached_age < min_refetch_interval:
-            data, retrieved = cache.read()
+            data, retrieved = cache.read(parser)
             if data is not None:
                 log.info(
                     "source=%s outcome=cache_fresh age=%s elapsed=%.3fs "
@@ -228,7 +253,7 @@ def fetch_json(
         elapsed = time.monotonic() - started
         now = datetime.now(UTC)
         cache.write(data, now)
-        log.info("source=%s outcome=live elapsed=%.3fs bytes=%d", name, elapsed, len(raw))
+        log.info("source=%s outcome=live elapsed=%.3fs chars=%d", name, elapsed, len(raw))
         return FetchResult(
             name=name,
             url=url,
@@ -240,7 +265,7 @@ def fetch_json(
 
     except _NotModified as exc:
         elapsed = time.monotonic() - started
-        data, retrieved = cache.read()
+        data, retrieved = cache.read(parser)
         if data is not None:
             log.info(
                 "source=%s outcome=not_modified elapsed=%.3fs (upstream reports "
@@ -276,8 +301,8 @@ def fetch_json(
 
     except Exception as exc:
         elapsed = time.monotonic() - started
-        detail = _describe_error(exc)
-        data, retrieved = cache.read()
+        detail = _describe_error(exc, timeout)
+        data, retrieved = cache.read(parser)
         if data is not None:
             log.warning(
                 "source=%s outcome=cache_fallback elapsed=%.3fs error=%s cache_age=%s",
@@ -334,14 +359,18 @@ def _first_line(text: str) -> str:
     return stripped.splitlines()[0] if stripped else ""
 
 
-def _describe_error(exc: Exception) -> str:
-    """Human-readable one-liner for the health panel."""
+def _describe_error(exc: Exception, timeout: float) -> str:
+    """Human-readable one-liner for the health panel.
+
+    Published verbatim in health.json, so it must describe what the code
+    actually did -- including the timeout actually used, not the default.
+    """
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP {exc.code} {exc.reason}"
     if isinstance(exc, urllib.error.URLError):
         return f"Network error: {exc.reason}"
     if isinstance(exc, TimeoutError):
-        return f"Timed out after {HTTP_TIMEOUT_SECONDS:.0f}s"
+        return f"Timed out after {timeout:.0f}s"
     if isinstance(exc, json.JSONDecodeError):
         return f"Malformed JSON: {exc.msg}"
     if isinstance(exc, ValueError):

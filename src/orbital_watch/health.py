@@ -21,7 +21,7 @@ would be a lie of exactly the kind this panel exists to prevent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
@@ -50,6 +50,11 @@ class SourceHealth:
     stale_within_seconds: float
     detail: str
     error: str | None = None
+    #: How long the fetch took. Published because "it succeeded" and "it
+    #: succeeded in 19 of a 20 second budget" are different operational facts.
+    elapsed_seconds: float | None = None
+    #: Extra operator-facing context from the fetch layer.
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -62,12 +67,14 @@ class SourceHealth:
                 self.last_success.isoformat() if self.last_success else None
             ),
             "age_seconds": self.age_seconds,
+            "elapsed_seconds": self.elapsed_seconds,
             "thresholds": {
                 "fresh_within_seconds": self.fresh_within_seconds,
                 "stale_within_seconds": self.stale_within_seconds,
             },
             "detail": self.detail,
             "error": self.error,
+            "notes": list(self.notes),
         }
 
 
@@ -102,6 +109,8 @@ def evaluate(
         stale_within_seconds=policy.stale_within.total_seconds(),
         detail=detail,
         error=result.error,
+        elapsed_seconds=round(result.elapsed_seconds, 3),
+        notes=list(result.notes),
     )
 
 

@@ -96,11 +96,11 @@ class KpReading:
 
 #: NOAA G-scale, keyed by the floor of Kp.
 _KP_BANDS: tuple[tuple[float, str, str], ...] = (
-    (9.0, "extreme", "G5 - extreme storm"),
-    (8.0, "severe", "G4 - severe storm"),
-    (7.0, "strong", "G3 - strong storm"),
-    (6.0, "moderate", "G2 - moderate storm"),
-    (5.0, "minor storm", "G1 - minor storm"),
+    (9.0, "extreme", "G5 — extreme storm"),
+    (8.0, "severe", "G4 — severe storm"),
+    (7.0, "strong", "G3 — strong storm"),
+    (6.0, "moderate", "G2 — moderate storm"),
+    (5.0, "minor storm", "G1 — minor storm"),
     (4.0, "active", "Active, below storm threshold"),
     (3.0, "unsettled", "Unsettled"),
     (0.0, "quiet", "Quiet"),
@@ -123,6 +123,16 @@ def parse_kp_series(records: list) -> list[KpReading]:
     assume, because the shape changing upstream should degrade to "we parsed
     what we could" and not a build failure.
     """
+    # Guard the container itself, not just its contents. A cached payload
+    # written by an older revision could be a dict or a scalar, and
+    # records[0] on a dict raises KeyError rather than returning an item.
+    if not isinstance(records, list):
+        log.warning(
+            "kp payload is %s, expected a list; parsed nothing",
+            type(records).__name__,
+        )
+        return []
+
     readings: list[KpReading] = []
 
     if records and isinstance(records[0], dict):
@@ -141,7 +151,7 @@ def parse_kp_series(records: list) -> list[KpReading]:
             log.warning("kp payload header not recognised: %s", header)
             return []
         for row in records[1:]:
-            if len(row) <= max(time_idx, kp_idx):
+            if not isinstance(row, list | tuple) or len(row) <= max(time_idx, kp_idx):
                 continue
             parsed = _reading_from(row[time_idx], row[kp_idx])
             if parsed:
@@ -195,7 +205,7 @@ def latest_value(records: list, *keys: str) -> tuple[float | None, datetime | No
     Used for the summary endpoints, which return a single-element list of
     dicts, e.g. ``[{"proton_speed": 301, "time_tag": "..."}]``.
     """
-    if not records:
+    if not isinstance(records, list) or not records:
         return None, None
     row = records[-1]
     if not isinstance(row, dict):
