@@ -146,16 +146,23 @@ jobs:
               return json.loads((data / "health.json").read_text())
 
 
-          # 1. Seed present: real data still renders, but nothing claims to be
-          #    fresh, because we reached no upstream at all.
+          # 1. Seed present. Celestrak reads the committed snapshot BY DESIGN
+          #    (outcome "snapshot", freshness judged by the snapshot's age, so
+          #    not asserted here -- it depends on when the refresher last ran).
+          #    SWPC has no cache and a dead network, so it must fall back to
+          #    the seed -- and nothing served from a seed may claim freshness,
+          #    because a seed means we reached nobody.
           seeded = build("seeded")
-          assert seeded["counts"]["fresh"] == 0, seeded["counts"]
-          assert all(
-              s["outcome"] == "seed" for s in seeded["sources"]
-          ), [s["outcome"] for s in seeded["sources"]]
+          outcomes = {s["name"]: s for s in seeded["sources"]}
+          for name, source in outcomes.items():
+              if name.startswith("celestrak_"):
+                  assert source["outcome"] == "snapshot", (name, source["outcome"])
+              else:
+                  assert source["outcome"] == "seed", (name, source["outcome"])
+                  assert source["state"] != "fresh", (name, source["state"])
           print(
-              f"OK seeded: {len(EXPECTED)} files, "
-              f"overall={seeded['overall']}, all sources served from seed"
+              f"OK seeded: {len(EXPECTED)} files, overall={seeded['overall']}, "
+              f"celestrak from snapshot, swpc from seed, no seed claims fresh"
           )
 
           # 2. No seed at all: the site must still be complete and must report

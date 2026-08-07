@@ -49,7 +49,12 @@ from orbital_watch.propagate import (
     timescale,
 )
 from orbital_watch.sources import celestrak, swpc
-from orbital_watch.sources.fetch import NetworkBudget, format_duration
+from orbital_watch.sources.fetch import (
+    NetworkBudget,
+    Outcome,
+    format_duration,
+    snapshot_upstream_available,
+)
 
 log = logging.getLogger("orbital_watch.build")
 
@@ -113,7 +118,15 @@ def collect_satellites(
             )
             continue
 
+        # For a snapshot, len(result.data) is the *trimmed* count the
+        # refresher committed, not the upstream population -- using it would
+        # turn the sampling disclosure into a false "all 60 starlink" claim.
+        # The refresher records the pre-trim count in the manifest.
         available = len(result.data)
+        if result.outcome is Outcome.SNAPSHOT:
+            upstream = snapshot_upstream_available(f"celestrak_{group.key}")
+            if upstream is not None:
+                available = upstream
         selected = celestrak.select_objects(result.data, group)
         built = build_satellites(selected, group, ts)
         tracked.extend(built)

@@ -60,6 +60,14 @@ is used explicitly: it guarantees no network access during propagation.
 
 ## 3. Update cadence: hourly workflow, 6-hour Celestrak floor enforced in code
 
+> **Superseded.** The cadence is now 2-hourly (§15) and the Celestrak floor
+> is enforced by the snapshot refresher against the committed manifest
+> rather than in the fetcher against a disk cache (§16) — production build
+> containers are ephemeral, so the cache-based floor described below never
+> actually applied there. Kept unedited as the record of the original
+> reasoning; the *principle* (politeness enforced in code, not by the
+> schedule) survived, its enforcement point did not.
+
 **Decision.** The scheduled workflow runs hourly (`0 * * * *`). The Celestrak
 fetcher independently refuses to re-request a group whose cached copy is
 younger than 6 hours.
@@ -299,6 +307,12 @@ elevation mask.
 ---
 
 ## 13. Hosting: Cloudflare Pages, custom domain, committed seed snapshot
+
+> **Partly superseded.** The trigger topology this section chose was
+> corrected by §14 after it failed in production, and for Celestrak the
+> committed snapshot has been promoted from last-resort fallback to the
+> *primary* source builds read (§16). The seed-as-fallback mechanism
+> described here still applies to the SWPC sources.
 
 **Decision.** Cloudflare Pages, building from the repository, served at
 `orbital.rodrigopimenta.com`. GitHub Actions no longer builds or deploys; it

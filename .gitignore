@@ -12,6 +12,14 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Working documents between local AI assistants -- not portfolio content.
+HANDOFF-KIRO.md
+
+# Interrupted atomic writes in the snapshot dir. refresh-snapshot.yml
+# runs `git add seed/`, so a crash-orphaned temp file would otherwise be
+# committed by automation.
+seed/*.tmp
+
 # Local editor/agent settings. Ignored here rather than relying on a personal
 # global gitignore, so it stays ignored on any clone.
 .claude/settings.local.json

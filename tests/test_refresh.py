@@ -226,3 +226,54 @@ def test_not_modified_still_advances_the_confirmation_time(
     assert age is not None and age < timedelta(minutes=1), (
         "a confirmed-current snapshot must not keep the stale payload timestamp"
     )
+
+
+def test_snapshot_coverage_reports_upstream_population_not_trimmed_count(
+    snapshot, monkeypatch, tmp_path
+):
+    """The sampling disclosure must survive the snapshot being the source.
+
+    Regression: the snapshot stores trimmed records, so taking `available`
+    from len(snapshot) made the page claim "all 60 starlink" — the honesty
+    feature inverted into a false completeness claim. The refresher records
+    the pre-trim population in the manifest, and the build must read it back.
+    """
+    from orbital_watch.build import collect_satellites
+    from orbital_watch.propagate import timescale
+
+    # Force trimming: the committed starlink fixture is itself already trimmed
+    # (40 records), so cap the group below that or nothing gets sampled and
+    # this test asserts nothing.
+    tight = (
+        SatelliteGroup(key="stations", label="Space Stations", max_objects=40),
+        SatelliteGroup(key="weather", label="Weather Satellites", max_objects=90),
+        SatelliteGroup(key="starlink", label="Starlink", max_objects=10),
+    )
+    monkeypatch.setattr("orbital_watch.refresh.TRACKED_GROUPS", tight)
+    monkeypatch.setattr("orbital_watch.build.TRACKED_GROUPS", tight)
+
+    # Refresh from a fixture where upstream offers more than the cap keeps.
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        responder(
+            {
+                "GROUP=stations": fixture_bytes("celestrak_stations.json"),
+                "GROUP=weather": fixture_bytes("celestrak_weather.json"),
+                "GROUP=starlink": fixture_bytes("celestrak_starlink.json"),
+            }
+        ),
+    )
+    refresh_snapshot(seed_dir=snapshot, cache_dir=tmp_path / "c")
+
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    starlink_upstream = manifest["sources"]["celestrak_starlink"]["available"]
+    starlink_kept = manifest["sources"]["celestrak_starlink"]["records"]
+    assert starlink_upstream > starlink_kept, (
+        "fixture must exercise trimming for this test to mean anything"
+    )
+
+    _, _, coverage = collect_satellites(tmp_path / "cache", timescale())
+
+    starlink = next(g for g in coverage if g["key"] == "starlink")
+    assert starlink["available"] == starlink_upstream
+    assert starlink["sampled"] is True

@@ -505,6 +505,24 @@ def _read_seed(name: str, parser: Any) -> tuple[Any | None, datetime | None]:
     return data, _seed_captured_at(name)
 
 
+def snapshot_upstream_available(name: str) -> int | None:
+    """How many records upstream offered when the snapshot was captured.
+
+    The snapshot stores *trimmed* records (Starlink keeps 60 of ~11k), so
+    ``len(snapshot)`` is the tracked count, not the population. Without this,
+    the coverage disclosure on the page would claim "all 60 starlink" — the
+    sampling-honesty feature silently inverting into a false completeness
+    claim the moment the snapshot became the primary source. The refresher
+    records the pre-trim count in the manifest; this reads it back.
+    """
+    try:
+        manifest = json.loads((SEED_DIR / "manifest.json").read_text(encoding="utf-8"))
+        raw = manifest["sources"][name]["available"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    return raw if isinstance(raw, int) and raw >= 0 else None
+
+
 def _seed_captured_at(name: str) -> datetime | None:
     """True capture time of a seed entry, from the committed manifest."""
     try:

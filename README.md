@@ -72,7 +72,7 @@ It is a portfolio project, not an operational tool.
             └──────────┬───────────────┘
                        ▼
          ┌──────────────────────────────┐
-         │  Cloudflare Pages build      │  hourly, via
+         │  Cloudflare Pages build      │  2-hourly, via
          │  fetch → propagate → health  │  a deploy hook
          │  → write JSON (seed backstop)│
          └──────────────┬───────────────┘
@@ -138,7 +138,8 @@ answer is testable in isolation.
 | Cache younger than the refetch floor | `cache_fresh` | Cached data | **fresh** — upstream deliberately not contacted |
 | Upstream says nothing changed | `not_modified` | Cached data | **fresh** |
 | Upstream down, cache warm | `cache_fallback` | Cached data still renders | **stale** — with the connection error |
-| Upstream down, no cache, seed present | `seed` | Committed snapshot renders | **stale** — never *fresh*, whatever its age |
+| Celestrak (by design, every build) | `snapshot` | Committed snapshot renders | judged by **age alone** — the snapshot is the intended source, not a fallback |
+| Upstream down, no cache, seed present | `seed` | Committed seed renders | **stale** — never *fresh*, whatever its age |
 | Upstream down, no cache, no seed | `failed` | That panel empties, others unaffected | **failed** — with the reason |
 | Data older than the staleness limit | — | Data still renders | **failed** — "not operationally current" |
 | Malformed / non-JSON response | `cache_fallback` | Cached data | **stale** — cache is *not* overwritten |
@@ -227,7 +228,7 @@ ORBITAL_WATCH_LON=15.4075 \
 ## Tests
 
 ```bash
-uv run pytest              # 116 tests
+uv run pytest              # 133 tests
 uv run ruff check .        # lint
 uv run ruff format --check .
 ```
@@ -261,20 +262,24 @@ build from producing a complete site that tells the truth about its own state.
 
 | Source | Endpoint | Fetched |
 |---|---|---|
-| [Celestrak](https://celestrak.org/) | GP API, groups `stations`, `weather`, `starlink` | at most every 6 h |
-| [NOAA SWPC](https://www.swpc.noaa.gov/) | planetary K-index | hourly |
-| NOAA SWPC | solar wind speed, IMF Bt/Bz | hourly |
-| NOAA SWPC | observed solar cycle indices | hourly |
+| [Celestrak](https://celestrak.org/) | GP API, groups `stations`, `weather`, `starlink` | every 6 h, by the snapshot refresher only — **builds never call it** |
+| [NOAA SWPC](https://www.swpc.noaa.gov/) | planetary K-index | every 2 h, during each build |
+| NOAA SWPC | solar wind speed, IMF Bt/Bz | every 2 h, during each build |
+| NOAA SWPC | observed solar cycle indices | every 2 h, during each build |
 
 All public, unauthenticated, no API keys. **The project requires no secrets and
 no `.env` file of any kind.**
 
-Celestrak rate-limits aggressively and blocks abusive clients, so:
+Celestrak rate-limits aggressively and blocks abusive clients, so all
+traffic to it is concentrated in one place:
 
-- responses are cached to disk and reused;
-- the fetcher **refuses** to re-request a group whose cache is younger than six
-  hours, enforced in code rather than by the cron schedule — so the limit holds
-  even under manual runs or a misconfigured trigger;
+- **builds never contact Celestrak.** They read the committed `seed/`
+  snapshot; a single scheduled refresher (`refresh-snapshot.yml`) owns every
+  request and commits what it fetches;
+- the refresher refuses to re-request a group whose snapshot is younger than
+  six hours, enforced against the committed manifest — the only state that
+  survives ephemeral build containers — so the limit holds even under manual
+  runs or a misconfigured schedule;
 - requests carry a descriptive `User-Agent` identifying the project;
 - only the three named groups are fetched, never the full catalogue.
 
@@ -385,12 +390,23 @@ outage was found.
 `ci.yml` stays on GitHub Actions. Tests and linting belong with the code host;
 it is only the production refresh path that must not depend on it.
 
-### Why the build fetches its own data
+### Why the data paths look the way they do
 
 Cloudflare build containers are ephemeral, so unlike a CI runner there is no
-`.cache/` carried between builds — every build starts cold. A cold build
-during an upstream outage would publish an empty dashboard, which is exactly
-the failure this project exists to avoid.
+`.cache/` carried between builds — every build starts cold. That single fact
+shaped both data paths:
+
+**Celestrak (TLEs)** is not fetched by builds at all. A cold cache meant the
+in-code rate-limit floor never applied in production and every build hit a
+rate-limited third party three times — so one scheduled refresher now owns
+that traffic and commits the result, and builds read the committed snapshot
+(`snapshot` outcome, judged by age like everything else).
+
+**NOAA SWPC (space weather)** is fetched live during each build — it has no
+comparable rate limit and its data genuinely changes between builds. A cold
+build during an SWPC outage would still publish an empty weather panel, which
+is exactly the failure this project exists to avoid; that is what the seed
+exists for.
 
 `seed/` is the answer: a small committed snapshot used only when there is no
 cache **and** upstream is unreachable. It is honest by construction rather
@@ -407,9 +423,13 @@ plainly that the data is not live.
   sockets blocked and asserts the result is a complete site reporting total
   upstream failure. Actions are pinned to commit SHAs rather than tags, since
   a tag can be re-pointed at other code.
-- **`update-data.yml`** — hourly deploy-hook trigger, plus
-  `workflow_dispatch`. `concurrency: cancel-in-progress: false`, so two
-  overlapping runs can never produce a half-published site.
+- **`refresh-snapshot.yml`** — every 6 hours, fetches Celestrak GP data and
+  commits it to `seed/` with a `[CI Skip]` prefix so the commit costs no
+  Pages build; the next scheduled rebuild picks it up. The only code path in
+  the project that talks to Celestrak.
+- The **rebuild trigger is not a workflow at all** — it is the Cloudflare
+  Worker in `infra/refresh-worker/` (see step 3 above), which also carries
+  the dead-man and synthetic endpoint checks.
 
 ### Deploying from the command line instead
 
