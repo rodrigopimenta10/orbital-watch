@@ -454,3 +454,72 @@ that, then stop — this project is going into low-maintenance mode.
       change, the Celestrak decision, and the two Aug 6 bugs.
 - [ ] `uv run pytest` and `uv run ruff check .` both clean.
 - [ ] Live site shows 7/7 fresh after a scheduled — not pushed — rebuild.
+
+---
+
+# 11. Bug found in production, Aug 7 — the refresh cron and the politeness floor fight each other
+
+**Status: the §10 work is deployed and the Worker cron is confirmed firing.** Build at
+18:03 UTC followed the 18:00 tick, SWPC live and fresh. That part works.
+
+**But the site went STALE on all three Celestrak sources anyway, and the cause is a
+scheduling interaction, not a failure.**
+
+Observed at 19:25 UTC Aug 7:
+
+```
+celestrak_stations   stale   snapshot   age=9.5h
+celestrak_weather    stale   snapshot   age=9.5h
+celestrak_starlink   stale   snapshot   age=9.5h
+swpc_*               fresh   live       age=0.0h
+```
+
+## What actually happened
+
+- `refresh-snapshot.yml` cron is `30 1,7,13,19` — **every 6 hours**.
+- `refresh` enforces a **6-hour minimum age** before it will re-request Celestrak.
+- The snapshot was captured at **08:33 UTC** (commit `0b46032`).
+- The **14:30 UTC run executed and "succeeded" in 18s but committed nothing** —
+  at 14:30 the snapshot was 5h57m old, just under the 6h floor, so it correctly
+  skipped.
+- Next opportunity is 19:30 UTC, by which point the snapshot is ~11h old.
+
+**So the effective refresh interval is ~12h, not 6h — while `TLE_STALENESS.fresh_within`
+is 8h.** The site is therefore guaranteed to spend several hours STALE in every cycle.
+This is deterministic, not a race: a cron interval equal to the floor means every other
+run lands microscopically under the threshold and skips.
+
+## Why the diagnostic message is also wrong
+
+The health detail reads *"The scheduled refresher has likely stopped committing."*
+It hasn't — it ran, succeeded, and correctly declined. The wording accuses the
+right component of the wrong failure, which is exactly the kind of misleading
+diagnostic this project exists to avoid. **Fix the message too:** distinguish
+"refresher has not run" from "refresher ran and skipped because the floor was not
+yet cleared."
+
+## Required fix
+
+**The cron interval must be meaningfully shorter than the politeness floor** so that
+some tick always lands after the floor clears. Options, best first:
+
+1. **Cron every 2h, keep the 6h floor.** Refresh lands at 6–8h, inside the 8h window,
+   and the floor still guarantees at most one Celestrak fetch per 6h per group. The
+   floor — not the schedule — remains the politeness mechanism, which is what
+   `DECISIONS.md` §3 always claimed. Costs nothing: these runs commit rarely, and
+   `[CI Skip]` means commits don't consume Pages builds.
+2. Cron every 3h with the floor lowered to ~5h. Works, but tunes two numbers against
+   each other and will rot the next time either changes.
+3. Widening `fresh_within` past 12h — **rejected.** That hides the problem by
+   loosening the honesty guarantee, which is the one thing this project must not do.
+
+**Do not** raise the freshness window, and **do not** remove the floor.
+
+Add a regression test that asserts the invariant directly: *for any snapshot age, the
+gap between successive successful refreshes must stay below
+`TLE_STALENESS.fresh_within`.* That's the property that was violated, and it's the
+thing no existing test covered — every test verified the floor and the cron in
+isolation, and the bug lives only in their interaction.
+
+Record it in `DECISIONS.md` as the fourth production bug, with the reasoning that a
+correct component plus a correct component can still compose into an incorrect system.
