@@ -262,7 +262,7 @@ build from producing a complete site that tells the truth about its own state.
 
 | Source | Endpoint | Fetched |
 |---|---|---|
-| [Celestrak](https://celestrak.org/) | GP API, groups `stations`, `weather`, `starlink` | every 6 h, by the snapshot refresher only — **builds never call it** |
+| [Celestrak](https://celestrak.org/) | GP API, groups `stations`, `weather`, `starlink` | at most every 5.5 h, by the snapshot refresher only — **builds never call it** |
 | [NOAA SWPC](https://www.swpc.noaa.gov/) | planetary K-index | every 2 h, during each build |
 | NOAA SWPC | solar wind speed, IMF Bt/Bz | every 2 h, during each build |
 | NOAA SWPC | observed solar cycle indices | every 2 h, during each build |
@@ -277,9 +277,11 @@ traffic to it is concentrated in one place:
   snapshot; a single scheduled refresher (`refresh-snapshot.yml`) owns every
   request and commits what it fetches;
 - the refresher refuses to re-request a group whose snapshot is younger than
-  six hours, enforced against the committed manifest — the only state that
-  survives ephemeral build containers — so the limit holds even under manual
-  runs or a misconfigured schedule;
+  the politeness floor (5 h 30 m — derived, not arbitrary: freshness window
+  minus cron cadence minus scheduling margin, an invariant a test enforces),
+  checked against the committed manifest — the only state that survives
+  ephemeral build containers — so the limit holds even under manual runs or
+  a misconfigured schedule;
 - requests carry a descriptive `User-Agent` identifying the project;
 - only the three named groups are fetched, never the full catalogue.
 
@@ -423,7 +425,9 @@ plainly that the data is not live.
   sockets blocked and asserts the result is a complete site reporting total
   upstream failure. Actions are pinned to commit SHAs rather than tags, since
   a tag can be re-pointed at other code.
-- **`refresh-snapshot.yml`** — every 6 hours, fetches Celestrak GP data and
+- **`refresh-snapshot.yml`** — cron every 2 hours, but fetches Celestrak only
+  when the politeness floor (5 h 30 m) has cleared — so actual fetches land
+  roughly every 6 hours. It fetches GP data and
   commits it to `seed/` with a `[CI Skip]` prefix so the commit costs no
   Pages build; the next scheduled rebuild picks it up. The only code path in
   the project that talks to Celestrak.

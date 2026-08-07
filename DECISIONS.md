@@ -510,3 +510,60 @@ SWPC entries, since the Celestrak entries are refreshed on their own schedule
 and would skew the pinned instant). A test that fails on the age of a
 checked-in fixture rather than the behaviour under test is a trap for whoever
 touches the repo next — the failure looks exactly like a real regression.
+
+---
+
+## 18. The fourth production bug: two correct components composed into a broken system
+
+**Observed, 2026-08-07, on the live site.** All three Celestrak sources STALE
+at 9.5h old while every SWPC source was fresh — and *nothing had failed*. The
+refresher's 14:30 UTC run executed, succeeded in 18 seconds, and committed
+nothing, because at that moment the snapshot was 5h57m old: three minutes
+under the 6-hour politeness floor. It correctly skipped. The next opportunity
+was six hours later, by which point the snapshot was ~12h old against an
+8-hour freshness window.
+
+**The mechanism.** The cron interval equalled the floor. Each capture lands
+minutes after a tick (fetch and commit take time), so the tick arriving at
+floor-age is always those same minutes too early — it skips, deterministically,
+every cycle, and the effective refresh interval becomes twice the floor. Not
+a race: a limit cycle. The floor was tested. The cron was tested. The bug
+lives only in their composition, which no test covered.
+
+**The diagnostic compounded it.** The health detail read "the scheduled
+refresher has likely stopped committing" — accusing the right component of
+the wrong failure. It had run and correctly declined. The message now
+distinguishes the two cases the build can actually tell apart from age alone:
+within `floor + cadence` is expected scheduling, beyond it means cycles are
+genuinely being missed.
+
+**The fix, and an honest note about the spec.** The §11 write-up prescribed
+"cron every 2h, keep the 6h floor," projecting refreshes landing at 6–8h.
+The regression simulation it *also* prescribed showed that projection wrong:
+with the capture-after-tick offset, the steady state converges to a gap of
+exactly 8h0m — the knife-edge of the window, tipped over by any of the
+routine minutes-late cron ticks GitHub Actions delivers. The spec's suggested
+parameters failed the spec's own invariant by the width of one run's
+duration.
+
+So the floor is now **derived, not chosen**:
+
+```
+floor = fresh_within − cadence − scheduling_margin
+      = 8h − 2h − 30m = 5h30m
+```
+
+Steady-state refreshes land at ~6h gaps with two hours of headroom, Celestrak
+still sees at most ~4–5 requests per group per day (its own data only changes
+every 2h), and `test_scheduling.py` enforces the derivation three ways: the
+inequality itself, a discrete-event simulation of cron-plus-floor that must
+stay inside the window (and provably reproduces the old bug when fed the old
+numbers), and a parser that pins the workflow's actual cron string to the
+cadence constant so the YAML and the code cannot drift apart silently.
+
+**The general lesson, worth stating because it recurs:** unit-testing both
+sides of a boundary proves nothing about the boundary. Every prior bug in
+this file was a component wrong in isolation; this one had no wrong
+component. The properties worth the most tests are the ones that only exist
+between pieces — which is also why the fix is an invariant over three
+constants rather than new behaviour in any one of them.

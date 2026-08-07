@@ -125,10 +125,40 @@ NETWORK_BUDGET_SECONDS = 60.0
 
 CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
 
+#: Slack absorbed by the scheduling chain: GitHub Actions cron ticks are
+#: routinely minutes late, and the refresher itself takes time to run and
+#: commit. The politeness floor is derived leaving this much headroom.
+SNAPSHOT_SCHEDULING_MARGIN = timedelta(minutes=30)
+
 #: Celestrak refreshes GP data every 2 hours and rate-limits repeat callers.
-#: We refuse to re-fetch a group whose cache is younger than this, regardless
-#: of how often the build runs. See DECISIONS.md.
-CELESTRAK_MIN_REFETCH_INTERVAL = timedelta(hours=6)
+#: The snapshot refresher refuses to re-fetch a group whose committed snapshot
+#: is younger than this, regardless of how often it runs.
+#:
+#: NOT a free parameter. It is derived from the invariant in DECISIONS.md
+#: §18: floor + cadence + margin <= TLE_STALENESS.fresh_within, i.e.
+#: 8h - 2h - 30m = 5h30m. The obvious-looking 6h value fails that invariant
+#: by converging, in steady state, to a refresh gap of *exactly* the
+#: freshness window: each capture lands moments after a tick, so the tick at
+#: floor-age arrives moments too early, skips, and the refresh always slides
+#: to the next tick. Discovered by simulation while fixing the production
+#: bug where floor == cadence produced the same disease at twice the size.
+#: A scheduling test asserts the derivation, so changing any of the three
+#: numbers alone fails CI.
+CELESTRAK_MIN_REFETCH_INTERVAL = timedelta(hours=5, minutes=30)
+
+#: How often the snapshot refresher's cron fires (refresh-snapshot.yml). Held
+#: here so code can reason about scheduling and so a test can pin the workflow
+#: cron to it.
+#:
+#: The invariant that binds these three numbers, learned in production
+#: (DECISIONS.md §18): the cadence must be meaningfully SHORTER than the
+#: politeness floor, and floor + cadence must not exceed
+#: ``TLE_STALENESS.fresh_within``. When cadence equalled the floor, every
+#: other run landed minutes under the threshold and correctly skipped, making
+#: the effective refresh interval ~2x the floor -- deterministically outside
+#: the freshness window, so the site spent hours STALE every cycle while
+#: every individual component behaved exactly as designed.
+SNAPSHOT_REFRESH_CADENCE = timedelta(hours=2)
 
 
 @dataclass(frozen=True)

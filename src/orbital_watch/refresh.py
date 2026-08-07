@@ -137,7 +137,7 @@ def refresh_snapshot(
 
         # Trim before writing. The snapshot only needs what the build will
         # actually propagate, and Starlink is ~11k objects / 5 MB unfiltered --
-        # far too much to put in git every six hours.
+        # far too much to commit on every refresh cycle.
         records = celestrak.select_objects(result.data, group)
 
         # A payload that validates but has collapsed in size -- 2 stations

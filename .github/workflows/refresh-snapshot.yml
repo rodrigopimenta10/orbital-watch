@@ -14,9 +14,16 @@ name: Refresh TLE snapshot
 # actually matters. And a scheduled commit needs repository write access,
 # which Actions has natively and a Worker would need a long-lived PAT for.
 #
-# Every 6 hours, matching CELESTRAK_MIN_REFETCH_INTERVAL. The refresher also
-# enforces that floor itself against the manifest, so an extra manual run is
-# harmless — it will skip groups that are still young.
+# Every 2 hours — deliberately much more often than the 6-hour politeness
+# floor the refresher enforces. These two numbers must NOT be equal: when
+# they were both 6h, every other run landed minutes under the floor and
+# correctly skipped, so the effective refresh interval was ~12h against an
+# 8h freshness window and the site spent hours STALE every cycle
+# (DECISIONS.md §18). With a 2h cadence some tick always lands within 2h of
+# the floor clearing, bounding snapshot age at floor + cadence = 8h. The
+# floor — not this schedule — remains the politeness mechanism: Celestrak
+# still sees at most one request per group per 6h, and runs that skip cost
+# nothing. Extra manual runs are equally harmless.
 #
 # The commit message carries [CI Skip], which Cloudflare Pages recognises, so
 # a snapshot commit does NOT consume a Pages build. The next scheduled rebuild
@@ -25,7 +32,7 @@ name: Refresh TLE snapshot
 
 on:
   schedule:
-    - cron: "30 1,7,13,19 * * *"
+    - cron: "30 1-23/2 * * *"
   workflow_dispatch:
 
 permissions:

@@ -25,7 +25,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
-from orbital_watch.config import StalenessPolicy
+from orbital_watch.config import (
+    CELESTRAK_MIN_REFETCH_INTERVAL,
+    SNAPSHOT_REFRESH_CADENCE,
+    StalenessPolicy,
+)
 from orbital_watch.sources.fetch import FetchResult, Outcome, format_duration
 
 
@@ -157,7 +161,35 @@ def _classify(
     # committed snapshot, and the fix is the refresher, not the build.
     if result.outcome == Outcome.SNAPSHOT:
         happened = "The committed snapshot was captured"
-        remedy = " The scheduled refresher has likely stopped committing."
+        # Calibrated, not accusatory. The first version said "the refresher
+        # has likely stopped committing" -- shipped to the live site during a
+        # cycle in which the refresher had run, succeeded, and correctly
+        # declined because the politeness floor was not yet cleared. Accusing
+        # the right component of the wrong failure is precisely the species
+        # of misleading diagnostic this panel exists to avoid. What the build
+        # can actually infer from age alone:
+        #   age <= floor + cadence  -> a skip is the expected behaviour; the
+        #                              next tick should land after the floor
+        #                              clears. Not a fault.
+        #   age >  floor + cadence  -> a tick that should have refreshed has
+        #                              been missed; now it is fair to point
+        #                              at the refresher.
+        worst_scheduled_gap = CELESTRAK_MIN_REFETCH_INTERVAL + SNAPSHOT_REFRESH_CADENCE
+        if age <= worst_scheduled_gap:
+            remedy = (
+                f" This is within the worst-case scheduling gap "
+                f"(the {format_duration(CELESTRAK_MIN_REFETCH_INTERVAL)} "
+                f"politeness floor plus the "
+                f"{format_duration(SNAPSHOT_REFRESH_CADENCE)} cron cadence); "
+                f"the refresher has not failed, and the next tick past the "
+                f"floor should refresh it."
+            )
+        else:
+            remedy = (
+                f" This exceeds the worst-case scheduling gap of "
+                f"{format_duration(worst_scheduled_gap)}, so refresh cycles "
+                f"are being missed -- check the refresh-snapshot workflow."
+            )
     else:
         happened = "Last successful fetch was"
         remedy = ""
