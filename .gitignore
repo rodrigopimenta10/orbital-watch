@@ -31,3 +31,6 @@ seed/*.tmp
 
 # OS
 .DS_Store
+
+# Wrangler local state (created by wrangler login/deploy)
+.wrangler/
