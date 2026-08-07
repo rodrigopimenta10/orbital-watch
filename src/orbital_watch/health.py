@@ -151,23 +151,33 @@ def _classify(
         else ""
     )
 
-    # 3. Age-driven classification.
+    # 3. Age-driven classification. The wording tracks the outcome: a
+    # snapshot source is never fetched by the build, so "last successful
+    # fetch" would describe an event that does not exist -- what aged is the
+    # committed snapshot, and the fix is the refresher, not the build.
+    if result.outcome == Outcome.SNAPSHOT:
+        happened = "The committed snapshot was captured"
+        remedy = " The scheduled refresher has likely stopped committing."
+    else:
+        happened = "Last successful fetch was"
+        remedy = ""
+
     if age > policy.stale_within:
         return (
             State.FAILED,
             age,
-            f"Last successful fetch was {age_text} ago, beyond the "
+            f"{happened} {age_text} ago, beyond the "
             f"{format_duration(policy.stale_within)} limit. Data shown is not "
-            f"operationally current.{contact_lost}",
+            f"operationally current.{remedy}{contact_lost}",
         )
 
     if age > policy.fresh_within:
         return (
             State.STALE,
             age,
-            f"Last successful fetch was {age_text} ago, past the "
+            f"{happened} {age_text} ago, past the "
             f"{format_duration(policy.fresh_within)} freshness window."
-            f"{contact_lost}",
+            f"{remedy}{contact_lost}",
         )
 
     # 4. Young data, but did we actually reach upstream this run?

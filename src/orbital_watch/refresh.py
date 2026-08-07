@@ -46,6 +46,13 @@ log = logging.getLogger("orbital_watch.refresh")
 
 MANIFEST_NAME = "manifest.json"
 
+#: A refreshed group must keep at least this fraction of its previous record
+#: count, once the previous snapshot is big enough for the ratio to mean
+#: anything. Guards against a truncated-but-valid upstream response silently
+#: replacing a full snapshot.
+SHRINKAGE_FLOOR = 0.5
+MIN_PLAUSIBLE_RECORDS = 10
+
 
 def snapshot_age(seed_dir: Path, name: str) -> timedelta | None:
     """How long ago ``name`` was captured, per the manifest."""
@@ -85,13 +92,18 @@ def refresh_snapshot(
     """
     seed_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest(seed_dir)
+    _prewarm_cache(seed_dir, cache_dir, manifest)
     summary = {"refreshed": [], "skipped": [], "failed": []}
 
     for group in TRACKED_GROUPS:
         name = f"celestrak_{group.key}"
         age = snapshot_age(seed_dir, name)
 
-        if not force and age is not None and age < min_age:
+        # A negative age means the recorded capture time is in the future
+        # (clock skew, hand edit). Treating it as young would block
+        # refresh until wall-clock catches up with the bogus timestamp;
+        # treat it as unknown and refresh instead.
+        if not force and age is not None and timedelta(0) <= age < min_age:
             log.info(
                 "source=%s skipped age=%s (below the %s refetch floor)",
                 name,
@@ -127,6 +139,30 @@ def refresh_snapshot(
         # actually propagate, and Starlink is ~11k objects / 5 MB unfiltered --
         # far too much to put in git every six hours.
         records = celestrak.select_objects(result.data, group)
+
+        # A payload that validates but has collapsed in size -- 2 stations
+        # where the snapshot holds 22 -- is upstream trouble, not a real
+        # constellation change. Constellations do not lose most of their
+        # objects between refreshes; refuse to overwrite substantial data
+        # with a fraction of itself, keep the old snapshot, and let its age
+        # tell the story if the shrinkage persists.
+        previous = _previous_record_count(manifest, name)
+        if (
+            previous is not None
+            and previous >= MIN_PLAUSIBLE_RECORDS
+            and len(records) < previous * SHRINKAGE_FLOOR
+        ):
+            log.warning(
+                "source=%s payload shrank from %d to %d records "
+                "(below the %d%% floor); keeping the existing snapshot",
+                name,
+                previous,
+                len(records),
+                int(SHRINKAGE_FLOOR * 100),
+            )
+            summary["failed"].append(name)
+            continue
+
         _write_source(seed_dir, name, records)
 
         # Record when we last *confirmed currency with upstream*, not when the
@@ -167,13 +203,73 @@ def refresh_snapshot(
     return summary
 
 
+def _previous_record_count(manifest: dict, name: str) -> int | None:
+    entry = manifest["sources"].get(name)
+    if not isinstance(entry, dict):
+        return None
+    count = entry.get("records")
+    return count if isinstance(count, int) and count >= 0 else None
+
+
 def _load_manifest(seed_dir: Path) -> dict:
+    """Load the manifest, tolerating any shape of damage.
+
+    A manifest that is valid JSON but the wrong shape (a list, a string, a
+    ``sources`` that is not a dict) must degrade to empty exactly like invalid
+    JSON does. Without the isinstance checks, a hand-edit or partial write
+    crashed the refresher with a bare TypeError -- and because nothing repairs
+    the file, *every subsequent scheduled run crashed identically* while the
+    snapshot aged toward FAILED. The one component whose job is keeping data
+    fresh must never be wedged permanently by a malformed state file.
+    """
     try:
         manifest = json.loads((seed_dir / MANIFEST_NAME).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         manifest = {}
-    manifest.setdefault("sources", {})
+    if not isinstance(manifest, dict):
+        log.warning("manifest is %s, not a dict; starting fresh", type(manifest).__name__)
+        manifest = {}
+    if not isinstance(manifest.get("sources"), dict):
+        if "sources" in manifest:
+            log.warning("manifest 'sources' is not a dict; discarding it")
+        manifest["sources"] = {}
     return manifest
+
+
+def _prewarm_cache(seed_dir: Path, cache_dir: Path, manifest: dict) -> None:
+    """Seed the fetch cache from the committed snapshot.
+
+    CI runners are ephemeral, so the fetch cache is cold on every run -- and
+    Celestrak's "has not updated since your last successful download" sentinel
+    is tracked per IP, which for shared CI egress can fire even on this
+    runner's first contact. Against a cold cache that sentinel has nothing to
+    serve and resolves to FAILED, turning "you already hold the newest data"
+    into a dropped refresh cycle while seed/ holds exactly the data upstream
+    just confirmed. Pre-warming makes the sentinel resolve to NOT_MODIFIED,
+    which the loop below correctly counts as confirmation.
+
+    The cache timestamps use the manifest's payload_first_seen (or
+    retrieved_at) so nothing gets younger than it truly is.
+    """
+    for group in TRACKED_GROUPS:
+        name = f"celestrak_{group.key}"
+        src = seed_dir / f"{name}.json"
+        dst = cache_dir / f"{name}.json"
+        if not src.exists() or dst.exists():
+            continue
+        entry = manifest["sources"].get(name)
+        stamp = None
+        if isinstance(entry, dict):
+            stamp = entry.get("payload_first_seen") or entry.get("retrieved_at")
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            if stamp:
+                dst.with_suffix(".json.meta").write_text(
+                    json.dumps({"retrieved_at": stamp}), encoding="utf-8"
+                )
+        except OSError as exc:
+            log.warning("cache pre-warm failed for %s: %s", name, exc)
 
 
 def _write_source(seed_dir: Path, name: str, records: list) -> None:

@@ -73,7 +73,15 @@ jobs:
           rotten = []
           for name, entry in sorted(manifest["sources"].items()):
               raw = entry.get("retrieved_at")
-              stamp = datetime.fromisoformat(raw)
+              # A missing or unparseable capture time is treated as rotten,
+              # not as a crash: the step exists to complain clearly, and a
+              # TypeError traceback is not a clear complaint.
+              try:
+                  stamp = datetime.fromisoformat(raw)
+              except (TypeError, ValueError):
+                  print(f"  {name}: capture time missing or unparseable ({raw!r})")
+                  rotten.append(f"{name} (no capture time)")
+                  continue
               if stamp.tzinfo is None:
                   stamp = stamp.replace(tzinfo=UTC)
               age = now - stamp
@@ -123,8 +131,6 @@ jobs:
 
           def build(tag, seed_dir=None):
               """Run the real entry point and return its health block."""
-              import importlib
-
               import orbital_watch.config as config
               import orbital_watch.sources.fetch as fetch
 

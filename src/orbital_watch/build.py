@@ -416,6 +416,14 @@ def _pass_to_dict(item: Pass) -> dict:
     }
 
 
+def _remove_path(path: Path) -> None:
+    """Remove ``path`` whether it is a directory, a file, or absent."""
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=False))
@@ -546,8 +554,7 @@ def run_build(
     # mixture. The swap makes "the build output exists" and "the build output
     # is complete" the same fact.
     staging = build_dir.parent / (build_dir.name + ".staging")
-    if staging.exists():
-        shutil.rmtree(staging)
+    _remove_path(staging)
 
     # Frontend first, generated data second. copy_frontend uses
     # dirs_exist_ok=True, so doing it the other way round would let a stray
@@ -609,16 +616,25 @@ def run_build(
         # output untouched rather than replacing it with a broken one.
         raise OSError(f"staging incomplete, refusing to publish: {missing}")
 
-    # Swap via a retired-name rename rather than delete-then-move, so there is
-    # no instant at which build_dir does not exist at all.
+    # Swap via a retired-name rename rather than delete-then-move. The window
+    # in which build_dir does not exist shrinks to the gap between two renames
+    # -- not literally zero without renameat2(RENAME_EXCHANGE), but far
+    # narrower than a delete-and-recreate, and a crash inside it is fully
+    # recovered by the next build.
+    #
+    # _remove_path throughout, not rmtree: any of these names can be occupied
+    # by a stray *file* (a mistyped ORBITAL_WATCH_BUILD, debris from an
+    # earlier crash), and rmtree on a file raises. Worse, in the retired slot
+    # that debris was persistent: the swap would publish successfully, crash
+    # on cleanup, exit non-zero for a build that in fact shipped, and then
+    # every subsequent build failed at the same spot until someone deleted
+    # the file by hand.
     retired = build_dir.parent / (build_dir.name + ".previous")
-    if retired.exists():
-        shutil.rmtree(retired)
+    _remove_path(retired)
     if build_dir.exists():
         build_dir.replace(retired)
     staging.replace(build_dir)
-    if retired.exists():
-        shutil.rmtree(retired)
+    _remove_path(retired)
 
     log.info(
         "build complete elapsed=%.2fs tracked=%d above_horizon=%d passes=%d health=%s",

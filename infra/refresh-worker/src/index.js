@@ -74,7 +74,9 @@ const ENDPOINTS = [
   { path: "/data/passes.json", type: "application/json" },
   { path: "/data/space_weather.json", type: "application/json" },
   { path: "/assets/app.js", type: "javascript" },
+  { path: "/assets/theme.js", type: "javascript" },
   { path: "/assets/style.css", type: "text/css" },
+  { path: "/assets/og.jpg", type: "image/jpeg" },
 ];
 
 async function checkEndpoints(env) {
@@ -101,7 +103,19 @@ async function checkEndpoints(env) {
 }
 
 async function checkPreviousCycle(env) {
-  const maxAge = Number(env.MAX_DATA_AGE_SECONDS || 21600);
+  // Guard the coercion: Number("21,600") is NaN, and every comparison with
+  // NaN is false -- a single typo in the var would silently disable the one
+  // check whose whole purpose is noticing silence. Fall back loudly instead.
+  let maxAge = Number(env.MAX_DATA_AGE_SECONDS);
+  if (!Number.isFinite(maxAge) || maxAge <= 0) {
+    if (env.MAX_DATA_AGE_SECONDS) {
+      console.error(
+        `MAX_DATA_AGE_SECONDS=${JSON.stringify(env.MAX_DATA_AGE_SECONDS)} ` +
+          "is not a positive number; using the 21600s default",
+      );
+    }
+    maxAge = 21600;
+  }
   const url = `${env.SITE_URL}/data/health.json`;
 
   const endpointFailures = await checkEndpoints(env);
@@ -164,16 +178,25 @@ async function alert(env, message) {
   };
 
   try {
+    // Dedup via the plain issues list, not the search API: search has index
+    // lag and is mid-migration to a new query grammar, and -- the actual bug
+    // this replaces -- a failed dedup lookup must NOT fall through to
+    // creation, or a single API hiccup during an outage files a duplicate
+    // issue every two hours for as long as the outage lasts.
     const existing = await fetch(
-      `https://api.github.com/search/issues?q=` +
-        encodeURIComponent(`repo:${env.GITHUB_REPO} is:issue is:open in:title "${ALERT_TITLE}"`),
+      `https://api.github.com/repos/${env.GITHUB_REPO}/issues?state=open&per_page=100`,
       { headers },
     );
-    if (existing.ok) {
-      const found = await existing.json();
-      if (found.total_count > 0) {
-        return { ok: false, alerted: "already-open", message };
-      }
+    if (!existing.ok) {
+      console.error(
+        `issue dedup lookup failed (HTTP ${existing.status}); ` +
+          "not filing, to avoid duplicates",
+      );
+      return { ok: false, alerted: "dedup-unavailable", message };
+    }
+    const open = await existing.json();
+    if (Array.isArray(open) && open.some((i) => i && i.title === ALERT_TITLE)) {
+      return { ok: false, alerted: "already-open", message };
     }
 
     const created = await fetch(

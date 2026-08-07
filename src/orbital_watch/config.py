@@ -21,8 +21,10 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parent.parent
 
-#: Disk cache for upstream responses. Survives between builds in CI via
-#: actions/cache so that a failed fetch can still fall back to real data.
+#: Disk cache for upstream responses. Machine-local and ephemeral in every
+#: CI/build environment this project uses -- which is exactly why the
+#: committed seed/ snapshot exists as the durable fallback, and why the
+#: snapshot refresher pre-warms this cache from seed/ before fetching.
 CACHE_DIR = Path(os.environ.get("ORBITAL_WATCH_CACHE", REPO_ROOT / ".cache"))
 
 #: Frontend source. Copied verbatim into the build output.

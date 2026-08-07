@@ -67,9 +67,21 @@ jobs:
           git add seed/
           # [CI Skip] keeps this commit from consuming a Cloudflare Pages
           # build; the next scheduled rebuild picks the new snapshot up.
-          git commit -m "Refresh TLE snapshot [CI Skip]
+          # It MUST be the prefix -- Cloudflare only recognises the marker at
+          # the start of the message, and as a suffix every one of these
+          # commits would silently consume a build (~120/month against the
+          # 500 cap this workflow exists to respect).
+          git commit -m "[CI Skip] Refresh TLE snapshot
 
           Automated Celestrak GP refresh. See seed/manifest.json for
           per-group capture times and record counts."
-          git pull --rebase origin main
-          git push origin main
+          # -X theirs: in a rebase, "theirs" is the commit being replayed --
+          # i.e. OUR fresh snapshot. If a human push touched seed/ in the
+          # window, the just-fetched data wins rather than the whole cycle
+          # being dropped. One retry covers a push race that is not a
+          # conflict at all.
+          git pull --rebase -X theirs origin main
+          git push origin main || {
+            git pull --rebase -X theirs origin main
+            git push origin main
+          }

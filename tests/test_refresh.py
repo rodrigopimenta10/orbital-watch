@@ -277,3 +277,126 @@ def test_snapshot_coverage_reports_upstream_population_not_trimmed_count(
     starlink = next(g for g in coverage if g["key"] == "starlink")
     assert starlink["available"] == starlink_upstream
     assert starlink["sampled"] is True
+
+
+# --------------------------------------------------------------------------
+# Audit regressions: shapes of damage the refresher must survive
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "[]",  # a list where the dict belongs
+        '"a string"',
+        '{"sources": []}',  # valid dict, wrong-shaped sources
+        '{"sources": "nope"}',
+        "not json at all {",
+    ],
+)
+def test_refresher_survives_any_manifest_damage(snapshot, monkeypatch, tmp_path, damage):
+    """A malformed manifest must self-heal, never wedge the refresher.
+
+    Regression: a valid-JSON-wrong-shape manifest raised TypeError past the
+    OSError-only handler in main(), and because nothing repaired the file,
+    every subsequent scheduled run crashed identically while the snapshot
+    aged toward FAILED. The one component whose job is keeping data fresh
+    must not be permanently disabled by a damaged state file.
+    """
+    (snapshot / "manifest.json").write_text(damage)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        responder(
+            {
+                "GROUP=stations": fixture_bytes("celestrak_stations.json"),
+                "GROUP=weather": fixture_bytes("celestrak_weather.json"),
+                "GROUP=starlink": fixture_bytes("celestrak_starlink.json"),
+            }
+        ),
+    )
+
+    summary = refresh_snapshot(seed_dir=snapshot, cache_dir=tmp_path / "c")
+
+    assert len(summary["refreshed"]) == 3
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    assert isinstance(manifest["sources"], dict)
+
+
+def test_shrunken_payload_does_not_replace_a_substantial_snapshot(
+    snapshot, monkeypatch, tmp_path
+):
+    """A validating payload that collapsed in size keeps the old snapshot.
+
+    Constellations do not lose most of their objects between refreshes; a
+    2-record response where the snapshot holds 22 is upstream trouble.
+    """
+    records = json.loads(fixture_bytes("celestrak_stations.json"))
+    write_snapshot(snapshot, "celestrak_stations", records, age=timedelta(hours=20))
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    manifest["sources"]["celestrak_stations"]["records"] = len(records)
+    (snapshot / "manifest.json").write_text(json.dumps(manifest))
+
+    tiny = records[:2]
+    monkeypatch.setattr(
+        "urllib.request.urlopen", responder({"GROUP=stations": tiny}, default=tiny)
+    )
+
+    summary = refresh_snapshot(seed_dir=snapshot, cache_dir=tmp_path / "c")
+
+    assert "celestrak_stations" in summary["failed"]
+    kept = json.loads((snapshot / "celestrak_stations.json").read_text())
+    assert len(kept) == len(records), "shrunken payload must not replace the snapshot"
+
+
+def test_future_capture_time_does_not_block_refresh_forever(
+    snapshot, monkeypatch, tmp_path
+):
+    """A manifest timestamp in the future must trigger a refresh, not a skip.
+
+    Negative age is < min_age forever, so without the guard a clock-skewed or
+    hand-edited timestamp silently blocked refresh until wall-clock caught up.
+    """
+    records = json.loads(fixture_bytes("celestrak_stations.json"))
+    write_snapshot(snapshot, "celestrak_stations", records, age=-timedelta(days=365))
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        responder(
+            {"GROUP=stations": fixture_bytes("celestrak_stations.json")},
+            default=urllib.error.URLError("other groups absent"),
+        ),
+    )
+
+    summary = refresh_snapshot(seed_dir=snapshot, cache_dir=tmp_path / "c")
+
+    assert "celestrak_stations" in summary["refreshed"]
+
+
+def test_cold_runner_not_modified_counts_as_confirmation(snapshot, monkeypatch, tmp_path):
+    """Celestrak's sentinel on a cold runner must confirm, not fail.
+
+    CI runners have no fetch cache, and the sentinel is tracked per IP --
+    shared egress can fire it on this runner's first contact. Without the
+    pre-warm, "you already hold the newest data" resolved to FAILED and the
+    cycle was dropped while seed/ held exactly the confirmed data.
+    """
+    records = json.loads(fixture_bytes("celestrak_stations.json"))
+    write_snapshot(snapshot, "celestrak_stations", records, age=timedelta(hours=20))
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        responder(
+            {"GROUP=stations": fixture_bytes("celestrak_not_updated.txt")},
+            default=urllib.error.URLError("other groups absent"),
+        ),
+    )
+
+    # cache_dir is a fresh tmp dir: the cold-runner case.
+    summary = refresh_snapshot(seed_dir=snapshot, cache_dir=tmp_path / "coldcache")
+
+    assert "celestrak_stations" in summary["refreshed"]
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    entry = manifest["sources"]["celestrak_stations"]
+    assert entry["upstream_unchanged"] is True
+    age = snapshot_age(snapshot, "celestrak_stations")
+    assert age is not None and age < timedelta(minutes=1)

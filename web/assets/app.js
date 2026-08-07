@@ -20,9 +20,13 @@
 
   var DATA = "data/";
 
-  /* If the page's own data is older than this, the scheduled rebuild has
-   * probably stopped and we say so at the top of the page. Generous relative
-   * to the hourly cadence so a single missed run is not alarming. */
+  /* If the page's own data is older than this, a scheduled rebuild has been
+   * missed and we say so at the top of the page. With the 2-hour cadence,
+   * one missed run puts the data at ~4h and trips this -- deliberately, per
+   * the accepted tradeoff in DECISIONS §15: the page reports the truth about
+   * its own data rather than hiding a missed cycle. (The Worker's dead-man
+   * alert to the owner uses a looser 6h threshold; this banner is for
+   * viewers, that alert is for the operator.) */
   var REBUILD_ALARM_SECONDS = 3 * 3600;
 
   /* Relative times ("in 4m") drift on a tab left open, and recomputed source
@@ -313,7 +317,7 @@
       el(
         "p",
         null,
-        "The scheduled job rebuilds this site hourly, so a gap this long means " +
+        "The scheduled job rebuilds this site every two hours, so a gap this long means " +
           "it has probably stopped running. Everything below is still exactly " +
           "what was true at " +
           utcStamp(meta.generated_at) +
