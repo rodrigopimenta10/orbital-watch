@@ -1,5 +1,5 @@
 {
-  "captured_at": "2026-08-25T16:09:34.260615+00:00",
+  "captured_at": "2026-08-25T17:58:03.568365+00:00",
   "sources": {
     "celestrak_starlink": {
       "available": 10991,
@@ -17,9 +17,9 @@
     },
     "celestrak_weather": {
       "available": 73,
-      "payload_first_seen": "2026-08-25T10:02:18.139454+00:00",
+      "payload_first_seen": "2026-08-25T17:58:03.566619+00:00",
       "records": 73,
-      "retrieved_at": "2026-08-25T10:02:18.140904+00:00",
+      "retrieved_at": "2026-08-25T17:58:03.568142+00:00",
       "upstream_unchanged": false
     },
     "swpc_kp": {
