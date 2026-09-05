@@ -1,11 +1,11 @@
 {
-  "captured_at": "2026-09-05T01:18:30.326657+00:00",
+  "captured_at": "2026-09-05T06:13:02.835029+00:00",
   "sources": {
     "celestrak_starlink": {
       "available": 11086,
-      "payload_first_seen": "2026-09-04T19:48:31.740762+00:00",
+      "payload_first_seen": "2026-09-05T06:13:02.779863+00:00",
       "records": 60,
-      "retrieved_at": "2026-09-04T19:48:31.800588+00:00",
+      "retrieved_at": "2026-09-05T06:13:02.834976+00:00",
       "upstream_unchanged": false
     },
     "celestrak_stations": {
