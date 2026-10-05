@@ -1,25 +1,25 @@
 {
-  "captured_at": "2026-10-05T07:35:09.715835+00:00",
+  "captured_at": "2026-10-05T18:46:22.709598+00:00",
   "sources": {
     "celestrak_starlink": {
-      "available": 11122,
-      "payload_first_seen": "2026-10-05T07:35:09.620533+00:00",
+      "available": 11119,
+      "payload_first_seen": "2026-10-05T18:46:22.646051+00:00",
       "records": 60,
-      "retrieved_at": "2026-10-05T07:35:09.715788+00:00",
+      "retrieved_at": "2026-10-05T18:46:22.709516+00:00",
       "upstream_unchanged": false
     },
     "celestrak_stations": {
       "available": 23,
-      "payload_first_seen": "2026-10-05T07:35:04.049869+00:00",
+      "payload_first_seen": "2026-10-05T18:45:55.092230+00:00",
       "records": 23,
-      "retrieved_at": "2026-10-05T07:35:04.050739+00:00",
+      "retrieved_at": "2026-10-05T18:45:55.093322+00:00",
       "upstream_unchanged": false
     },
     "celestrak_weather": {
       "available": 72,
-      "payload_first_seen": "2026-10-05T07:35:04.586884+00:00",
+      "payload_first_seen": "2026-10-05T18:46:05.983391+00:00",
       "records": 72,
-      "retrieved_at": "2026-10-05T07:35:04.588155+00:00",
+      "retrieved_at": "2026-10-05T18:46:05.985057+00:00",
       "upstream_unchanged": false
     },
     "swpc_kp": {
