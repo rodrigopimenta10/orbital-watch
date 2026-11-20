@@ -1,10 +1,12 @@
-/* Orbital Watch frontend.
+/* Orbital Watch frontend: drawing.
  *
- * Loads the static JSON written by the build and renders it. There is no
- * upstream call here and no framework -- the page's only dependency is the
- * JSON files sitting next to it.
+ * Loads the one document the pipeline publishes and renders it. There is no
+ * upstream call here and no framework. The decisions -- which copy of the
+ * document to show, how old it is, what state a source is in, where a
+ * satellite is now -- are made in core.js, which has no DOM in it and is
+ * tested under Node. This file turns those decisions into elements.
  *
- * Two rules govern everything below.
+ * Three rules govern everything below.
  *
  * 1. A panel whose data is missing says so, in place, with the reason. It
  *    never renders blank and never renders a number it cannot attribute.
@@ -12,32 +14,42 @@
  *    cannot take out the panels below it -- least of all the health panel,
  *    which is the one that would have explained the failure.
  *
- * 2. Freshness is recomputed here, from timestamps, rather than trusted from
- *    the build. See stateNow() for why that matters.
+ * 2. Nothing is taken on trust that can be recomputed. Ages, source states
+ *    and satellite positions are all worked out against this browser's clock
+ *    on every tick, so a pipeline that has stopped is visible here without
+ *    any help from the pipeline.
+ *
+ * 3. The page says which copy of the document it is showing. The live one
+ *    comes from the pipeline's public bucket; if that cannot be reached, the
+ *    copy baked into the site at deploy time is shown instead, labelled as
+ *    such, and nothing in it is reported as fresh.
  */
 (function () {
   "use strict";
 
-  var DATA = "data/";
+  var Core = window.OrbitalWatchCore;
+  var CONFIG = window.ORBITAL_WATCH_CONFIG || Core.DEFAULT_CONFIG;
 
-  /* If the page's own data is older than this, a scheduled rebuild has been
-   * missed and we say so at the top of the page. With the 2-hour cadence,
-   * one missed run puts the data at ~4h and trips this -- deliberately, per
-   * the accepted tradeoff in DECISIONS §15: the page reports the truth about
-   * its own data rather than hiding a missed cycle. (The Worker's dead-man
-   * alert to the owner uses a looser 6h threshold; this banner is for
-   * viewers, that alert is for the operator.) */
-  var REBUILD_ALARM_SECONDS = 3 * 3600;
+  /* How often to look for a newer document. The pipeline publishes every ten
+   * minutes and the document may be cached for one, so asking once a minute
+   * keeps the page within about two minutes of the newest one without a
+   * reload. An unchanged document costs a conditional request and no redraw. */
+  var POLL_MS = 60000;
 
-  /* Relative times ("in 4m") drift on a tab left open, and recomputed source
-   * states go out of date. Both need refreshing -- but re-rendering the page
-   * to do it destroys everything the user was doing: an open <details> snaps
-   * shut mid-paragraph, keyboard focus inside a scroll region is dropped, and
-   * horizontal scroll jumps back to column one. So the tick updates only the
-   * volatile text, in place, through the registry below. */
-  var RETICK_MS = 30000;
+  /* How often the volatile parts are recomputed: relative times, source
+   * states, and satellite positions. A satellite in low orbit crosses a
+   * degree of sky in about a second near the zenith, so this is short. Only
+   * the volatile text is touched -- re-rendering the page to do it would
+   * destroy everything the reader was doing: an open <details> snaps shut
+   * mid-paragraph, keyboard focus inside a scroll region is dropped, and
+   * horizontal scroll jumps back to column one. */
+  var RETICK_MS = 5000;
 
-  /* Closures that refresh one piece of volatile text. Registered during
+  /* What the page is showing: the document, where it came from, and whether
+   * the last check for a newer one worked. */
+  var shown = null;
+
+  /* Closures that refresh one piece of volatile content. Registered during
    * render, replayed on every tick. Cleared before a full re-render so they
    * cannot accumulate or point at detached nodes. */
   var tickables = [];
@@ -79,6 +91,12 @@
 
   // ---------------------------------------------------------------- utils
 
+  var has = Core.has;
+  var parseTime = Core.parseTime;
+  var humanDuration = Core.humanDuration;
+  var relative = Core.relative;
+  var utcStamp = Core.utcStamp;
+
   function el(tag, className, text) {
     var node = document.createElement(tag);
     if (className) node.className = className;
@@ -90,26 +108,8 @@
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
-  /** Own-property test. Bare `obj[key]` also finds "constructor", "toString". */
-  function has(obj, key) {
-    return Object.prototype.hasOwnProperty.call(obj, key);
-  }
-
-  /** Fetch JSON, resolving to {ok, data, error} rather than throwing. */
-  function loadJSON(name) {
-    return fetch(DATA + name + ".json", { cache: "no-cache" })
-      .then(function (response) {
-        if (!response.ok) {
-          throw new Error("HTTP " + response.status + " " + response.statusText);
-        }
-        return response.json();
-      })
-      .then(function (data) {
-        return { ok: true, data: data, error: null };
-      })
-      .catch(function (error) {
-        return { ok: false, data: null, error: error.message || String(error) };
-      });
+  function byId(id) {
+    return document.getElementById(id);
   }
 
   function showError(container, title, detail) {
@@ -129,8 +129,8 @@
         container,
         label + " could not be rendered",
         (error && error.message ? error.message : String(error)) +
-          ". The underlying JSON loaded, so this is a rendering fault rather " +
-          "than a data outage."
+          ". The document loaded, so this is a rendering fault rather than a " +
+          "data outage."
       );
     }
   }
@@ -152,42 +152,6 @@
     return Math.round(value)
       .toString()
       .replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  }
-
-  function parseTime(value) {
-    if (!value) return null;
-    var t = new Date(value);
-    return isNaN(t.getTime()) ? null : t;
-  }
-
-  function humanDuration(seconds) {
-    if (typeof seconds !== "number" || !isFinite(seconds)) return "unknown";
-    var s = Math.abs(Math.round(seconds));
-    if (s < 60) return s + "s";
-    if (s < 3600) return Math.floor(s / 60) + "m";
-    if (s < 86400) {
-      var h = Math.floor(s / 3600);
-      var m = Math.floor((s % 3600) / 60);
-      return m ? h + "h " + m + "m" : h + "h";
-    }
-    var d = Math.floor(s / 86400);
-    var hh = Math.floor((s % 86400) / 3600);
-    return hh ? d + "d " + hh + "h" : d + "d";
-  }
-
-  /** "3h 12m ago" / "in 4m" -- relative phrasing an operator reads quickly. */
-  function relative(value, now) {
-    var t = parseTime(value);
-    if (!t) return "unknown";
-    var seconds = ((now || new Date()) - t) / 1000;
-    var text = humanDuration(seconds);
-    return seconds < 0 ? "in " + text : text + " ago";
-  }
-
-  function utcStamp(value) {
-    var t = parseTime(value);
-    if (!t) return "unknown";
-    return t.toISOString().replace("T", " ").slice(0, 19);
   }
 
   function humanSeconds(seconds) {
@@ -235,95 +199,91 @@
     return badge(spec.cls, spec.glyph, spec.label);
   }
 
-  // ------------------------------------------------------ freshness, live
-  //
-  // The build computes each source's state in Python and bakes it into
-  // health.json. That value is correct at build time and decays afterwards:
-  // if the scheduled workflow stops, the page keeps asserting "fresh" while
-  // the timestamp beside it counts up into days. GitHub disables scheduled
-  // workflows on repositories with no activity for 60 days, so for a project
-  // that is finished and left alone this is close to inevitable.
-  //
-  // Everything needed to recompute the state client-side is already in the
-  // JSON -- last_success plus the published thresholds -- so we do, and the
-  // panel stays honest no matter how long the page outlives its build.
-
+  /** A source's state right now, given which copy of the document is shown. */
   function stateNow(source, now) {
-    if (!source) return "failed";
-
-    // Mirrors health.py::_classify step 1 -- no data at all is FAILED. The
-    // build always pairs a null payload with a null last_success, and it
-    // records the state it computed, so trust that here.
-    if (source.state === "failed" && !source.last_success) return "failed";
-
-    var t = parseTime(source.last_success);
-    if (!t) {
-      // health.py step 2: data we cannot date is STALE, not failed -- we are
-      // serving something real, we just cannot say how old it is. Reporting
-      // "failed" here would also make the divergence note below blame elapsed
-      // time for a state that has nothing to do with elapsed time.
-      return source.state === "failed" ? "failed" : "stale";
-    }
-
-    var thresholds = source.thresholds || {};
-    var fresh = thresholds.fresh_within_seconds;
-    var stale = thresholds.stale_within_seconds;
-    if (typeof fresh !== "number" || typeof stale !== "number") {
-      return has(STATUS_GLYPH, source.state) ? source.state : "unknown";
-    }
-
-    var age = (now - t) / 1000;
-    if (age > stale) return "failed";
-    if (age > fresh) return "stale";
-    // Inside the freshness window by age -- but if the build could not reach
-    // upstream on the run that produced this page, it is not fresh. That
-    // covers cache_fallback and seed alike; both mean contact was lost. It
-    // does NOT cover "snapshot", which is the intended source (a scheduled
-    // refresher owns that upstream) and is judged purely by its age above.
-    if (source.outcome === "cache_fallback" || source.outcome === "seed") {
-      return "stale";
-    }
-    return "fresh";
+    return Core.stateNow(source, now, shown && shown.origin === "baked");
   }
 
-  /* Worst-first. "unknown" outranks "fresh": a source we cannot assess must
-   * never let the top-level badge claim everything is fine. */
-  function worstState(states) {
-    if (states.indexOf("failed") !== -1) return "failed";
-    if (states.indexOf("stale") !== -1) return "stale";
-    if (states.indexOf("unknown") !== -1) return "unknown";
-    return states.length ? "fresh" : "unknown";
+  var worstState = Core.worstState;
+
+  // ------------------------------------------------- which copy, and how old
+
+  /** One sentence saying which copy of the document is on screen. */
+  function sourceLine(now) {
+    if (!shown || !shown.document) return "";
+    var stamp = utcStamp(shown.document.generated_at);
+    var age = relative(shown.document.generated_at, now);
+
+    if (shown.origin === "baked") {
+      return (
+        "Showing the copy of the data that was baked into this site when it " +
+        "was deployed, published " +
+        stamp +
+        " UTC (" +
+        age +
+        "). The live document could not be loaded (" +
+        (shown.liveError || "unknown error") +
+        "), so nothing below is reported as fresh."
+      );
+    }
+    var text = "Showing the live document, published " + stamp + " UTC (" + age + ").";
+    if (shown.refreshError) {
+      text +=
+        " The last check for a newer one failed (" +
+        shown.refreshError +
+        "), so this may not be the latest.";
+    }
+    return text;
   }
 
-  // ----------------------------------------------------- staleness banner
-
-  function renderStalenessBanner(container, meta, now) {
+  function renderSilenceBanner(container, doc, now) {
     clear(container);
-    if (!meta || !meta.generated_at) return;
-    var built = parseTime(meta.generated_at);
-    if (!built) return;
+    var status = Core.pipelineStatus(doc, now);
+    if (!status.generatedAt || !status.silent) return;
 
-    var age = (now - built) / 1000;
-    if (age <= REBUILD_ALARM_SECONDS) return;
+    var age = humanDuration(status.ageSeconds);
+    var stamp = utcStamp(status.generatedAt);
+    var cadence = status.cadenceSeconds ? humanDuration(status.cadenceSeconds) : null;
+    var baked = shown && shown.origin === "baked";
 
     var banner = el("div", "banner banner-elevated");
     var heading = el("h3");
-    heading.appendChild(badge("status-elevated", "◆", "stale build"));
     heading.appendChild(
-      el("span", null, "This page was last rebuilt " + humanDuration(age) + " ago")
+      badge("status-elevated", "◆", baked ? "old copy" : "pipeline silent")
+    );
+    heading.appendChild(
+      el(
+        "span",
+        null,
+        baked
+          ? "This copy of the data was published at " + stamp + " UTC, " + age + " ago"
+          : "The pipeline last published at " + stamp + " UTC, " + age + " ago"
+      )
     );
     banner.appendChild(heading);
+
+    var expectation = cadence
+      ? "A new document is expected every " + cadence + ". "
+      : "";
     banner.appendChild(
       el(
         "p",
         null,
-        "The scheduled job rebuilds this site every two hours, so a gap this long means " +
-          "it has probably stopped running. Everything below is still exactly " +
-          "what was true at " +
-          utcStamp(meta.generated_at) +
-          " UTC — it is simply that old. Source states are recomputed in your " +
+        (baked
+          ? expectation +
+            "This page could not reach the live document and is showing the " +
+            "copy shipped with the site, so the pipeline may be running " +
+            "normally while this page cannot see it. "
+          : expectation +
+            "None has appeared for " +
+            age +
+            ", so the scheduled job has probably stopped or cannot publish. ") +
+          "Everything below is what was true at " +
+          stamp +
+          " UTC and is simply that old. Source states are recomputed in your " +
           "browser from the published timestamps, so they degrade with age " +
-          "rather than staying frozen at whatever the last build reported."
+          "rather than staying frozen, and satellite positions are withheld " +
+          "once the published track runs out."
       )
     );
     container.appendChild(banner);
@@ -338,7 +298,7 @@
       showError(
         container,
         "Assessment unavailable",
-        "No correlation data in the build output."
+        "No correlation data in the document."
       );
       return;
     }
@@ -379,18 +339,24 @@
     var v = el("div", "value", value);
     if (unit) v.appendChild(el("span", "unit", unit));
     card.appendChild(v);
-    if (meta) card.appendChild(el("div", "meta", meta));
-    if (provenance) card.appendChild(el("div", "provenance", provenance));
+    if (meta) card.appendChild(typeof meta === "string" ? el("div", "meta", meta) : meta);
+    if (provenance) {
+      card.appendChild(
+        typeof provenance === "string" ? el("div", "provenance", provenance) : provenance
+      );
+    }
     return card;
   }
 
-  function observedAt(time, now) {
-    return time
-      ? "NOAA SWPC · " + utcStamp(time) + " (" + relative(time, now) + ")"
-      : "NOAA SWPC · no data this build";
+  /** "NOAA SWPC · <observation time> (<age>)", with the age kept current. */
+  function observedAt(time) {
+    if (!time) return "NOAA SWPC · no data";
+    return live("div", "provenance", function (now) {
+      return "NOAA SWPC · " + utcStamp(time) + " (" + relative(time, now) + ")";
+    });
   }
 
-  function renderWeatherTiles(container, payload, meta, now) {
+  function renderWeatherTiles(container, payload, meta, sky) {
     clear(container);
     var w = payload.weather || {};
 
@@ -401,12 +367,12 @@
           num(w.kp, 2),
           null,
           (w.kp_description || "") + " · trend " + (w.kp_trend || "unknown"),
-          observedAt(w.kp_time, now)
+          observedAt(w.kp_time)
         )
       );
     } else {
       container.appendChild(
-        tile("Planetary Kp", "—", null, "Unavailable", observedAt(null, now))
+        tile("Planetary Kp", "—", null, "Unavailable", observedAt(null))
       );
     }
 
@@ -416,7 +382,7 @@
         num(w.solar_wind_speed_km_s, 0),
         "km/s",
         null,
-        observedAt(w.solar_wind_time, now)
+        observedAt(w.solar_wind_time)
       )
     );
 
@@ -426,7 +392,7 @@
         num(w.bz_nt, 1),
         "nT",
         typeof w.bt_nt === "number" ? "Bt " + num(w.bt_nt, 1) + " nT" : null,
-        observedAt(w.mag_time, now)
+        observedAt(w.mag_time)
       )
     );
 
@@ -443,7 +409,7 @@
           : null,
         w.solar_cycle_month
           ? "NOAA SWPC · monthly mean, " + w.solar_cycle_month
-          : "NOAA SWPC · no data this build"
+          : "NOAA SWPC · no data"
       )
     );
 
@@ -453,9 +419,15 @@
         "Tracked objects",
         int(counts.tracked_satellites),
         null,
-        typeof counts.above_horizon === "number"
-          ? counts.above_horizon + " above horizon"
-          : null,
+        // Counted from the same interpolated positions the sky view shows, so
+        // the two can never disagree -- and blank, not frozen, once the
+        // published track has run out.
+        live("div", "meta", function (now) {
+          var view = Core.skyAt(sky || {}, now);
+          if (view.status === "expired") return "Positions no longer current";
+          if (view.status === "missing") return "";
+          return view.satellites.length + " above horizon now";
+        }),
         "Celestrak GP · propagated with SGP4"
       )
     );
@@ -498,7 +470,7 @@
     card.appendChild(el("div", "label", "Planetary Kp — recent history"));
 
     if (!history.length) {
-      card.appendChild(el("p", "empty", "No Kp history available in this build."));
+      card.appendChild(el("p", "empty", "No Kp history available in this document."));
       return;
     }
 
@@ -702,96 +674,150 @@
     );
   }
 
-  function renderSky(container, payload, meta, now) {
+  /* The sky view is the one panel that is rebuilt on every tick, because it
+   * is the one whose *contents* change with the clock: rows appear as
+   * objects rise, drop out as they set, and reorder as elevations change.
+   * The scroll container is kept and only the rows inside it are replaced,
+   * so a reader's horizontal scroll and keyboard focus survive. */
+  function renderSky(container, sky, meta) {
     clear(container);
-    var sats = (payload.satellites || []).filter(function (s) {
-      return s && typeof s.elevation_deg === "number";
-    });
+    var holder = el("div");
+    var caption = el("div", "provenance");
+    var table = null;
 
-    if (!sats.length) {
-      container.appendChild(
-        el(
-          "p",
-          "empty",
-          "No tracked satellites above the horizon at the last build, or no " +
-            "orbital data was available. Check system health below."
-        )
-      );
-      return;
+    function message(text) {
+      table = null;
+      clear(holder);
+      holder.appendChild(el("p", "empty", text));
     }
 
-    var built = buildTable(
-      [
-        { label: "Satellite" },
-        { label: "Group" },
-        { label: "Elev", numeric: true },
-        { label: "Az", numeric: true },
-        { label: "Dir", numeric: true },
-        { label: "Range", numeric: true },
-        { label: "Alt", numeric: true },
-        { label: "Elem. age", numeric: true },
-      ],
-      "Satellites above the horizon",
-      "Tracked satellites currently above the horizon, highest elevation first."
-    );
+    function update(now) {
+      var view = Core.skyAt(sky, now);
 
-    sats.forEach(function (s) {
-      var row = el("tr");
-      row.appendChild(el("td", "name", s.name || "unknown"));
-      row.appendChild(groupTag(s.group || "—"));
-      row.appendChild(el("td", "num", num(s.elevation_deg, 1) + "°"));
-      row.appendChild(el("td", "num", num(s.azimuth_deg, 0) + "°"));
-      row.appendChild(el("td", "num dim", s.compass || "—"));
-      row.appendChild(el("td", "num", int(s.range_km) + " km"));
-      row.appendChild(el("td", "num", int(s.altitude_km) + " km"));
-      row.appendChild(el("td", "num dim", num(s.tle_age_hours, 1) + " h"));
-      built.tbody.appendChild(row);
-    });
+      if (view.status === "missing") {
+        message(
+          "No position track in this document, so the sky view cannot be " +
+            "shown. Check system health below."
+        );
+        caption.textContent = "";
+        return;
+      }
 
-    container.appendChild(built.scroll);
+      if (view.status === "expired") {
+        // The published track covers a fixed window. Past its end there is
+        // nothing to interpolate, and the last known positions are not
+        // where anything is now -- so they are not shown at all.
+        message(
+          "Positions are no longer current. The track in this document " +
+            "covers up to " +
+            utcStamp(view.coveredUntil) +
+            " UTC, which was " +
+            relative(view.coveredUntil, now) +
+            ", and no newer document has arrived. Satellites have moved on; " +
+            "showing where they were would be showing them in the wrong place."
+        );
+        caption.textContent = "";
+        return;
+      }
+
+      if (!view.satellites.length) {
+        message(
+          "No tracked satellites are above the horizon right now, or no " +
+            "orbital data was available. Check system health below."
+        );
+      } else {
+        if (!table) {
+          clear(holder);
+          table = buildTable(
+            [
+              { label: "Satellite" },
+              { label: "Group" },
+              { label: "Elev", numeric: true },
+              { label: "Az", numeric: true },
+              { label: "Dir", numeric: true },
+              { label: "Range", numeric: true },
+              { label: "Alt", numeric: true },
+              { label: "Elem. age", numeric: true },
+            ],
+            "Satellites above the horizon",
+            "Tracked satellites currently above the horizon, highest elevation first."
+          );
+          holder.appendChild(table.scroll);
+        }
+        clear(table.tbody);
+        view.satellites.forEach(function (s) {
+          var row = el("tr");
+          row.appendChild(el("td", "name", s.name || "unknown"));
+          row.appendChild(groupTag(s.group || "—"));
+          row.appendChild(el("td", "num", num(s.elevation_deg, 1) + "°"));
+          row.appendChild(el("td", "num", num(s.azimuth_deg, 0) + "°"));
+          row.appendChild(el("td", "num dim", s.compass || "—"));
+          row.appendChild(el("td", "num", int(s.range_km) + " km"));
+          row.appendChild(el("td", "num", int(s.altitude_km) + " km"));
+          row.appendChild(el("td", "num dim", num(s.tle_age_hours, 1) + " h"));
+          table.tbody.appendChild(row);
+        });
+      }
+
+      caption.textContent =
+        "Positions as of " +
+        utcStamp(view.at) +
+        " UTC, by your device's clock" +
+        (view.status === "early"
+          ? " — which reads earlier than the time this track starts, so the " +
+            "first published positions are shown"
+          : "") +
+        ". Track published through " +
+        utcStamp(view.coveredUntil) +
+        " UTC.";
+    }
+
+    container.appendChild(holder);
+    update(new Date());
+    onTick(update);
+
+    container.appendChild(caption);
     container.appendChild(
       el(
         "div",
         "provenance",
-        'Positions computed with SGP4 from Celestrak element sets. "Elem. age" ' +
-          "is the age of the element set at build time — propagation error " +
-          "grows with it."
+        "The pipeline propagates Celestrak element sets with SGP4 and " +
+          "publishes a short track per object; this page interpolates along " +
+          'it to the current time and does no orbital mechanics itself. "Elem. ' +
+          'age" is the age of the element set — propagation error grows with it.'
       )
     );
     var note = coverageNote(meta);
     if (note) container.appendChild(el("div", "provenance", note));
-    if (now) {
-      container.appendChild(
-        el(
-          "div",
-          "provenance",
-          "Positions are a snapshot at " +
-            utcStamp(payload.generated_at) +
-            " UTC (" +
-            relative(payload.generated_at, now) +
-            "), not live."
-        )
-      );
-    }
   }
 
-  function renderPasses(container, payload, meta, now) {
+  function renderPasses(container, payload, meta, generatedAt, now) {
     clear(container);
     var all = (payload.passes || []).filter(function (p) {
       return p && p.start;
     });
 
-    // passes.json is generated at build time and the page may be viewed an
-    // hour or more later, so part of the schedule is already history. Showing
-    // "18m ago" under a column headed "In" reads as a bug even though the
-    // data is fine.
-    var upcoming = [];
-    var elapsed = 0;
-    all.forEach(function (p) {
+    // The schedule is computed when the document is generated and read some
+    // time later, so part of it may already be history. Showing "18m ago"
+    // under a column headed "In" reads as a bug even though the data is fine.
+    var upcoming = all.filter(function (p) {
       var end = parseTime(p.end);
-      if (end && end < now) elapsed += 1;
-      else upcoming.push(p);
+      return !(end && end < now);
     });
+
+    // An honest footnote when the search was cut short at the run's deadline.
+    function incompleteNote() {
+      if (payload.complete !== false) return null;
+      return el(
+        "div",
+        "provenance",
+        "The pass search stopped at the run's deadline after " +
+          int(payload.satellites_searched) +
+          " of " +
+          int(payload.satellites_total) +
+          " tracked objects, so this list is incomplete."
+      );
+    }
 
     if (!upcoming.length) {
       container.appendChild(
@@ -801,19 +827,17 @@
           all.length
             ? "All " +
               all.length +
-              " predicted passes in this build have already elapsed. The page " +
-              "is waiting on the next scheduled rebuild."
+              " predicted passes in this document have already elapsed. The " +
+              "page is waiting on a newer document."
             : "No passes predicted, or no orbital data was available. Check " +
               "system health below."
         )
       );
       container.appendChild(
-        el(
-          "div",
-          "provenance",
-          "Generated " + utcStamp(payload.generated_at) + " UTC."
-        )
+        el("div", "provenance", "Computed " + utcStamp(generatedAt) + " UTC.")
       );
+      var cutShort = incompleteNote();
+      if (cutShort) container.appendChild(cutShort);
       return;
     }
 
@@ -877,10 +901,9 @@
           num(payload.min_elevation_deg, 0) +
           "°, searched " +
           num(payload.search_hours, 0) +
-          " h ahead from the last build at " +
-          utcStamp(payload.generated_at) +
-          " UTC." +
-          ""
+          " h ahead from " +
+          utcStamp(generatedAt) +
+          " UTC."
       )
     );
     container.appendChild(
@@ -894,17 +917,51 @@
           gone +
           " of " +
           all.length +
-          " passes in this build have already elapsed and are hidden."
+          " passes in this document have already elapsed and are hidden."
         );
       })
     );
+    var incomplete = incompleteNote();
+    if (incomplete) container.appendChild(incomplete);
     var note = coverageNote(meta);
     if (note) container.appendChild(el("div", "provenance", note));
   }
 
   // --------------------------------------------------------------- health
 
-  function renderHealth(container, payload, now) {
+  /** The schedule and politeness figures the thresholds are derived from. */
+  function scheduleNote(meta) {
+    var pipeline = (meta && meta.pipeline) || {};
+    var parameters = (meta && meta.parameters) || {};
+    var parts = [];
+    if (Core.isNumber(pipeline.cadence_seconds)) {
+      parts.push("The job runs every " + humanDuration(pipeline.cadence_seconds));
+    }
+    if (Core.isNumber(pipeline.silence_limit_seconds)) {
+      parts.push(
+        "a document older than " +
+          humanDuration(pipeline.silence_limit_seconds) +
+          " is flagged at the top of this page"
+      );
+    }
+    var text = parts.length ? parts.join("; ") + ". " : "";
+    if (Core.isNumber(parameters.celestrak_min_refetch_seconds)) {
+      text +=
+        "NOAA SWPC is asked on every run. Each Celestrak group is asked at " +
+        "most once every " +
+        humanDuration(parameters.celestrak_min_refetch_seconds) +
+        ", which is how often Celestrak publishes" +
+        (Core.isNumber(parameters.celestrak_retry_seconds)
+          ? ", and not again for " +
+            humanDuration(parameters.celestrak_retry_seconds) +
+            " after a failed request"
+          : "") +
+        ". ";
+    }
+    return text;
+  }
+
+  function renderHealth(container, payload, meta) {
     clear(container);
     var sources = payload.sources || [];
 
@@ -912,7 +969,7 @@
       showError(
         container,
         "Health unavailable",
-        "The build produced no source health records."
+        "The document carries no source health records."
       );
       return;
     }
@@ -943,26 +1000,31 @@
       row.appendChild(middle);
 
       var right = el("div");
-      // Prefixed deliberately. This sentence was written by the build and can
-      // contain an age baked into the text ("cache is 1h 3m old"), which would
-      // otherwise sit next to a live, ticking age and contradict it. Saying
-      // whose account it is reconciles the two honestly.
+      // Prefixed deliberately. This sentence was written by the pipeline and
+      // can contain an age fixed in the text ("answered 1h 3m ago"), which
+      // would otherwise sit next to a live, ticking age and contradict it.
+      // Saying whose account it is, and from when, reconciles the two.
       if (source.detail) {
-        right.appendChild(el("div", "health-detail", "At build: " + source.detail));
+        right.appendChild(
+          el("div", "health-detail", "When published: " + source.detail)
+        );
       }
 
-      // If age has pushed the state past what the build recorded, say so
-      // rather than silently disagreeing with the detail text above.
+      // If age, or having fallen back to the baked copy, has pushed the state
+      // past what the pipeline recorded, say so rather than silently
+      // disagreeing with the detail text above.
       right.appendChild(
         live("div", "health-when", function (t) {
           var current = stateNow(source, t);
           if (!source.state || current === source.state) return "";
           return (
-            "Recomputed in-browser: was " +
+            "Recomputed in your browser: was " +
             source.state +
-            " at build time, now " +
+            " when published, now " +
             current +
-            "."
+            (shown && shown.origin === "baked" && source.state === "fresh"
+              ? " (this is a fallback copy; nothing in it is reported fresh)."
+              : ".")
           );
         })
       );
@@ -972,7 +1034,7 @@
           el(
             "div",
             "health-when",
-            "Last success " + utcStamp(source.last_success) + " UTC"
+            "Upstream last answered " + utcStamp(source.last_success) + " UTC"
           )
         );
       }
@@ -989,7 +1051,7 @@
             (source.outcome || "unknown") +
             (typeof source.elapsed_seconds === "number" &&
             isFinite(source.elapsed_seconds)
-              ? " · fetched in " + source.elapsed_seconds.toFixed(2) + "s"
+              ? " · took " + source.elapsed_seconds.toFixed(2) + "s"
               : "")
         )
       );
@@ -1001,6 +1063,7 @@
       container.appendChild(row);
     });
 
+    var schedule = scheduleNote(meta);
     container.appendChild(
       live("div", "thresholds", function (t) {
         var states = sources.map(function (source) {
@@ -1024,10 +1087,12 @@
           worstState(states) +
           " — " +
           parts.join(", ") +
-          ". Thresholds are build-time constants, published here so the state " +
-          "is checkable rather than asserted. States are recomputed in your " +
-          "browser from the timestamps above, so they stay truthful even if " +
-          "the scheduled rebuild stops."
+          ". " +
+          schedule +
+          "The thresholds are constants derived from those figures, published " +
+          "here so each state is checkable rather than asserted. States are " +
+          "recomputed in your browser from the timestamps above, so they stay " +
+          "truthful even if the pipeline stops."
         );
       })
     );
@@ -1059,89 +1124,80 @@
     });
   }
 
-  function render(results) {
-    var meta = results[0];
-    var weather = results[1];
-    var sky = results[2];
-    var passes = results[3];
-    var health = results[4];
+  /* A full re-render replaces every panel, which would close an open
+   * <details> and reset any horizontal scroll. A new document arrives every
+   * ten minutes, so that would happen under the reader's hands. Note what
+   * they had open and where they had scrolled to, and put it back. */
+  function keepingReaderState(render) {
+    var open = [];
+    var scrolled = {};
+    Array.prototype.forEach.call(document.querySelectorAll("details"), function (d) {
+      var owner = d.closest("[id]");
+      if (d.open && owner) open.push(owner.id);
+    });
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".table-scroll, .chart-wrap"),
+      function (node) {
+        var owner = node.closest("[id]");
+        if (owner && node.scrollLeft) scrolled[owner.id] = node.scrollLeft;
+      }
+    );
+
+    render();
+
+    open.forEach(function (id) {
+      var d = byId(id) && byId(id).querySelector("details");
+      if (d) d.open = true;
+    });
+    Object.keys(scrolled).forEach(function (id) {
+      var node = byId(id) && byId(id).querySelector(".table-scroll, .chart-wrap");
+      if (node) node.scrollLeft = scrolled[id];
+    });
+  }
+
+  function render() {
+    var doc = shown.document;
+    var meta = doc.meta || {};
     var now = new Date();
 
     // Anything registered by a previous render points at DOM that is about to
     // be replaced. Drop it so closures cannot accumulate across renders.
     tickables.length = 0;
 
-    var metaData = meta.ok ? meta.data : null;
-
-    if (metaData && metaData.observer) {
-      var o = metaData.observer;
-      var subEl = document.getElementById("site-sub");
-      var infoEl = document.getElementById("build-info");
-
-      function subText(t) {
-        return (
-          "Ground station: " +
-          o.name +
-          " (" +
-          num(o.latitude_deg, 4) +
-          "°, " +
-          num(o.longitude_deg, 4) +
-          "°) · built " +
-          utcStamp(metaData.generated_at) +
-          " UTC (" +
-          relative(metaData.generated_at, t) +
-          ")"
-        );
-      }
-
-      function infoText(t) {
-        return (
-          "Data generated " +
-          utcStamp(metaData.generated_at) +
-          " UTC (" +
-          relative(metaData.generated_at, t) +
-          ") in " +
-          num(metaData.build_seconds, 2) +
-          "s. This page is static: it reads pre-generated JSON and makes no " +
-          "upstream calls, so an upstream outage cannot take it down — it only " +
-          "makes the data below older, which the health panel reports."
-        );
-      }
-
-      subEl.textContent = subText(now);
-      infoEl.textContent = infoText(now);
-      onTick(function (t) {
-        subEl.textContent = subText(t);
-        infoEl.textContent = infoText(t);
-      });
-    } else {
-      document.getElementById("build-info").textContent = meta.ok
-        ? "Build metadata loaded but did not contain an observer block, so the " +
-          "ground station and generation time cannot be shown."
-        : "Build metadata could not be loaded (" +
-          meta.error +
-          "), so the generation time is unknown.";
+    var subEl = byId("site-sub");
+    var observer = meta.observer;
+    if (observer && subEl) {
+      subEl.textContent =
+        "Ground station: " +
+        observer.name +
+        " (" +
+        num(observer.latitude_deg, 4) +
+        "°, " +
+        num(observer.longitude_deg, 4) +
+        "°)";
     }
 
-    var stalenessEl = document.getElementById("staleness-banner");
-    guard(stalenessEl, "Staleness check", function () {
-      renderStalenessBanner(stalenessEl, metaData, now);
+    var sourceEl = byId("document-source");
+    sourceEl.textContent = sourceLine(now);
+    onTick(function (t) {
+      sourceEl.textContent = sourceLine(t);
+    });
+
+    var silenceEl = byId("staleness-banner");
+    guard(silenceEl, "Document age check", function () {
+      renderSilenceBanner(silenceEl, doc, now);
       onTick(function (t) {
-        renderStalenessBanner(stalenessEl, metaData, t);
+        renderSilenceBanner(silenceEl, doc, t);
       });
     });
 
-    var healthSources =
-      health.ok && health.data && Array.isArray(health.data.sources)
-        ? health.data.sources
-        : null;
-
-    var overall = document.getElementById("overall-status");
+    var healthSources = Array.isArray(doc.health.sources) ? doc.health.sources : null;
+    var overall = byId("overall-status");
     clear(overall);
     overall.appendChild(
       liveNode("span", null, function (t) {
         return statusBadge(
-          healthSources
+          healthSources && healthSources.length
             ? worstState(
                 healthSources.map(function (source) {
                   return stateNow(source, t);
@@ -1152,105 +1208,143 @@
       })
     );
 
-    var correlationEl = document.getElementById("correlation");
-    var tilesEl = document.getElementById("weather-tiles");
-    var chartEl = document.getElementById("kp-chart-card");
-    if (weather.ok) {
-      chartEl.style.display = "";
-      guard(correlationEl, "Operational assessment", function () {
-        renderCorrelation(correlationEl, weather.data);
-      });
-      guard(tilesEl, "Space weather", function () {
-        renderWeatherTiles(tilesEl, weather.data, metaData, now);
-      });
-      guard(chartEl, "Kp history chart", function () {
-        renderKpChart(chartEl, weather.data);
-      });
-    } else {
-      showError(
-        correlationEl,
-        "Operational assessment unavailable",
-        weather.error +
-          ". Space weather could not be loaded, so no geomagnetic assessment " +
-          "can be made."
-      );
-      // The error must also appear in the Space weather section itself --
-      // otherwise that heading renders above an empty void with no reason.
-      clear(tilesEl);
-      chartEl.style.display = "";
-      showError(
-        chartEl,
-        "Space weather data could not be loaded",
-        weather.error + ". The build may not have run, or the file is missing."
-      );
-    }
+    var correlationEl = byId("correlation");
+    guard(correlationEl, "Operational assessment", function () {
+      renderCorrelation(correlationEl, doc.space_weather);
+    });
+    var tilesEl = byId("weather-tiles");
+    guard(tilesEl, "Space weather", function () {
+      renderWeatherTiles(tilesEl, doc.space_weather, meta, doc.sky);
+    });
+    var chartEl = byId("kp-chart-card");
+    chartEl.style.display = "";
+    guard(chartEl, "Kp history chart", function () {
+      renderKpChart(chartEl, doc.space_weather);
+    });
 
-    var skyEl = document.getElementById("sky");
-    if (sky.ok) {
-      guard(skyEl, "Sky view", function () {
-        renderSky(skyEl, sky.data, metaData, now);
-      });
-    } else {
-      showError(skyEl, "Sky view could not be loaded", sky.error);
-    }
+    var skyEl = byId("sky");
+    guard(skyEl, "Sky view", function () {
+      renderSky(skyEl, doc.sky, meta);
+    });
 
-    var passesEl = document.getElementById("passes");
-    if (passes.ok) {
-      guard(passesEl, "Pass predictions", function () {
-        renderPasses(passesEl, passes.data, metaData, now);
-      });
-    } else {
-      showError(passesEl, "Pass data could not be loaded", passes.error);
-    }
+    var passesEl = byId("passes");
+    guard(passesEl, "Pass predictions", function () {
+      renderPasses(passesEl, doc.passes, meta, doc.generated_at, now);
+    });
 
-    var healthEl = document.getElementById("health");
-    if (health.ok) {
-      guard(healthEl, "System health", function () {
-        renderHealth(healthEl, health.data, now);
-      });
-    } else {
-      showError(
-        healthEl,
-        "Health data could not be loaded",
-        health.error +
-          ". If you are opening this file directly from disk, the browser " +
-          "blocks local JSON reads — serve the directory over HTTP instead."
-      );
-    }
+    var healthEl = byId("health");
+    guard(healthEl, "System health", function () {
+      renderHealth(healthEl, doc.health, meta);
+    });
+
+    var pipeline = meta.pipeline || {};
+    byId("build-info").textContent =
+      "Document generated " +
+      utcStamp(doc.generated_at) +
+      " UTC in " +
+      num(pipeline.run_seconds, 2) +
+      "s" +
+      (pipeline.revision ? " by revision " + String(pipeline.revision).slice(0, 7) : "") +
+      ". This page is static files: it reads one pre-generated document and " +
+      "makes no upstream calls, so an upstream outage cannot take it down — it " +
+      "only makes the data older, which the health panel reports.";
   }
 
-  function boot() {
-    wireThemeToggle();
+  /** Nothing could be loaded at all: say so in every panel, with the reasons. */
+  function renderLoadFailure(liveError, bakedError) {
+    tickables.length = 0;
+    var reason =
+      "The live document could not be loaded (" +
+      (liveError || "unknown error") +
+      "), and neither could the copy shipped with this site (" +
+      (bakedError || "unknown error") +
+      ").";
+    byId("document-source").textContent = "No data could be loaded. " + reason;
+    clear(byId("staleness-banner"));
+    clear(byId("overall-status"));
+    byId("overall-status").appendChild(statusBadge("unknown"));
 
-    Promise.all([
-      loadJSON("meta"),
-      loadJSON("space_weather"),
-      loadJSON("sky"),
-      loadJSON("passes"),
-      loadJSON("health"),
-    ])
-      .then(function (results) {
-        render(results);
-        // Refresh only the volatile text. A full re-render here would collapse
-        // an open <details>, drop keyboard focus out of a scroll region, and
-        // reset horizontal scroll -- every 30 seconds, forever.
-        window.setInterval(function () {
-          runTicks(new Date());
-        }, RETICK_MS);
+    showError(
+      byId("correlation"),
+      "Operational assessment unavailable",
+      reason + " Without space weather no geomagnetic assessment can be made."
+    );
+    clear(byId("weather-tiles"));
+    byId("kp-chart-card").style.display = "";
+    showError(byId("kp-chart-card"), "Space weather data could not be loaded", reason);
+    showError(byId("sky"), "Sky view could not be loaded", reason);
+    showError(byId("passes"), "Pass data could not be loaded", reason);
+    showError(
+      byId("health"),
+      "Health data could not be loaded",
+      reason +
+        " If you are opening this file directly from disk, the browser blocks " +
+        "local reads — serve the directory over HTTP instead. This page will " +
+        "keep trying once a minute."
+    );
+    byId("build-info").textContent =
+      "No document loaded, so nothing is known about when the data was generated.";
+  }
+
+  var loading = false;
+
+  /** Look for a document: on first load, and then once a minute. */
+  function refresh() {
+    if (loading) return;
+    loading = true;
+    Core.loadDocument(CONFIG, {
+      fetch: window.fetch.bind(window),
+      setTimeout: window.setTimeout.bind(window),
+      clearTimeout: window.clearTimeout.bind(window),
+      AbortController: window.AbortController,
+    })
+      .then(function (loaded) {
+        var next = Core.adoptLoad(shown, loaded);
+        if (!next.document) {
+          shown = null;
+          renderLoadFailure(next.liveError, next.bakedError);
+          return;
+        }
+        var first = !shown;
+        shown = next;
+        if (first) render();
+        else if (next.changed) keepingReaderState(render);
+        // Unchanged: the tick below picks up any change to refreshError.
+        runTicks(new Date());
       })
       .catch(function (error) {
         // Last line of defence. Nothing above should reject, but a blank page
         // with no explanation is the one outcome this project must not have.
-        var container = document.getElementById("correlation");
-        if (container) {
-          showError(
-            container,
-            "The dashboard failed to render",
-            (error && error.message ? error.message : String(error)) +
-              ". The raw data is still readable at data/health.json."
-          );
-        }
+        showError(
+          byId("correlation"),
+          "The dashboard failed to render",
+          (error && error.message ? error.message : String(error)) +
+            ". The raw data is still readable at " +
+            (CONFIG.bakedDocumentUrl || "data/latest.json") +
+            "."
+        );
+      })
+      .then(function () {
+        loading = false;
       });
+  }
+
+  function boot() {
+    wireThemeToggle();
+    refresh();
+    window.setInterval(refresh, POLL_MS);
+    // Refresh only the volatile parts. See RETICK_MS for why not everything.
+    window.setInterval(function () {
+      runTicks(new Date());
+    }, RETICK_MS);
+    // A tab that was in the background has been throttled; catch up at once
+    // instead of showing minutes-old positions until the next tick.
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) {
+        runTicks(new Date());
+        refresh();
+      }
+    });
   }
 
   if (document.readyState === "loading") {

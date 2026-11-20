@@ -139,6 +139,17 @@ body {
   font-size: 0.85rem;
 }
 
+/* Which copy of the data is on screen. Quiet, but always present. */
+.document-source {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  margin: 0.75rem 0 0;
+}
+
+.noscript-box {
+  margin-top: 1.25rem;
+}
+
 .masthead-right {
   display: flex;
   align-items: center;
