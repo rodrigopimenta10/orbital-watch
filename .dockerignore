@@ -1,0 +1,11 @@
+# The image is built from four things: pyproject.toml, uv.lock, src/ and the
+# two files the package metadata names. Ignore everything, then allow those,
+# so nothing else can reach the build context by accident -- least of all a
+# local state directory or a Terraform working directory.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+src/**/__pycache__/
