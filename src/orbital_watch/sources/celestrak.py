@@ -95,8 +95,9 @@ def validate_gp_records(data: object) -> list[dict]:
 def select_objects(records: list[dict], group: SatelliteGroup) -> list[dict]:
     """Trim a group down to the objects we will actually propagate.
 
-    Starlink ships ~11k objects. Propagating all of them would dominate run
-    time and produce a document no browser should be asked to parse, for no
+    A group can hold far more objects than the page should show (the full
+    Starlink group is ~11k). Propagating all of them would dominate run time
+    and produce a document no browser should be asked to parse, for no
     analytical gain -- the point of the dashboard is representative
     visibility, not a catalogue browser (explicitly out of scope, brief §4.2).
 
@@ -158,15 +159,32 @@ def group_spec(group: SatelliteGroup) -> SourceSpec:
     """Describe one GP group to the fetch helper.
 
     What is kept in the state store is the *trimmed* group -- the objects we
-    propagate -- because the full Starlink group is about 5 MB and would be
-    rewritten every two hours for nothing. The size of the group before
-    trimming is recorded as a fact alongside it, since the page states its own
-    sampling ("60 of 11,205 starlink") and that number is not recoverable from
-    the sixty records kept.
+    propagate. The size of the group before trimming is recorded as a fact
+    alongside it, since the page states its own sampling ("60 of 107 recent
+    starlink") and that number is not recoverable from the sixty records kept.
+
+    A group may be taken from a differently named Celestrak group and narrowed
+    by object name (``query_group`` and ``name_prefix``): Starlink comes from
+    the small "last-30-days" group, not from the 5 MB Starlink one. "Available"
+    then counts the objects that matched, which is what the page's sentence is
+    about.
     """
 
     def parse(data: object) -> Payload:
         records = validate_gp_records(data)
+        if group.name_prefix is not None:
+            records = [
+                record
+                for record in records
+                if str(record["OBJECT_NAME"]).startswith(group.name_prefix)
+            ]
+            if not records:
+                # Upstream answered, but with nothing we track. Raising keeps
+                # the stored group and reports this one as not refreshed.
+                raise ValueError(
+                    f"no object named {group.name_prefix}* in Celestrak group "
+                    f"{group.query_group or group.key}"
+                )
         return Payload(
             data=select_objects(records, group),
             facts={"available": len(records)},
@@ -174,7 +192,7 @@ def group_spec(group: SatelliteGroup) -> SourceSpec:
 
     return SourceSpec(
         name=source_name(group),
-        url=group_url(group.key),
+        url=group_url(group.query_group or group.key),
         parse=parse,
         revalidate=validate_gp_records,
         plausible=_refuse_collapse,

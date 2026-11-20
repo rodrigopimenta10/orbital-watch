@@ -1214,3 +1214,76 @@ real services fail. A reviewer who starts from "how could this claim be
 false?" finds different things from an author who starts from "does this
 work?", and a system whose whole claim is honesty about failure needs the
 first kind of reading before it is trusted with the second.
+
+---
+
+## 31. Starlink comes from a 90 KB group, not a 5 MB one
+
+**Decision.** The Starlink objects on the page are taken from Celestrak's
+`last-30-days` group (everything launched in the last thirty days, about 200
+objects) filtered to names beginning `STARLINK`, and no longer from the full
+`starlink` group. The sample is still sixty, still the most recent epochs
+(§4). The group is labelled "Recent Starlink", and the page's coverage line
+counts against what matched ("60 of 107").
+
+**Why.** The full group is about 11,000 objects and 5 MB. Downloading it
+twelve times a day to show sixty satellites was about 60 MB a day. Celestrak's
+own documentation says what that costs them: they have a monthly bandwidth
+budget they are exceeding, they ask users to consider how much data they
+need, and an address using more than roughly 100 MB a day can expect to be
+firewalled. This job's address is shared with other Cloud Run tenants, so
+its own 60 MB was most of that allowance before anyone else's traffic was
+counted. The new request is about 90 KB, so the three groups together are
+now about 1.5 MB a day.
+
+It is also the fragile request. On the day of the move, with Celestrak
+struggling, the two small groups got through from Google Cloud and the 5 MB
+one never did. The smaller the request, the more often it completes on a bad
+day; and a download abandoned part-way still counts, on Celestrak's side, as
+the one download allowed until the data next changes (§29).
+
+**What it costs.** The sixty are no longer drawn from the whole
+constellation, only from recent launches, which are often still raising
+their orbits. For a page whose purpose is representative visibility over one
+ground station that is an acceptable sample, and the label says what it is.
+If thirty days pass with no Starlink launch, the filter matches nothing; that
+is treated as a refusal to refresh, so the stored group is kept and ages
+honestly (there is a test for it).
+
+**Recorded shape.** The real response of 2026-11-20 is a fixture
+(`tests/fixtures/celestrak_last_30_days.json`: 204 objects, 107 Starlink).
+
+---
+
+## 32. The move to Google Cloud, 20 November 2026: what was carried over
+
+The job's first runs on Google Cloud (16:10 and 16:13 UTC) found Celestrak
+answering HTTP 503 to every request; it was failing for everyone that
+afternoon, not for this address in particular. The state store was empty, so
+the page had space weather and no satellites, and said so.
+
+**What was done.** The stations and weather groups had been fetched
+successfully at 15:25 UTC by this same code, run once from a laptop while
+checking the rebuild. Those two payloads were copied into the job's state
+store with their true retrieval times, keeping the job's own record of its
+failed attempt at 16:13. The next run served them and reported both sources
+as **stale** ("upstream unreachable at the last attempt; serving stored data
+from 1 h 15 m ago"), which was exactly the case. At 16:50 UTC Celestrak
+answered the job itself and both groups went fresh on their own.
+
+**Why record it.** State that did not come from the job's own request is
+the kind of thing this project exists to be honest about. Nothing on the
+page claimed more than was true at any point: the copied data carried its
+real age, and the health panel called it stale until the job had confirmed
+it. This is the one time state was written by hand. §27 removed the seed
+snapshot because a cold start "happens once"; this is what that once looked
+like, on a day the upstream was down.
+
+**The address.** `orbital.rodrigopimenta.com` was moved from Cloudflare Pages
+to Firebase Hosting at about 16:45 UTC, after the portfolio site's status
+check had been switched to read the published document. The certificate was
+issued within fifteen minutes. The scheduler Worker was deleted the same
+day and the Pages project's builds were switched off; Cloudflare will not
+delete a Pages project that has more than a hundred past deployments until
+they are removed through its API, so the dormant project outlived the move.
+

@@ -322,7 +322,7 @@ ORBITAL_WATCH_LON=15.4075 \
 ## Tests
 
 ```bash
-uv run pytest                 # 344 tests
+uv run pytest                 # 346 tests
 uv run ruff check .           # lint
 uv run ruff format --check .
 node --test tests/web/*.test.js   # 53 tests of the page's logic; no npm, no dependencies
@@ -381,7 +381,7 @@ pinned to each other.
 
 | Source | Endpoint | Fetched |
 |---|---|---|
-| [Celestrak](https://celestrak.org/) | GP API, groups `stations`, `weather`, `starlink` | each group at most once every 2 h; after a failed attempt, not again for 30 min |
+| [Celestrak](https://celestrak.org/) | GP API, groups `stations`, `weather`, `last-30-days` (for its Starlinks) | each group at most once every 2 h; after a failed attempt, not again for 30 min |
 | [NOAA SWPC](https://www.swpc.noaa.gov/) | planetary K-index | every run (10 min), conditionally |
 | NOAA SWPC | solar wind speed, IMF Bt/Bz | every run, conditionally |
 | NOAA SWPC | observed solar cycle indices | every run, conditionally |
@@ -398,18 +398,20 @@ Celestrak rate-limits aggressively and blocks abusive clients, so:
 - each group is asked **at most once per publication interval**. Celestrak
   regenerates GP data about every two hours; asking sooner cannot return
   newer element sets;
-- each request has a ceiling on its whole duration (20 s; 45 s for the 5 MB
-  Starlink group), so a throttled download is dropped and retried later
-  rather than held open;
+- each request has a ceiling on its whole duration (20 s; 45 s for the
+  largest, under 100 KB), so a throttled download is dropped and retried
+  later rather than held open;
 - that floor is enforced against the stored record of the last attempt, so it
   holds however often the job runs — and if the state store cannot be read,
   Celestrak is not contacted at all;
 - a failing group is retried every 30 minutes, not every run;
 - requests carry a descriptive `User-Agent` identifying the project;
-- only the three named groups are fetched, never the full catalogue.
+- only three small groups are fetched, about 1.5 MB a day in all. Never the
+  full catalogue, and never the 5 MB Starlink group.
 
-Starlink is sampled (60 of ~11,000 objects, most recent epochs) — see
-[DECISIONS.md](DECISIONS.md).
+Starlink is represented by the satellites launched in the last 30 days
+(sixty of about a hundred, most recent epochs), taken from Celestrak's small
+`last-30-days` group — see [DECISIONS.md](DECISIONS.md) §31.
 
 Two upstream findings, both documented in [DECISIONS.md](DECISIONS.md): the
 `products/solar-wind/plasma-*.json` endpoints in the original spec now return
