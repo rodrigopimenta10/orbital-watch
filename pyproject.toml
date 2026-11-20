@@ -1,7 +1,7 @@
 [project]
 name = "orbital-watch"
-version = "0.1.0"
-description = "Satellite pass tracking correlated with live space-weather conditions, served as a static site."
+version = "2.0.0"
+description = "Satellite pass tracking correlated with live space-weather conditions: a scheduled job that publishes one document, and a static page that reads it."
 readme = "README.md"
 authors = [
     { name = "Rodrigo Pimenta", email = "rodrigopimenta102@gmail.com" }
@@ -15,14 +15,19 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
 dependencies = [
-    # Topocentric geometry and rise/culminate/set search. See DECISIONS.md.
-    # HTTP is stdlib urllib -- no requests, no httpx.
+    # Topocentric geometry and rise/culminate/set search. See DECISIONS.md §2.
+    # Upstream HTTP is stdlib urllib -- no requests, no httpx (DECISIONS.md §7).
     "skyfield>=1.49",
     # Declared explicitly because propagate.py imports sgp4.api and sgp4.omm
     # directly. It arrives transitively via skyfield today, but depending on
     # a transitive dependency for a direct import breaks the day skyfield
     # vendors or drops it.
     "sgp4>=2.20",
+    # State and the published document live in Cloud Storage. The official
+    # client is used for authentication and for conditional (generation-
+    # matched) writes; it is imported in store.py and nowhere else. See
+    # DECISIONS.md §28 for why this one is not hand-written.
+    "google-cloud-storage>=3.0",
 ]
 
 [build-system]
