@@ -20,6 +20,9 @@ concurrency:
 env:
   # The same uv the container image is built with (see Dockerfile).
   UV_VERSION: "0.13.9"
+  # Named, not "whatever the runner has". The first version of this workflow
+  # relied on the runner's Node and broke on it: see the frontend job.
+  NODE_VERSION: "22.23.5"
 
 jobs:
   python:
@@ -121,15 +124,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The runner's own Node, and Node's built-in test runner: the frontend has no package.json
-      # and no dependencies, and its tests keep it that way.
+      # Node's built-in test runner: the frontend has no package.json and no dependencies, and
+      # its tests keep it that way. Only Node itself is installed.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
       - name: Every script parses
         run: |
           node --version
           for file in web/assets/*.js; do node --check "$file"; done
 
+      # The test files are named (through a glob the shell expands), not their directory. Node 22
+      # takes a directory argument to be a single file to run and fails with "Cannot find
+      # module"; newer versions search it. Naming the files means the same thing on every version.
       - name: Tests
-        run: node --test tests/web/
+        run: node --test tests/web/*.test.js
 
   container:
     name: container image

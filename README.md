@@ -173,11 +173,15 @@ There is exactly one place in the codebase that talks to an upstream:
 `fetch_source()` in `src/orbital_watch/sources/fetch.py`. It guarantees the
 same things for every caller:
 
-- a hard timeout — no unbounded waits;
+- a ceiling on the whole request, body included, and a shorter limit on how
+  long the connection may go silent — no unbounded waits, and a body sent at
+  a trickle is abandoned instead of read for minutes;
 - failure is caught, logged with source and elapsed time, and falls back to
   the last good payload in the state store;
 - a source with a politeness floor is not contacted until the floor clears,
-  decided from the stored record of the last attempt;
+  decided from the stored record of the last attempt — which is written
+  *before* the request, so it exists even if the run is stopped half way,
+  and a request that cannot be recorded is not made;
 - the outcome is recorded in a result object the health panel reports verbatim;
 - **it never raises.** No caller can abort the run by forgetting a
   `try`/`except`, because there is nothing to catch.
@@ -197,12 +201,16 @@ answer is testable in isolation.
 | Upstream down, retry not yet due | `cache_fallback` | Stored data | **stale** — still; it does not flip back to fresh between retries |
 | Upstream down, nothing stored | `failed` | That panel empties, others unaffected | **failed** — with the reason |
 | Data older than the staleness limit | — | Data still renders | **failed** — "not operationally current" |
-| Malformed, wrong-shaped or non-JSON response | `cache_fallback` | Stored data | **stale** — the stored copy is *not* overwritten |
+| Malformed, wrong-shaped or non-JSON response, or one carrying `NaN` / `Infinity` | `cache_fallback` | Stored data | **stale** — the stored copy is *not* overwritten |
+| Upstream answers, then sends the body at a trickle | `cache_fallback` | Stored data | **stale** — "gave up after 45s with the response incomplete" |
 | Stored data with no date | — | Data renders | **stale** — undated is never fresh |
 | State store unreadable | `failed` for Celestrak | Celestrak panels empty | **failed** — and Celestrak is *not* contacted, since nothing says when it last was |
+| State store readable but not writable | `cache_fallback` for Celestrak | Stored data | **stale** — Celestrak is *not* contacted, since the request could not be recorded |
+| The Kp source ages past its limit | — | The assessment banner is withdrawn | says the assessment is no longer current, and what it was |
 | The document would be malformed | — | Previous document stays | unchanged; the run fails and the owner is alerted |
 | The pipeline stops | — | Page shows the last document | every state recomputed in the browser; banner after 30 min |
 | The page cannot reach the live document | — | Copy baked into the site is shown, labelled | nothing in it is reported **fresh** |
+| The reader's clock is slow | — | Ages use the latest of the device's clock, the document's own time and the server's `Date` | no state is shown better than it was published |
 
 Three behaviours worth calling out:
 
@@ -314,10 +322,10 @@ ORBITAL_WATCH_LON=15.4075 \
 ## Tests
 
 ```bash
-uv run pytest                 # 308 tests
+uv run pytest                 # 344 tests
 uv run ruff check .           # lint
 uv run ruff format --check .
-node --test tests/web/        # 45 tests of the page's logic; no npm, no dependencies
+node --test tests/web/*.test.js   # 53 tests of the page's logic; no npm, no dependencies
 (cd infra && terraform init -backend=false && terraform test)   # 12 runs, mocked providers
 ```
 
@@ -349,13 +357,15 @@ or without — can prevent a run from producing a complete document that tells
 the truth about its own state.
 
 **State and concurrency** (`test_store.py`, `test_sources.py`,
-`test_document.py`): the politeness floor survives a new process; two
-overlapping runs cannot overwrite each other's state; an older run cannot
-replace a newer document.
+`test_document.py`): the politeness floor survives a new process, a run
+killed mid-request, and a store that cannot be written; two overlapping runs
+ask a rate-limited source once and cannot lose each other's results; an
+older run cannot replace a newer document.
 
 **The page** (`tests/web/core.test.js`): which copy of the document is shown
 and when it falls back, that a frozen pipeline is noticed from the reader's
-clock alone, that nothing in a fallback copy is fresh, and that interpolated
+clock alone, that a slow reader clock cannot make anything look newer than
+it is, that nothing in a fallback copy is fresh, and that interpolated
 positions match SGP4. The reference values for that last one are written by
 the Python pipeline (`test_web_fixture.py`), so the JavaScript is checked
 against SGP4 rather than against numbers typed into a test.
@@ -388,6 +398,9 @@ Celestrak rate-limits aggressively and blocks abusive clients, so:
 - each group is asked **at most once per publication interval**. Celestrak
   regenerates GP data about every two hours; asking sooner cannot return
   newer element sets;
+- each request has a ceiling on its whole duration (20 s; 45 s for the 5 MB
+  Starlink group), so a throttled download is dropped and retried later
+  rather than held open;
 - that floor is enforced against the stored record of the last attempt, so it
   holds however often the job runs — and if the state store cannot be read,
   Celestrak is not contacted at all;

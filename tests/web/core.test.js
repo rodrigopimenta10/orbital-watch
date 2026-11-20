@@ -1,7 +1,8 @@
 /* Tests for the page's logic (web/assets/core.js).
  *
- * Run with `node --test tests/web/`. Node's own test runner and assert
- * module: no package.json, no dependencies, nothing to install.
+ * Run with `node --test tests/web/*.test.js` (the files, not the directory:
+ * Node 22 takes a directory argument to be one file). Node's own test runner
+ * and assert module: no package.json, no dependencies, nothing to install.
  *
  * core.js has no DOM in it, so everything the page *decides* is tested here
  * without a browser: which copy of the document to show, when to say the

@@ -330,3 +330,26 @@ def test_container_base_images_are_pinned_by_digest():
     # And nothing is pulled by a bare name further down.
     for line in re.findall(r"^FROM (\S+)", read("Dockerfile"), re.M):
         assert line.startswith("${"), f"FROM {line} bypasses the pinned images"
+
+
+def test_page_tests_are_run_by_file_on_a_named_node_version():
+    """CI broke on this once, before the first deploy.
+
+    ``node --test tests/web/`` ran locally on a recent Node and failed on the
+    runner's Node 22, which takes a directory argument to be one file. The
+    workflows name the test files and name the Node version, the same one in
+    both, and the README tells a reader to run what CI runs.
+    """
+    command = "node --test tests/web/*.test.js"
+    versions = set()
+    for path in WORKFLOWS:
+        text = path.read_text()
+        assert command in text, path.name
+        assert not re.search(r"node --test tests/web/?\s*$", text, re.M), path.name
+        assert "actions/setup-node@" in text, path.name
+        (version,) = re.findall(r'NODE_VERSION: "(\d+\.\d+\.\d+)"', text)
+        versions.add(version)
+
+    assert len(versions) == 1, f"the workflows disagree about Node: {versions}"
+    assert command in read("README.md")
+    assert sorted(path.name for path in (REPO / "tests" / "web").glob("*.test.js"))
