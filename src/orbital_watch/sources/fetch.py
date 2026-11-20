@@ -122,6 +122,10 @@ class SourceSpec:
     #: Ceiling on one whole request to this source, from sending it to the
     #: last byte of the body, in seconds.
     max_seconds: float = HTTP_TIMEOUT_SECONDS
+    #: Longest the connection may go without sending anything, when this
+    #: source needs more patience than ``HTTP_STALL_TIMEOUT_SECONDS``. Never
+    #: longer than ``max_seconds``, which still bounds the whole request.
+    stall_seconds: float | None = None
     #: Do not contact upstream again within this long of its last answer.
     min_refetch_interval: timedelta | None = None
     #: Do not retry within this long of a failed attempt. Only meaningful
@@ -531,8 +535,9 @@ def fetch_source(
         deadline=deadline,
         total=total,
         # A connection that goes silent is cut sooner than one that is merely
-        # slow, but never later than the attempt as a whole.
-        stall=max(min(HTTP_STALL_TIMEOUT_SECONDS, total), 0.1),
+        # slow, but never later than the attempt as a whole. A source may ask
+        # for more patience than the default (see SourceSpec.stall_seconds).
+        stall=max(min(spec.stall_seconds or HTTP_STALL_TIMEOUT_SECONDS, total), 0.1),
     )
     try:
         return _fetch(spec, store, allowance, clock, started)

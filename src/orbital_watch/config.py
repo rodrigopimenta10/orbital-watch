@@ -167,6 +167,8 @@ USER_AGENT = (
 #: while waiting for the headers, or between two pieces of a body. This is
 #: the socket timeout. It catches an upstream that has gone silent; it cannot
 #: catch one that is merely slow, which is what the ceilings below are for.
+#: It is the default: a source whose server is known to think for longer
+#: than this before answering sets its own (Celestrak does, see celestrak.py).
 HTTP_STALL_TIMEOUT_SECONDS = 10.0
 
 #: Ceiling on one whole request, from sending it to the last byte of the

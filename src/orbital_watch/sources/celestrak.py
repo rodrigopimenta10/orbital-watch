@@ -199,4 +199,11 @@ def group_spec(group: SatelliteGroup) -> SourceSpec:
         min_refetch_interval=CELESTRAK_MIN_REFETCH_INTERVAL,
         retry_interval=CELESTRAK_RETRY_INTERVAL,
         max_seconds=group.fetch_seconds,
+        # Celestrak can take longer to *begin* answering than the default
+        # silence limit allows: on 2026-11-20 it took over ten seconds to send
+        # the first byte of a 90 KB group, and the default cut every attempt
+        # short of an answer that was coming. For Celestrak the only limit is
+        # the ceiling on the whole request, which a silent server and a
+        # trickling one both run into.
+        stall_seconds=group.fetch_seconds,
     )
