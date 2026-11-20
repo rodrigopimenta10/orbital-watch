@@ -1404,3 +1404,37 @@ def test_a_recent_launches_group_with_no_starlink_keeps_the_stored_group(
     assert second.outcome is Outcome.CACHE_FALLBACK
     assert len(second.data) == 60
     assert "no object named STARLINK" in second.error
+
+
+def test_celestrak_is_given_its_whole_ceiling_to_start_answering(
+    state_store, monkeypatch
+):
+    """A slow first byte from Celestrak is waited for, up to the request's ceiling.
+
+    Seen live on 2026-11-20: Celestrak took more than ten seconds to begin
+    answering for a 90 KB group, and the ten-second silence limit cut each
+    attempt short of an answer that was on its way. The socket timeout handed
+    to the request must be the group's ceiling, not the default.
+    """
+    seen: list[float] = []
+
+    def urlopen(request, timeout=None):
+        seen.append(timeout)
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    starlink = next(g for g in TRACKED_GROUPS if g.key == "starlink")
+    stations = next(g for g in TRACKED_GROUPS if g.key == "stations")
+
+    slow = fetch_source(celestrak.group_spec(starlink), state_store, clock=FakeClock())
+    fetch_source(celestrak.group_spec(stations), state_store, clock=FakeClock())
+    fetch_source(swpc.KP, state_store, clock=FakeClock())
+
+    assert seen[0] == pytest.approx(starlink.fetch_seconds, abs=0.5)
+    assert seen[1] == pytest.approx(stations.fetch_seconds, abs=0.5)
+    # Everything else keeps the short default.
+    assert seen[2] == pytest.approx(fetch_module.HTTP_STALL_TIMEOUT_SECONDS, abs=0.5)
+    assert slow.outcome is Outcome.FAILED
+    assert (
+        slow.error == f"Timed out after {starlink.fetch_seconds:.0f}s without a response"
+    )

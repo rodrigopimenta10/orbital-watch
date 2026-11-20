@@ -1287,3 +1287,29 @@ day and the Pages project's builds were switched off; Cloudflare will not
 delete a Pages project that has more than a hundred past deployments until
 they are removed through its API, so the dormant project outlived the move.
 
+---
+
+## 33. Celestrak is given its whole ceiling to start answering
+
+**The bug.** Every request had two limits: a ceiling on the whole request
+(20 s, 45 s for the group Starlink comes from) and a ten-second limit on
+silence, which was also the wait for the first byte. On 2026-11-20, an hour
+after §31 shipped, Celestrak took more than ten seconds to *begin* answering
+for the 90 KB group (it had taken 25 s end to end from a laptop the same
+afternoon). The silence limit cut the attempt at ten seconds, so the 45 s
+ceiling written for exactly this case never came into play, and each cut
+attempt cost thirty minutes of back-off.
+
+**The fix.** A source can state its own silence limit
+(`SourceSpec.stall_seconds`); Celestrak's is its request ceiling. A silent
+Celestrak and a trickling one now run into the same single limit, the
+ceiling. NOAA's sources keep the short default, because they answer in well
+under a second and ten seconds of silence from them does mean something is
+wrong.
+
+**Why it was missed.** §30's review asked "what if the body is slow?" and
+the fix bounded the body. Nobody asked "what if the server is slow to
+start?", because every test upstream either answered at once or never. Two
+limits on one request are two places for a number to be wrong; the test
+added here pins which limit each source actually gets.
+
