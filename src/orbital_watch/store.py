@@ -190,6 +190,11 @@ class LocalStore:
                 try:
                     with os.fdopen(handle, "wb") as tmp:
                         tmp.write(data)
+                    # mkstemp creates the file private to its owner. These are
+                    # not secrets -- one of the two stores stands in for a
+                    # public bucket -- and a web server running as another
+                    # user has to be able to read what is published.
+                    os.chmod(tmp_name, 0o644)
                     os.replace(tmp_name, path)
                 except BaseException:
                     with contextlib.suppress(OSError):
