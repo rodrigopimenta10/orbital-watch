@@ -35,10 +35,17 @@ log = logging.getLogger(__name__)
 #: Cloud Storage uses the same value for the same purpose.
 ABSENT = 0
 
-#: Per-call timeout for storage operations, in seconds. Storage is in the same
-#: region as the job and answers in tens of milliseconds; a call that takes
-#: longer than this is not going to succeed usefully.
-STORAGE_TIMEOUT_SECONDS = 15.0
+#: Timeout for one attempt at a storage operation, in seconds. Storage is in
+#: the same region as the job and answers in tens of milliseconds; an attempt
+#: that takes longer than this is not going to succeed usefully.
+STORAGE_TIMEOUT_SECONDS = 10.0
+
+#: How long one storage operation may go on being retried before it is
+#: reported as failed. The client library's own default is two minutes, which
+#: across the seven state reads of one run would be longer than the run is
+#: allowed to take: a storage outage has to surface as a failed run promptly,
+#: not as a run that hangs until the platform kills it.
+STORAGE_RETRY_SECONDS = 15.0
 
 
 class StoreError(Exception):
@@ -226,7 +233,10 @@ class GcsStore:
         *,
         client: Any = None,
         timeout: float = STORAGE_TIMEOUT_SECONDS,
+        retry_seconds: float = STORAGE_RETRY_SECONDS,
     ) -> None:
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
         if client is None:
             from google.cloud import storage
 
@@ -234,6 +244,9 @@ class GcsStore:
         self._bucket_name = bucket_name
         self._bucket = client.bucket(bucket_name)
         self._timeout = timeout
+        # The library's standard policy (which errors are worth retrying, and
+        # how to back off), with this project's limit on how long to keep at it.
+        self._retry = DEFAULT_RETRY.with_deadline(retry_seconds)
 
     def describe(self) -> str:
         return f"bucket gs://{self._bucket_name}"
@@ -243,7 +256,7 @@ class GcsStore:
 
         blob = self._bucket.blob(str(_check_key(key)))
         try:
-            data = blob.download_as_bytes(timeout=self._timeout)
+            data = blob.download_as_bytes(timeout=self._timeout, retry=self._retry)
         except gcs_errors.NotFound:
             return None
         except Exception as exc:
@@ -281,6 +294,11 @@ class GcsStore:
                 content_type=content_type,
                 if_generation_match=if_generation_match,
                 timeout=self._timeout,
+                # Retrying a write is only safe when it is conditional: if the
+                # first attempt did land and its answer was lost, the retry is
+                # refused by the precondition instead of writing twice. An
+                # unconditional write is attempted once.
+                retry=self._retry if if_generation_match is not None else None,
             )
         except gcs_errors.PreconditionFailed as exc:
             raise PreconditionFailed(

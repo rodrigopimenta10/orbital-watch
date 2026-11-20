@@ -314,7 +314,7 @@ ORBITAL_WATCH_LON=15.4075 \
 ## Tests
 
 ```bash
-uv run pytest                 # 307 tests
+uv run pytest                 # 308 tests
 uv run ruff check .           # lint
 uv run ruff format --check .
 node --test tests/web/        # 45 tests of the page's logic; no npm, no dependencies

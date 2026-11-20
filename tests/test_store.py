@@ -158,8 +158,9 @@ class FakeBlob:
         self.generation = None
         self.cache_control = None
 
-    def download_as_bytes(self, timeout=None):
+    def download_as_bytes(self, timeout=None, retry=None):
         self._bucket.timeouts.append(timeout)
+        self._bucket.retries.append(("read", retry))
         if self._bucket.fail_with is not None:
             raise self._bucket.fail_with
         if self.name not in self._bucket.objects:
@@ -169,9 +170,10 @@ class FakeBlob:
         return data
 
     def upload_from_string(
-        self, data, content_type=None, if_generation_match=None, timeout=None
+        self, data, content_type=None, if_generation_match=None, timeout=None, retry=None
     ):
         self._bucket.timeouts.append(timeout)
+        self._bucket.retries.append(("write", retry))
         if self._bucket.fail_with is not None:
             raise self._bucket.fail_with
         current = self._bucket.objects.get(self.name)
@@ -193,6 +195,7 @@ class FakeBucket:
         self.counter = 1000
         self.fail_with: Exception | None = None
         self.timeouts: list = []
+        self.retries: list = []
 
     def blob(self, name: str) -> FakeBlob:
         return FakeBlob(self, name)
@@ -259,6 +262,28 @@ def test_gcs_every_call_carries_a_timeout(gcs):
     store.read("a.json")
 
     assert bucket.timeouts and all(t is not None and t > 0 for t in bucket.timeouts)
+
+
+def test_gcs_retries_are_bounded_and_only_for_writes_that_are_safe_to_repeat(gcs):
+    """A storage outage must fail the run promptly, and never write twice.
+
+    Reads and conditional writes are retried, for a bounded time far shorter
+    than the client library's default. An unconditional write is not retried
+    at all: if its first attempt landed and the answer was lost, a retry
+    would write again.
+    """
+    from orbital_watch.store import STORAGE_RETRY_SECONDS
+
+    store, bucket = gcs
+    generation = store.write("a.json", b"one", content_type=JSON)
+    store.read("a.json")
+    store.write("a.json", b"two", content_type=JSON, if_generation_match=generation)
+
+    (_, unconditional), (_, read), (_, conditional) = bucket.retries
+    assert unconditional is None
+    for policy in (read, conditional):
+        assert policy is not None
+        assert policy.deadline == STORAGE_RETRY_SECONDS < 60
 
 
 @pytest.mark.parametrize(
