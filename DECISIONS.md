@@ -1147,3 +1147,70 @@ the rest of the system put together, so it waits for evidence that the
 problem is real. I could not test this against Celestrak itself: on the day
 of the rebuild its whole site was answering HTTP 503, which the new job
 reported, correctly, as three failed sources and a successful run.
+
+---
+
+## 30. An independent review before the first deploy found seven defects, and more
+
+**What happened.** Before the rebuild was deployed, the branch was reviewed
+independently of its author, and the job was run once against the real
+upstreams. The review confirmed six defects by reproducing them with fakes,
+and CI found a seventh. It also raised six suspicions: four were confirmed,
+one was fixed without being confirmed, one was left. None of this had been
+caught by 308 passing tests, because each lived in a case the tests had not
+thought to construct. Everything fixed was fixed before anything shipped,
+and each fix has a test that failed first.
+
+**Confirmed, with the cause of each in a line:**
+
+| # | Defect | Cause |
+|---|---|---|
+| 1 | A throttled body was read for minutes; past 150 s the pass list was published empty, past 300 s the task was killed and nothing was | The "hard timeout" was a socket timeout. It bounds each read, not the response, and a slow steady body never trips it. Seen live the same day: Celestrak sent 5 MB at about 8 KB/s |
+| 2 | One `NaN` or `Infinity` from upstream withheld the whole document | Python's JSON parser accepts both, and turns `1e999` into infinity. The value was stored, and failed validation on every later run |
+| 3 | With runs overlapping, a failure record displaced a fresh payload | The conditional write treated every lost race alike, and gave up even when the loser held the newer data |
+| 4 | With state readable but not writable, every run asked Celestrak | The floor was checked against a record written *after* the request. A run killed mid-request left none either |
+| 5 | A slow reader clock made stale look fresh, hid a silent pipeline, and showed expired positions as current | Every age on the page was measured against the device clock and nothing else |
+| 6 | A live poll could move the page to an older document | "Live" was taken to mean "newest"; a cache can answer with an older copy |
+| 7 | The page's tests failed in CI | `node --test <directory>` searches the directory on recent Node and treats it as one file on Node 22, which the runner had. Never run on the version CI used |
+
+**Suspected and confirmed:** a publish whose answer was lost was reported as
+a failed run although the document was up; a published document dated in
+the future made every later run stand down and exit 0 without publishing;
+a truncated Starlink list still filled the sample of sixty and passed the
+collapse check, which compared samples; the assessment banner went on
+saying "storm in progress" after the Kp source behind it had failed by age.
+
+**Suspected, not confirmed, fixed anyway.** The published document is public
+and cacheable, so Cloud Storage may answer even the job's own read of it
+from a cache, with a stale generation; the conditional publish would then
+fail twice and the run exit 1 although a newer document was up. I could not
+establish from here whether that cache applies to authenticated reads. The
+fix — ask for the live generation, then read that generation by number —
+costs one metadata call and is right in either case.
+
+**Suspected and left.** On a change of schema version, a browser holding the
+previous `core.js` (assets may be cached for an hour) refuses both the live
+document and the baked copy, and shows the error state until its cache
+expires. It is real, it is confined to the hour after a schema bump, and the
+proper fix is fingerprinted asset names — a build step, which §1 decided
+against. A tab that is already open is unaffected: it keeps the document it
+has and says the newer one could not be read. If the schema ever does
+change, the page should first be taught to read both versions, and the
+pipeline switched over only after that page has been out for an hour.
+
+**What the fixes have in common.** Five of the seven were the same mistake
+in different places: *a guarantee stated more strongly than it was
+implemented*. "Hard timeout" meant a per-read timeout. "The floor holds
+however the job is started" meant however it is started, provided it also
+finishes and can write. "Recomputed against the reader's clock" assumed the
+clock. In each case the fix was to make the mechanism match the sentence —
+a deadline over the whole response, a record written before the act it
+records, a clock with a floor under it — rather than to soften the sentence.
+
+**What I take from it.** The tests I wrote covered the failures I had
+imagined, and I had imagined upstreams that fail *cleanly*: refuse, time
+out, return garbage. The live run failed slowly and partially, which is how
+real services fail. A reviewer who starts from "how could this claim be
+false?" finds different things from an author who starts from "does this
+work?", and a system whose whole claim is honesty about failure needs the
+first kind of reading before it is trusted with the second.
