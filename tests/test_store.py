@@ -152,17 +152,38 @@ def test_unwritable_root_is_a_store_error_not_an_oserror(tmp_path):
 
 
 class FakeBlob:
-    def __init__(self, bucket: FakeBucket, name: str) -> None:
+    def __init__(self, bucket: FakeBucket, name: str, generation=None) -> None:
         self._bucket = bucket
         self.name = name
-        self.generation = None
+        self._pinned = generation
+        self.generation = generation
         self.cache_control = None
+
+    def reload(self, timeout=None, retry=None):
+        """Metadata is never served from a cache: this is always the live object."""
+        self._bucket.timeouts.append(timeout)
+        if self._bucket.fail_with is not None:
+            raise self._bucket.fail_with
+        if self.name not in self._bucket.objects:
+            raise gcs_errors.NotFound(self.name)
+        self.generation = self._bucket.objects[self.name][1]
 
     def download_as_bytes(self, timeout=None, retry=None):
         self._bucket.timeouts.append(timeout)
         self._bucket.retries.append(("read", retry))
         if self._bucket.fail_with is not None:
             raise self._bucket.fail_with
+        if self._pinned is not None:
+            # A named generation is immutable: there is no stale copy of it.
+            if self._pinned not in self._bucket.history.get(self.name, {}):
+                raise gcs_errors.NotFound(self.name)
+            return self._bucket.history[self.name][self._pinned]
+        # An unpinned read of a publicly cacheable object may be answered
+        # from Cloud Storage's own cache, with an older generation.
+        cached = self._bucket.cached.get(self.name)
+        if cached is not None:
+            data, self.generation = cached
+            return data
         if self.name not in self._bucket.objects:
             raise gcs_errors.NotFound(self.name)
         data, generation, _meta = self._bucket.objects[self.name]
@@ -187,18 +208,27 @@ class FakeBlob:
             self.generation,
             {"content_type": content_type, "cache_control": self.cache_control},
         )
+        # No versioning on this fake bucket: only the live generation exists.
+        self._bucket.history[self.name] = {self.generation: data}
 
 
 class FakeBucket:
     def __init__(self) -> None:
         self.objects: dict[str, tuple] = {}
+        self.history: dict[str, dict[int, bytes]] = {}
+        self.cached: dict[str, tuple[bytes, int]] = {}
         self.counter = 1000
         self.fail_with: Exception | None = None
         self.timeouts: list = []
         self.retries: list = []
 
-    def blob(self, name: str) -> FakeBlob:
-        return FakeBlob(self, name)
+    def blob(self, name: str, generation=None) -> FakeBlob:
+        return FakeBlob(self, name, generation)
+
+    def serve_from_cache(self, name: str) -> None:
+        """Freeze what unpinned reads of ``name`` return at its current state."""
+        data, generation, _meta = self.objects[name]
+        self.cached[name] = (data, generation)
 
 
 class FakeClient:
@@ -307,3 +337,63 @@ def test_gcs_store_refuses_unsafe_keys(gcs):
     store, _bucket = gcs
     with pytest.raises(StoreError):
         store.read("../other-bucket/secret")
+
+
+# --------------------------------------------------------------------------
+# Reads of an object that Cloud Storage may serve from its own cache
+# --------------------------------------------------------------------------
+
+
+def test_pinned_read_sees_the_live_object_when_a_plain_read_would_be_stale():
+    """A public, cacheable object can be read back stale -- even by its writer.
+
+    The published document is public with a cache lifetime, so Cloud Storage
+    may answer a read of it from its built-in cache. A stale generation there
+    would make the conditional publish fail against an object that changed a
+    minute ago, twice, and the run exit non-zero although a newer document
+    was already up. Reading the metadata first (never cached) and then that
+    exact generation gives the bytes and the generation that belong together
+    and are current.
+    """
+    client = FakeClient()
+    bucket = client.bucket("public")
+    plain = GcsStore("public", client=client)
+    pinned = GcsStore("public", client=client, pinned_reads=True)
+
+    first = plain.write("latest.json", b"older", content_type=JSON)
+    bucket.serve_from_cache("latest.json")
+    second = plain.write("latest.json", b"newer", content_type=JSON)
+
+    stale = plain.read("latest.json")
+    assert (stale.data, stale.generation) == (b"older", first), "the fake cache works"
+
+    live = pinned.read("latest.json")
+    assert (live.data, live.generation) == (b"newer", second)
+    # And the generation it returns is one a conditional write will accept.
+    pinned.write("latest.json", b"next", content_type=JSON, if_generation_match=second)
+
+
+def test_pinned_read_of_an_absent_object_is_none():
+    assert (
+        GcsStore("public", client=FakeClient(), pinned_reads=True).read("x.json") is None
+    )
+
+
+def test_pinned_read_looks_again_if_the_object_is_replaced_between_its_two_calls():
+    client = FakeClient()
+    bucket = client.bucket("public")
+    store = GcsStore("public", client=client, pinned_reads=True)
+    store.write("latest.json", b"one", content_type=JSON)
+
+    real_blob = bucket.blob
+    raced = []
+
+    def blob_with_a_race(name, generation=None):
+        if generation is not None and not raced:
+            raced.append(True)
+            real_blob(name).upload_from_string(b"two", content_type=JSON)
+        return real_blob(name, generation)
+
+    bucket.blob = blob_with_a_race
+
+    assert store.read("latest.json").data == b"two"

@@ -215,14 +215,16 @@ def test_both_bucket_variables_select_cloud_storage(tmp_path, monkeypatch):
     built = []
 
     class RecordingStore:
-        def __init__(self, bucket_name):
-            built.append(bucket_name)
+        def __init__(self, bucket_name, **options):
+            built.append((bucket_name, options))
 
     monkeypatch.setattr(job, "GcsStore", RecordingStore)
     _state, _public, local = job.stores_from_environment(tmp_path)
 
     assert local is False
-    assert built == ["state-bucket", "public-bucket"]
+    # Only the public bucket's objects are cacheable, so only its reads
+    # need to be pinned to a generation.
+    assert built == [("state-bucket", {}), ("public-bucket", {"pinned_reads": True})]
 
 
 # --------------------------------------------------------------------------

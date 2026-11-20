@@ -100,7 +100,9 @@ def stores_from_environment(local_dir: Path) -> tuple[Store, Store, bool]:
     state_bucket = os.environ.get(STATE_BUCKET_ENV, "").strip()
     public_bucket = os.environ.get(PUBLIC_BUCKET_ENV, "").strip()
     if state_bucket and public_bucket:
-        return GcsStore(state_bucket), GcsStore(public_bucket), False
+        # The published document is public and cacheable, so reads of it are
+        # pinned to a generation; state is private and never cached.
+        return GcsStore(state_bucket), GcsStore(public_bucket, pinned_reads=True), False
     if state_bucket or public_bucket:
         raise ValueError(
             f"set both {STATE_BUCKET_ENV} and {PUBLIC_BUCKET_ENV}, or neither "

@@ -301,3 +301,62 @@ def test_storage_failure_is_reported_as_such(document, public_store):
 
     with pytest.raises(StoreError, match="backend unavailable"):
         do_publish(document, public_store)
+
+
+# --------------------------------------------------------------------------
+# Review findings before the first deploy (DECISIONS.md §30)
+# --------------------------------------------------------------------------
+
+
+def test_a_document_dated_in_the_future_does_not_stop_publication(document, public_store):
+    """ "Newer than ours" is only believed within the length of a run.
+
+    A document stamped a day ahead -- a bad clock on one run, or garbage --
+    would otherwise make every later run stand down and exit 0 without
+    publishing, for a day, with nothing to alert on. An overlapping run can
+    be ahead of this one by minutes at most; anything further ahead is not
+    an overlapping run, and is replaced.
+    """
+    from_the_future = _generated_later(document, timedelta(days=1))
+    do_publish(from_the_future, public_store)
+
+    assert do_publish(document, public_store) == "published"
+    assert json.loads(public_store.read(DOCUMENT_KEY).data) == document
+
+
+def test_a_document_a_few_minutes_newer_still_supersedes(document, public_store):
+    do_publish(_generated_later(document, timedelta(minutes=4)), public_store)
+
+    assert do_publish(document, public_store) == "superseded"
+
+
+def test_a_write_that_landed_but_whose_answer_was_lost_counts_as_published(
+    document, public_store
+):
+    """The store reports failure, but the object is there: that is a success.
+
+    Exiting non-zero here would alert the owner that nothing was published
+    while readers were already being served this very document.
+    """
+    real_write = public_store.write
+
+    def lands_then_times_out(key, data, **kwargs):
+        real_write(key, data, **kwargs)
+        raise StoreError("no answer from the backend")
+
+    public_store.write = lands_then_times_out
+
+    assert do_publish(document, public_store) == "published"
+    assert json.loads(public_store.read(DOCUMENT_KEY).data) == document
+
+
+def test_a_failed_write_that_did_not_land_is_still_a_failure(document, public_store):
+    do_publish(_generated_later(document, -timedelta(minutes=10)), public_store)
+
+    def down(*args, **kwargs):
+        raise StoreError("backend unavailable")
+
+    public_store.write = down
+
+    with pytest.raises(StoreError, match="backend unavailable"):
+        do_publish(document, public_store)

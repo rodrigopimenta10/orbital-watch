@@ -234,6 +234,7 @@ class GcsStore:
         client: Any = None,
         timeout: float = STORAGE_TIMEOUT_SECONDS,
         retry_seconds: float = STORAGE_RETRY_SECONDS,
+        pinned_reads: bool = False,
     ) -> None:
         from google.cloud.storage.retry import DEFAULT_RETRY
 
@@ -247,6 +248,8 @@ class GcsStore:
         # The library's standard policy (which errors are worth retrying, and
         # how to back off), with this project's limit on how long to keep at it.
         self._retry = DEFAULT_RETRY.with_deadline(retry_seconds)
+        # For a bucket whose objects are public and cacheable. See read().
+        self._pinned_reads = pinned_reads
 
     def describe(self) -> str:
         return f"bucket gs://{self._bucket_name}"
@@ -254,7 +257,11 @@ class GcsStore:
     def read(self, key: str) -> StoredObject | None:
         from google.api_core import exceptions as gcs_errors
 
-        blob = self._bucket.blob(str(_check_key(key)))
+        name = str(_check_key(key))
+        if self._pinned_reads:
+            return self._read_pinned(key, name)
+
+        blob = self._bucket.blob(name)
         try:
             data = blob.download_as_bytes(timeout=self._timeout, retry=self._retry)
         except gcs_errors.NotFound:
@@ -271,6 +278,49 @@ class GcsStore:
                 f"refusing to guess one"
             )
         return StoredObject(data=data, generation=int(blob.generation))
+
+    def _read_pinned(self, key: str, name: str) -> StoredObject | None:
+        """Read the live object without trusting a cached copy of it.
+
+        An object that is publicly readable and has a cache lifetime may be
+        answered from Cloud Storage's built-in cache for that lifetime, and a
+        stale answer would carry a stale generation. A conditional write
+        made on the strength of it fails although nothing is wrong.
+
+        Metadata is not cached, so the live generation is asked for first,
+        and then that generation by number. A numbered generation never
+        changes, so however it is served, its bytes are the right ones. If
+        the object is replaced between the two calls the numbered generation
+        is gone (the bucket keeps no old versions); that is looked at once
+        more and then reported.
+        """
+        from google.api_core import exceptions as gcs_errors
+
+        try:
+            for _attempt in range(2):
+                live = self._bucket.blob(name)
+                try:
+                    live.reload(timeout=self._timeout, retry=self._retry)
+                except gcs_errors.NotFound:
+                    return None
+                if live.generation is None:
+                    break
+                generation = int(live.generation)
+                pinned = self._bucket.blob(name, generation=generation)
+                try:
+                    data = pinned.download_as_bytes(
+                        timeout=self._timeout, retry=self._retry
+                    )
+                except gcs_errors.NotFound:
+                    continue
+                return StoredObject(data=data, generation=generation)
+        except Exception as exc:
+            raise StoreError(
+                f"could not read gs://{self._bucket_name}/{key}: {type(exc).__name__}"
+            ) from exc
+        raise StoreError(
+            f"gs://{self._bucket_name}/{key} kept changing while it was being read"
+        )
 
     def write(
         self,

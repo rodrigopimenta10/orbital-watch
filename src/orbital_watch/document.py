@@ -21,7 +21,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from orbital_watch.config import DOCUMENT_KEY
+from orbital_watch.config import DOCUMENT_KEY, REFRESH_CADENCE
 from orbital_watch.health import State
 from orbital_watch.sources.fetch import CONTACT_OUTCOMES, Outcome
 from orbital_watch.store import ABSENT, PreconditionFailed, Store, StoreError
@@ -41,6 +41,12 @@ SCHEMA_VERSION = 2
 #: one; it does not need to be zero, because the page computes every age from
 #: timestamps inside the document rather than from when it was fetched.
 DOCUMENT_CACHE_CONTROL = "public, max-age=60"
+
+#: How far ahead of this run's document an already-published one may be dated
+#: and still be believed to come from an overlapping run. A run cannot outlast
+#: one cadence (the platform stops it well before), so nothing honest is
+#: further ahead than that.
+SUPERSEDE_HORIZON = REFRESH_CADENCE
 
 _SEVERITIES = {"quiet", "elevated", "storm", "unknown"}
 
@@ -361,13 +367,23 @@ def publish(document: dict, store: Store, *, expected_sources: Iterable[str]) ->
         current = store.read(DOCUMENT_KEY)
         if current is not None:
             theirs = _generated_at(current.data)
-            if theirs is not None and theirs > ours:
+            if theirs is not None and ours < theirs <= ours + SUPERSEDE_HORIZON:
                 log.warning(
                     "not publishing: a newer document (generated %s) is already "
                     "published",
                     theirs.isoformat(),
                 )
                 return "superseded"
+            if theirs is not None and theirs > ours:
+                # Dated further ahead than any overlapping run could be: a
+                # bad clock somewhere, or not one of ours. Standing down for
+                # it would mean publishing nothing, successfully, until the
+                # wall clock caught up with it.
+                log.warning(
+                    "the published document is dated %s, which no overlapping "
+                    "run could have produced; replacing it",
+                    theirs.isoformat(),
+                )
         try:
             store.write(
                 DOCUMENT_KEY,
@@ -379,12 +395,30 @@ def publish(document: dict, store: Store, *, expected_sources: Iterable[str]) ->
         except PreconditionFailed:
             log.warning("the published document changed while publishing; looking again")
             continue
+        except StoreError:
+            # A write can land and its answer be lost. Before calling this a
+            # failed run -- which alerts the owner that readers got nothing
+            # new -- look at what is actually published.
+            if not _is_published(store, body):
+                raise
+            log.warning(
+                "the store reported a failed write, but the document is published"
+            )
         log.info(
             "published %s (%d bytes) to %s", DOCUMENT_KEY, len(body), store.describe()
         )
         return "published"
 
     raise StoreError("the published document kept changing; gave up after two attempts")
+
+
+def _is_published(store: Store, body: bytes) -> bool:
+    """Whether exactly these bytes are what is published now. Never raises."""
+    try:
+        current = store.read(DOCUMENT_KEY)
+    except StoreError:
+        return False
+    return current is not None and current.data == body
 
 
 def _generated_at(body: bytes) -> datetime | None:
