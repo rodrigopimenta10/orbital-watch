@@ -1,0 +1,16 @@
+# Local Terraform state and caches. State lives in the GCS bucket, never here.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Variable files could hold the billing account ID or the alert email. They are passed in the
+# environment instead (TF_VAR_billing_account_id, TF_VAR_alert_email) and must not be written down.
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+!example.tfvars
+
+# Saved plans contain every value, including sensitive ones.
+*.tfplan
+plan.out

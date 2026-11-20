@@ -129,3 +129,134 @@ def test_hosting_serves_the_directory_the_site_is_built_into():
     assert "rewrites" not in config, "the site is files only; nothing is proxied"
     (sites,) = (project["hosting"][config["target"]] for project in targets.values())
     assert sites == ["rodrigopimenta-orbital-watch"]
+
+
+# --------------------------------------------------------------------------
+# Infrastructure
+# --------------------------------------------------------------------------
+
+INFRA = REPO / "infra"
+
+
+def terraform_sources() -> dict[str, str]:
+    return {path.name: path.read_text(encoding="utf-8") for path in INFRA.glob("*.tf")}
+
+
+def variable_block(name: str) -> str:
+    """The text of one ``variable "name" { ... }`` block in variables.tf."""
+    source = read("infra/variables.tf")
+    match = re.search(rf'^variable "{name}" \{{\n(.*?)^\}}', source, re.S | re.M)
+    assert match, f"variables.tf declares no variable {name!r}"
+    return match.group(1)
+
+
+def variable_default(name: str) -> str:
+    match = re.search(r"^  default\s*=\s*(.+)$", variable_block(name), re.M)
+    assert match, f"variable {name!r} has no default"
+    return match.group(1).strip().strip('"')
+
+
+def test_scheduled_cadence_matches_the_cadence_the_code_assumes():
+    """One cadence, in two files that cannot import each other.
+
+    Terraform starts the job on this cadence and tells it so through an
+    environment variable, so in production there is one number. This pins
+    the two *defaults* together, so that a local run and the tests reason
+    about the same schedule production actually keeps.
+    """
+    from orbital_watch.config import CADENCE_ENV, DEFAULT_REFRESH_CADENCE_MINUTES
+
+    assert int(variable_default("refresh_cadence_minutes")) == (
+        DEFAULT_REFRESH_CADENCE_MINUTES
+    )
+    job = read("infra/job.tf")
+    assert f'name  = "{CADENCE_ENV}"' in job
+    assert "value = tostring(var.refresh_cadence_minutes)" in job
+    assert 'schedule  = "*/${var.refresh_cadence_minutes} * * * *"' in read(
+        "infra/scheduler.tf"
+    )
+
+
+def test_job_is_configured_through_the_variables_the_code_reads():
+    from orbital_watch.config import PUBLIC_BUCKET_ENV, STATE_BUCKET_ENV
+
+    job = read("infra/job.tf")
+    assert f'name  = "{STATE_BUCKET_ENV}"' in job
+    assert f'name  = "{PUBLIC_BUCKET_ENV}"' in job
+
+
+def test_run_deadline_fits_inside_the_task_timeout():
+    """The job stops itself before Cloud Run has to."""
+    from orbital_watch.config import REFRESH_CADENCE, RUN_DEADLINE_SECONDS
+
+    (timeout,) = re.findall(r'^\s*timeout = "(\d+)s"$', read("infra/job.tf"), re.M)
+
+    assert RUN_DEADLINE_SECONDS < int(timeout) < REFRESH_CADENCE.total_seconds()
+
+
+def test_monitoring_and_page_look_for_the_document_the_job_writes():
+    from orbital_watch.config import DOCUMENT_KEY
+
+    monitoring = read("infra/monitoring.tf")
+    assert f'content = "\\"{DOCUMENT_KIND}\\""' in monitoring
+    assert f"/{DOCUMENT_KEY}" in monitoring
+    # The site check recognises the page by its title.
+    (matcher,) = re.findall(r'content = "(<title>[^"]+)"', monitoring)
+    assert matcher in read("web/index.html")
+
+
+def test_hosting_site_is_the_same_in_terraform_and_the_firebase_config():
+    targets = json.loads(read(".firebaserc"))
+    (project,) = targets["targets"]
+    (sites,) = targets["targets"][project]["hosting"].values()
+
+    assert project == variable_default("project_id") == targets["projects"]["default"]
+    assert sites == [variable_default("hosting_site_id")]
+
+
+def test_no_service_account_key_is_created_anywhere():
+    """Every credential here is a token minted per use. No key exists to leak."""
+    for name, source in terraform_sources().items():
+        assert "google_service_account_key" not in source, name
+        assert "private_key" not in source, name
+        assert not re.search(r"^\s*credentials\s*=", source, re.M), name
+
+
+def test_the_alert_address_has_no_default():
+    """A default would put an address in the repository. It must be supplied."""
+    block = variable_block("alert_email")
+
+    assert not re.search(r"^\s*default\s*=", block, re.M)
+    assert re.search(r"^\s*sensitive\s*=\s*true$", block, re.M)
+
+
+def test_no_address_or_account_id_is_written_into_the_infrastructure():
+    """Nothing that identifies a person or a billing account is committed."""
+    committed = "\n".join(terraform_sources().values()) + read(
+        "infra/tests/invariants.tftest.hcl"
+    )
+    addresses = set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", committed))
+
+    # Service account addresses built from the project ID, and the placeholder
+    # the mocked tests use, are the only ones there should be.
+    assert all(
+        address.endswith(".iam.gserviceaccount.com") or address.endswith("@example.com")
+        for address in addresses
+    ), addresses
+    assert not re.search(r"\b[0-9A-F]{6}-[0-9A-F]{6}-[0-9A-F]{6}\b", committed)
+
+
+def test_apis_are_never_disabled_on_destroy():
+    """The project is shared; turning an API off could break the portfolio."""
+    assert "disable_on_destroy = false" in read("infra/services.tf")
+
+
+def test_terraform_ignores_only_the_image_the_deploy_owns():
+    job = read("infra/job.tf")
+    (ignored,) = re.findall(r"ignore_changes = \[\n(.*?)\n    \]", job, re.S)
+
+    assert {item.strip().rstrip(",") for item in ignored.splitlines()} == {
+        "client",
+        "client_version",
+        "template[0].template[0].containers[0].image",
+    }
