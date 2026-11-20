@@ -1,18 +1,23 @@
-"""SGP4 propagation: GP element sets -> positions and passes.
+"""SGP4 propagation: GP element sets -> positions, tracks and passes.
 
-Two questions are answered here, both from the observer's point of view:
+Three questions are answered here, all from the observer's point of view:
 
-* What is above the horizon right now?
+* What is above the horizon at a given instant?
+* Where will each nearby object be over the next half hour? (The page shows
+  the sky at the moment it is *viewed*, which is later than the moment this
+  ran, so it is given a short track to interpolate along.)
 * When does each tracked object next come over, and how good is that pass?
 
 Everything is topocentric off a WGS84 site, which needs no planetary
-ephemeris -- so the build never downloads a 16 MB JPL kernel and never depends
+ephemeris -- so the job never downloads a 16 MB JPL kernel and never depends
 on network access to do maths.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -22,6 +27,9 @@ from skyfield.api import EarthSatellite, Timescale, load, wgs84
 from skyfield.toposlib import GeographicPosition
 
 from orbital_watch.config import (
+    EPHEMERIS_HORIZON_MARGIN_DEG,
+    EPHEMERIS_STEP,
+    EPHEMERIS_WINDOW,
     HORIZON_ELEVATION_DEG,
     MAX_PASSES_PER_SAT,
     MIN_PASS_ELEVATION_DEG,
@@ -67,6 +75,38 @@ class SkyPosition:
     sub_lon_deg: float
     altitude_km: float
     tle_epoch: datetime
+
+
+@dataclass
+class Track:
+    """Where one satellite is, sample by sample, as seen from the site.
+
+    Each sample is ``(east_km, north_km, up_km, altitude_km)``: the satellite's
+    position relative to the site in the local east/north/up frame, plus its
+    height above the ellipsoid. See :func:`ephemeris` for why the track is a
+    vector and not elevation and azimuth.
+    """
+
+    name: str
+    norad_id: int
+    group: str
+    tle_epoch: datetime
+    samples: list[tuple[float, float, float, float]]
+
+
+@dataclass
+class PassSearch:
+    """Result of a pass search, including whether it ran to completion."""
+
+    passes: list[Pass]
+    #: Satellites actually searched, out of ``total``. Fewer means the search
+    #: was stopped at the run deadline and the list is incomplete.
+    searched: int
+    total: int
+
+    @property
+    def complete(self) -> bool:
+        return self.searched >= self.total
 
 
 @dataclass
@@ -116,7 +156,7 @@ def build_satellites(
 
     A record that SGP4 rejects is dropped with a warning rather than aborting
     the group -- one bad element set should cost us one satellite, not the
-    whole build.
+    whole run.
     """
     tracked: list[TrackedSatellite] = []
     for record in records:
@@ -143,7 +183,7 @@ def build_satellites(
             # Deliberately avoids record.get() here. This handler exists to
             # absorb malformed records, so calling a dict method on one would
             # make the handler itself raise -- turning "skip one satellite"
-            # into "abort the build", the exact opposite of its purpose.
+            # into "abort the stage", the exact opposite of its purpose.
             label = (
                 record.get("OBJECT_NAME")
                 if isinstance(record, dict)
@@ -200,7 +240,122 @@ def sky_view(
     return above
 
 
-def next_passes(
+def ephemeris(
+    tracked: list[TrackedSatellite],
+    site: GeographicPosition,
+    ts: Timescale,
+    start: datetime,
+    *,
+    window: timedelta = EPHEMERIS_WINDOW,
+    step: timedelta = EPHEMERIS_STEP,
+    min_elevation_deg: float = HORIZON_ELEVATION_DEG - EPHEMERIS_HORIZON_MARGIN_DEG,
+) -> list[Track]:
+    """Short position tracks for every object near the sky during ``window``.
+
+    The page is read at some later moment than this runs, and a satellite in
+    low orbit crosses the whole sky in about ten minutes. Positions computed
+    once and shown as "now" would be wrong almost immediately. So instead of
+    one position per object, this publishes a track sampled every ``step``
+    across ``window``, and the browser interpolates along it to its own clock.
+    All the orbital mechanics stays here; the browser draws a straight line
+    between two points.
+
+    The samples are east/north/up vectors, not elevation and azimuth, because
+    of what that straight line does. Over one step a satellite's path is very
+    nearly straight in space, so interpolating the *vector* is accurate to
+    about a kilometre. Elevation and azimuth are not nearly linear: a pass
+    through the zenith swings the azimuth by half a turn in seconds and peaks
+    the elevation between two samples, and interpolating those angles directly
+    would cut the top off the pass. The browser turns the interpolated vector
+    into angles with two arctangents.
+
+    Only objects that reach ``min_elevation_deg`` at some sample are included.
+    That threshold sits slightly below the horizon so the sample just before a
+    rise and just after a set are always there to interpolate between.
+    """
+    begin = _as_utc(start)
+    count = int(window / step) + 1
+    times = ts.from_datetimes([begin + step * index for index in range(count)])
+
+    tracks: list[Track] = []
+    for item in tracked:
+        try:
+            alt, az, distance = (item.satellite - site).at(times).altaz()
+            elevations = alt.radians.tolist()
+            azimuths = az.radians.tolist()
+            ranges = distance.km.tolist()
+            heights = wgs84.height_of(item.satellite.at(times)).km.tolist()
+
+            # SGP4 reports an element set it cannot propagate (a decayed
+            # object, say) as NaN positions rather than an exception. One such
+            # object must cost one track, and a NaN must never reach the
+            # document: JSON has no way to write it.
+            if not all(
+                math.isfinite(value)
+                for series in (elevations, azimuths, ranges, heights)
+                for value in series
+            ):
+                raise ValueError("propagation produced non-finite positions")
+
+            if math.degrees(max(elevations)) < min_elevation_deg:
+                continue
+
+            samples = []
+            for el, azimuth, rng, height in zip(
+                elevations, azimuths, ranges, heights, strict=True
+            ):
+                horizontal = rng * math.cos(el)
+                samples.append(
+                    (
+                        round(horizontal * math.sin(azimuth), 1),
+                        round(horizontal * math.cos(azimuth), 1),
+                        round(rng * math.sin(el), 1),
+                        round(height, 1),
+                    )
+                )
+            tracks.append(
+                Track(
+                    name=item.name,
+                    norad_id=item.norad_id,
+                    group=item.group,
+                    tle_epoch=item.epoch,
+                    samples=samples,
+                )
+            )
+        except Exception as exc:
+            log.warning("ephemeris failed for %s: %s", item.name, exc)
+
+    return tracks
+
+
+def position_from_track(
+    samples: list[tuple[float, float, float, float]],
+    start: datetime,
+    step: timedelta,
+    when: datetime,
+) -> tuple[float, float, float] | None:
+    """Elevation, azimuth (degrees) and range (km) at ``when``, from a track.
+
+    This is the arithmetic the browser does, written once more in Python so
+    the tests can hold the published track to its accuracy claim against SGP4
+    itself. Returns ``None`` outside the track.
+    """
+    offset = (_as_utc(when) - _as_utc(start)) / step
+    if offset < 0 or offset > len(samples) - 1:
+        return None
+    index = min(int(offset), len(samples) - 2)
+    fraction = offset - index
+    east, north, up = (
+        a + (b - a) * fraction
+        for a, b in zip(samples[index][:3], samples[index + 1][:3], strict=True)
+    )
+    rng = math.sqrt(east * east + north * north + up * up)
+    elevation = math.degrees(math.atan2(up, math.hypot(east, north)))
+    azimuth = math.degrees(math.atan2(east, north)) % 360.0
+    return elevation, azimuth, rng
+
+
+def search_passes(
     tracked: list[TrackedSatellite],
     site: GeographicPosition,
     ts: Timescale,
@@ -209,14 +364,31 @@ def next_passes(
     hours: int = PASS_SEARCH_HOURS,
     min_elevation_deg: float = MIN_PASS_ELEVATION_DEG,
     max_per_satellite: int = MAX_PASSES_PER_SAT,
-) -> list[Pass]:
-    """Upcoming passes over the site, soonest first."""
+    out_of_time: Callable[[], bool] | None = None,
+) -> PassSearch:
+    """Upcoming passes over the site, soonest first.
+
+    The search is the slow part of a run -- a root-find per satellite over a
+    day -- so it is the one computation that checks the run deadline. If
+    ``out_of_time`` says the deadline has passed, the search stops between
+    satellites and reports how far it got, so the caller can publish a list
+    that says it is incomplete instead of a late one or none.
+    """
     begin = _as_utc(start)
     t0 = ts.from_datetime(begin)
     t1 = ts.from_datetime(begin + timedelta(hours=hours))
 
     passes: list[Pass] = []
+    searched = 0
     for item in tracked:
+        if out_of_time is not None and out_of_time():
+            log.warning(
+                "pass search stopped at the run deadline after %d of %d satellites",
+                searched,
+                len(tracked),
+            )
+            break
+        searched += 1
         try:
             times, events = item.satellite.find_events(
                 site, t0, t1, altitude_degrees=min_elevation_deg
@@ -229,7 +401,29 @@ def next_passes(
         passes.extend(found)
 
     passes.sort(key=lambda p: p.start)
-    return passes
+    return PassSearch(passes=passes, searched=searched, total=len(tracked))
+
+
+def next_passes(
+    tracked: list[TrackedSatellite],
+    site: GeographicPosition,
+    ts: Timescale,
+    start: datetime,
+    *,
+    hours: int = PASS_SEARCH_HOURS,
+    min_elevation_deg: float = MIN_PASS_ELEVATION_DEG,
+    max_per_satellite: int = MAX_PASSES_PER_SAT,
+) -> list[Pass]:
+    """Upcoming passes over the site, soonest first, searched to completion."""
+    return search_passes(
+        tracked,
+        site,
+        ts,
+        start,
+        hours=hours,
+        min_elevation_deg=min_elevation_deg,
+        max_per_satellite=max_per_satellite,
+    ).passes
 
 
 def _assemble_passes(

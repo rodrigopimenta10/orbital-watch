@@ -8,13 +8,15 @@ viewer can check against the published thresholds.
 The rule, in order of precedence:
 
 1. No data at all -> FAILED, regardless of age.
-2. Otherwise the state is driven by the age of the payload we are serving,
-   measured against the source's own :class:`StalenessPolicy`.
-3. A fetch that failed but fell back to a *young* cache is still STALE at
-   worst -- we are serving good data, but we have lost contact and the viewer
-   deserves to know that.
+2. Data we cannot date -> STALE. Something of unknown age is not fresh.
+3. Otherwise the state is driven by how long ago upstream last answered for
+   the payload we are serving, measured against the source's own
+   :class:`StalenessPolicy`.
+4. A fetch that failed but fell back to a *young* stored payload is still
+   STALE at worst -- we are serving good data, but we have lost contact and
+   the viewer deserves to know that.
 
-Point 3 is the interesting one. A source can be serving perfectly good numbers
+Point 4 is the interesting one. A source can be serving perfectly good numbers
 while being broken. Reporting it as "fresh" because the numbers look fine
 would be a lie of exactly the kind this panel exists to prevent.
 """
@@ -25,11 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
-from orbital_watch.config import (
-    CELESTRAK_MIN_REFETCH_INTERVAL,
-    SNAPSHOT_REFRESH_CADENCE,
-    StalenessPolicy,
-)
+from orbital_watch.config import StalenessPolicy
 from orbital_watch.sources.fetch import FetchResult, Outcome, format_duration
 
 
@@ -57,6 +55,8 @@ class SourceHealth:
     #: How long the fetch took. Published because "it succeeded" and "it
     #: succeeded in 19 of a 20 second budget" are different operational facts.
     elapsed_seconds: float | None = None
+    #: When upstream was last actually asked, whatever the answer.
+    last_attempt: datetime | None = None
     #: Extra operator-facing context from the fetch layer.
     notes: list[str] = field(default_factory=list)
 
@@ -69,6 +69,9 @@ class SourceHealth:
             "outcome": self.outcome.value,
             "last_success": (
                 self.last_success.isoformat() if self.last_success else None
+            ),
+            "last_attempt": (
+                self.last_attempt.isoformat() if self.last_attempt else None
             ),
             "age_seconds": self.age_seconds,
             "elapsed_seconds": self.elapsed_seconds,
@@ -114,6 +117,7 @@ def evaluate(
         detail=detail,
         error=result.error,
         elapsed_seconds=round(result.elapsed_seconds, 3),
+        last_attempt=result.last_attempt,
         notes=list(result.notes),
     )
 
@@ -126,7 +130,7 @@ def _classify(
         return (
             State.FAILED,
             None,
-            result.error or "No data available and no cache to fall back on.",
+            result.error or "No data available and nothing stored to fall back on.",
         )
 
     # 2. Data with no known retrieval time. We are serving something we cannot
@@ -135,11 +139,12 @@ def _classify(
         return (
             State.STALE,
             None,
-            "Serving data of unknown age; retrieval timestamp is missing.",
+            "Serving data of unknown age; the time upstream last answered for "
+            "it is missing.",
         )
 
     # Clamped at zero. A source fetched *after* the reference instant is not
-    # "negatively old" -- it was retrieved during this build. Without the clamp
+    # "negatively old" -- it was retrieved during this run. Without the clamp
     # a pinned clock produces a negative age and `format_duration` renders the
     # phrase "in the future", which then reads as "in the future ago".
     age = max(now - result.last_success, timedelta(0))
@@ -148,122 +153,62 @@ def _classify(
     # Data can be both old *and* cut off from upstream. Reporting only the age
     # would hide the more actionable half -- an operator wants to know we have
     # lost contact, not just that the numbers are old.
-    lost_contact_outcomes = (Outcome.CACHE_FALLBACK, Outcome.SEED)
     contact_lost = (
-        f" Upstream was also unreachable this run ({result.error})."
-        if result.outcome in lost_contact_outcomes
+        f" Upstream was also unreachable at the last attempt ({result.error})."
+        if result.outcome is Outcome.CACHE_FALLBACK
         else ""
     )
 
-    # 3. Age-driven classification. The wording tracks the outcome: a
-    # snapshot source is never fetched by the build, so "last successful
-    # fetch" would describe an event that does not exist -- what aged is the
-    # committed snapshot, and the fix is the refresher, not the build.
-    if result.outcome == Outcome.SNAPSHOT:
-        happened = "The committed snapshot was captured"
-        # Calibrated, not accusatory. The first version said "the refresher
-        # has likely stopped committing" -- shipped to the live site during a
-        # cycle in which the refresher had run, succeeded, and correctly
-        # declined because the politeness floor was not yet cleared. Accusing
-        # the right component of the wrong failure is precisely the species
-        # of misleading diagnostic this panel exists to avoid. What the build
-        # can actually infer from age alone:
-        #   age <= floor + cadence  -> a skip is the expected behaviour; the
-        #                              next tick should land after the floor
-        #                              clears. Not a fault.
-        #   age >  floor + cadence  -> a tick that should have refreshed has
-        #                              been missed; now it is fair to point
-        #                              at the refresher.
-        worst_scheduled_gap = CELESTRAK_MIN_REFETCH_INTERVAL + SNAPSHOT_REFRESH_CADENCE
-        if age <= worst_scheduled_gap:
-            remedy = (
-                f" This is within the worst-case scheduling gap "
-                f"(the {format_duration(CELESTRAK_MIN_REFETCH_INTERVAL)} "
-                f"politeness floor plus the "
-                f"{format_duration(SNAPSHOT_REFRESH_CADENCE)} cron cadence); "
-                f"the refresher has not failed, and the next tick past the "
-                f"floor should refresh it."
-            )
-        else:
-            remedy = (
-                f" This exceeds the worst-case scheduling gap of "
-                f"{format_duration(worst_scheduled_gap)}, so refresh cycles "
-                f"are being missed -- check the refresh-snapshot workflow."
-            )
-    else:
-        happened = "Last successful fetch was"
-        remedy = ""
-
+    # 3. Age-driven classification.
     if age > policy.stale_within:
         return (
             State.FAILED,
             age,
-            f"{happened} {age_text} ago, beyond the "
+            f"Upstream last answered {age_text} ago, beyond the "
             f"{format_duration(policy.stale_within)} limit. Data shown is not "
-            f"operationally current.{remedy}{contact_lost}",
+            f"operationally current.{contact_lost}",
         )
 
     if age > policy.fresh_within:
         return (
             State.STALE,
             age,
-            f"{happened} {age_text} ago, past the "
+            f"Upstream last answered {age_text} ago, past the "
             f"{format_duration(policy.fresh_within)} freshness window."
-            f"{remedy}{contact_lost}",
+            f"{contact_lost}",
         )
 
-    # 4. Young data, but did we actually reach upstream this run?
-    if result.outcome == Outcome.SEED:
-        # Never FRESH, even if the snapshot happens to be recent. A seed is
-        # served only when upstream was unreachable *and* no cache existed --
-        # we are as out of contact as it is possible to be, and the committed
-        # snapshot will drift further from reality with every day it is used.
+    # 4. Young data, but did upstream actually answer for it?
+    if result.outcome is Outcome.CACHE_FALLBACK:
         return (
             State.STALE,
             age,
-            f"Upstream unreachable and no cache available ({result.error}); "
-            f"serving the committed seed snapshot captured {age_text} ago. "
-            f"This is real data but it is not live.",
+            f"Upstream unreachable at the last attempt ({result.error}); "
+            f"serving stored data from {age_text} ago.",
         )
 
-    if result.outcome == Outcome.CACHE_FALLBACK:
-        return (
-            State.STALE,
-            age,
-            f"Upstream unreachable this run ({result.error}); serving cached "
-            f"data from {age_text} ago.",
-        )
-
-    if result.outcome == Outcome.NOT_MODIFIED:
-        return (
-            State.FRESH,
-            age,
-            f"Upstream reports no new data since our last download {age_text} ago.",
-        )
-
-    if result.outcome == Outcome.CACHE_FRESH:
+    if result.outcome is Outcome.NOT_MODIFIED:
+        if result.payload_retrieved_at is not None:
+            held = format_duration(max(now - result.payload_retrieved_at, timedelta(0)))
+            return (
+                State.FRESH,
+                age,
+                f"Upstream confirmed {age_text} ago that it has nothing newer "
+                f"than the copy downloaded {held} ago.",
+            )
         return (
             State.FRESH,
             age,
-            f"Cache is {age_text} old and within the minimum refetch interval; "
-            f"upstream was deliberately not contacted.",
+            f"Upstream confirmed {age_text} ago that it has nothing newer than "
+            f"the stored copy.",
         )
 
-    if result.outcome == Outcome.SNAPSHOT:
-        # Unlike a seed, a snapshot is the *intended* source rather than a
-        # fallback, so age alone decides. A scheduled refresher owns contact
-        # with this upstream; the build reading what that refresher committed
-        # is the design working, not a degradation. If the refresher stops,
-        # the snapshot ages past the thresholds above and this reports STALE
-        # then FAILED on its own -- which is the honest signal, and needs no
-        # special case to produce.
+    if result.outcome is Outcome.CACHE_FRESH:
         return (
             State.FRESH,
             age,
-            f"Served from the committed snapshot captured {age_text} ago, "
-            f"within the {format_duration(policy.fresh_within)} freshness "
-            f"window. The build does not call this upstream; a scheduled "
-            f"refresher owns that traffic.",
+            f"Upstream last answered {age_text} ago and is not due to be asked "
+            f"again yet; it was deliberately not contacted.",
         )
 
     return State.FRESH, age, f"Fetched from upstream {age_text} ago."
@@ -279,7 +224,7 @@ def overall_state(sources: list[SourceHealth]) -> State:
 
 
 def summarize(sources: list[SourceHealth]) -> dict:
-    """Health block for the output JSON."""
+    """Health block for the published document."""
     return {
         "overall": overall_state(sources).value,
         "counts": {

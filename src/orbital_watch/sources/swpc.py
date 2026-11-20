@@ -1,8 +1,14 @@
 """NOAA Space Weather Prediction Center products.
 
-Three independent reads (Kp, solar wind, solar cycle) rather than one, so that
-losing one does not cost us the others -- the space weather panel can render
-with a Kp index and no solar wind, and says so.
+Four independent reads (Kp, solar wind speed, magnetic field, solar cycle)
+rather than one, so that losing one does not cost us the others -- the space
+weather panel can render with a Kp index and no solar wind, and says so.
+
+None of them has a politeness floor: the products are small, they change by
+the minute, and SWPC publishes them for exactly this kind of polling. They
+are still asked conditionally (``If-None-Match`` / ``If-Modified-Since``), so
+a product that has not changed costs upstream a header exchange and nothing
+more.
 """
 
 from __future__ import annotations
@@ -10,10 +16,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 
 from orbital_watch.config import (
-    HTTP_TIMEOUT_SECONDS,
     KP_ELEVATED_THRESHOLD,
     KP_STORM_THRESHOLD,
     SWPC_KP_URL,
@@ -21,14 +25,19 @@ from orbital_watch.config import (
     SWPC_SOLAR_CYCLE_URL,
     SWPC_SOLAR_WIND_URL,
 )
-from orbital_watch.sources.fetch import FetchResult, fetch_json
+from orbital_watch.sources.fetch import SourceSpec
 
 log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
-# Fetchers
+# Sources
 # --------------------------------------------------------------------------
+
+#: Months of solar cycle history kept in state. Upstream sends its whole
+#: observed record on every request; the page shows only the latest month, so
+#: there is no reason to store more than a recent tail.
+SOLAR_CYCLE_MONTHS_KEPT = 36
 
 
 def _validate_nonempty_list(data: object) -> list:
@@ -39,59 +48,75 @@ def _validate_nonempty_list(data: object) -> list:
     return data
 
 
-def fetch_kp(cache_dir: Path, *, timeout: float = HTTP_TIMEOUT_SECONDS) -> FetchResult:
-    """Planetary K-index, 3-hourly, roughly a week of history."""
-    return fetch_json(
-        name="swpc_kp",
-        timeout=timeout,
-        url=SWPC_KP_URL,
-        cache_dir=cache_dir,
-        parser=_validate_nonempty_list,
-    )
+def _validate_kp(data: object) -> list:
+    """A Kp product we cannot read a single value from is not a Kp product."""
+    records = _validate_nonempty_list(data)
+    if not parse_kp_series(records):
+        raise ValueError("no Kp readings could be parsed from the payload")
+    return records
 
 
-def fetch_solar_wind(
-    cache_dir: Path, *, timeout: float = HTTP_TIMEOUT_SECONDS
-) -> FetchResult:
-    """Current solar wind bulk speed."""
-    return fetch_json(
-        name="swpc_solar_wind",
-        timeout=timeout,
-        url=SWPC_SOLAR_WIND_URL,
-        cache_dir=cache_dir,
-        parser=_validate_nonempty_list,
-    )
+def _latest_row_with(*keys: str):
+    """Build a validator: the newest row must carry at least one of ``keys``.
 
+    Only the key has to be there, not a value. SWPC reports a gap in the
+    spacecraft data as a null, and that is upstream telling the truth -- the
+    tile should go blank, not keep showing the last number we happened to
+    store. A row with none of the expected keys is different: the product has
+    changed shape, and accepting it would replace good stored data with
+    something this code cannot read while the panel reported "fresh".
+    """
 
-def fetch_mag_field(
-    cache_dir: Path, *, timeout: float = HTTP_TIMEOUT_SECONDS
-) -> FetchResult:
-    """Interplanetary magnetic field: total (Bt) and north-south (Bz) in GSM."""
-    return fetch_json(
-        name="swpc_mag_field",
-        timeout=timeout,
-        url=SWPC_MAG_FIELD_URL,
-        cache_dir=cache_dir,
-        parser=_validate_nonempty_list,
-    )
-
-
-def fetch_solar_cycle(
-    cache_dir: Path, *, timeout: float = HTTP_TIMEOUT_SECONDS
-) -> FetchResult:
-    """Observed solar cycle indices; we only use the recent tail (F10.7, SSN)."""
-
-    def _tail(data: object) -> list:
+    def validate(data: object) -> list:
         records = _validate_nonempty_list(data)
-        return records[-36:]
+        row = records[-1]
+        if not isinstance(row, dict) or not any(key in row for key in keys):
+            raise ValueError(f"latest record carries none of {keys}")
+        return records
 
-    return fetch_json(
-        name="swpc_solar_cycle",
-        timeout=timeout,
-        url=SWPC_SOLAR_CYCLE_URL,
-        cache_dir=cache_dir,
-        parser=_tail,
-    )
+    return validate
+
+
+_validate_solar_wind = _latest_row_with("proton_speed", "speed")
+_validate_mag_field = _latest_row_with("bt", "bz_gsm", "bz")
+_validate_solar_cycle = _latest_row_with("time-tag")
+
+
+def _solar_cycle_tail(data: object) -> list:
+    return _validate_solar_cycle(data)[-SOLAR_CYCLE_MONTHS_KEPT:]
+
+
+#: Planetary K-index, 3-hourly, roughly a week of history.
+KP = SourceSpec(
+    name="swpc_kp",
+    url=SWPC_KP_URL,
+    parse=_validate_kp,
+    revalidate=_validate_kp,
+)
+
+#: Current solar wind bulk speed.
+SOLAR_WIND = SourceSpec(
+    name="swpc_solar_wind",
+    url=SWPC_SOLAR_WIND_URL,
+    parse=_validate_solar_wind,
+    revalidate=_validate_solar_wind,
+)
+
+#: Interplanetary magnetic field: total (Bt) and north-south (Bz) in GSM.
+MAG_FIELD = SourceSpec(
+    name="swpc_mag_field",
+    url=SWPC_MAG_FIELD_URL,
+    parse=_validate_mag_field,
+    revalidate=_validate_mag_field,
+)
+
+#: Observed solar cycle indices; we only use the recent tail (F10.7, SSN).
+SOLAR_CYCLE = SourceSpec(
+    name="swpc_solar_cycle",
+    url=SWPC_SOLAR_CYCLE_URL,
+    parse=_solar_cycle_tail,
+    revalidate=_solar_cycle_tail,
+)
 
 
 # --------------------------------------------------------------------------
@@ -132,9 +157,9 @@ def parse_kp_series(records: list) -> list[KpReading]:
     SWPC has shipped this product in two shapes over the years: a list of
     dicts, and a list-of-lists with a header row. We accept both rather than
     assume, because the shape changing upstream should degrade to "we parsed
-    what we could" and not a build failure.
+    what we could" and not a failed run.
     """
-    # Guard the container itself, not just its contents. A cached payload
+    # Guard the container itself, not just its contents. A stored payload
     # written by an older revision could be a dict or a scalar, and
     # records[0] on a dict raises KeyError rather than returning an item.
     if not isinstance(records, list):

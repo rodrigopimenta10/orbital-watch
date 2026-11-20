@@ -1,12 +1,11 @@
-"""Source fetching and graceful degradation.
+"""The fetch helper and the sources built on it.
 
-This is the most important test module in the project. The site's core promise
-is that upstream failure cannot take it down, and the tests below are what
-make that a fact rather than an intention.
-
-``test_build_survives_*`` walks every source through failure, one at a time
-and then all at once, and asserts the build still completes and reports the
-failure honestly.
+Everything the project claims about upstream failure starts in
+``fetch_source``: it never raises, it never lets a bad response replace good
+stored data, it never claims contact it did not have, and it never asks a
+rate-limited upstream more often than its floor allows -- however often it is
+called. Each of those is pinned here, in isolation, against a real (local)
+state store.
 """
 
 from __future__ import annotations
@@ -15,54 +14,59 @@ import io
 import json
 import urllib.error
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 
-from orbital_watch import health
-from orbital_watch.build import build_correlation, collect_space_weather, run_build
 from orbital_watch.config import (
-    DATA_SUBDIR,
+    CELESTRAK_MIN_REFETCH_INTERVAL,
+    CELESTRAK_RETRY_INTERVAL,
+    SPACE_WEATHER_STALENESS,
     TLE_STALENESS,
-    Observer,
     SatelliteGroup,
     StalenessPolicy,
 )
 from orbital_watch.sources import celestrak, swpc
-from orbital_watch.sources.fetch import Outcome, fetch_json, format_duration
-from tests.helpers import FakeResponse, fixture_bytes, responder  # noqa: F401
+from orbital_watch.sources import fetch as fetch_module
+from orbital_watch.sources.fetch import (
+    Outcome,
+    Payload,
+    SourceSpec,
+    fetch_source,
+    format_duration,
+    state_key,
+)
+from orbital_watch.store import PreconditionFailed, StoreError
+from tests.helpers import (
+    FAILURE_MODES,
+    FakeClock,
+    FakeResponse,
+    fixture_bytes,
+    responder,
+    urls,
+)
 
-OBSERVER = Observer("Test Site", 39.0840, -77.1528, 82.0)
+DEMO = SourceSpec(name="demo", url="https://example.invalid/data.json")
+
+#: A source with a politeness floor, like a Celestrak group but tiny.
+POLITE = SourceSpec(
+    name="polite",
+    url="https://example.invalid/gp.php",
+    min_refetch_interval=timedelta(hours=2),
+    retry_interval=timedelta(minutes=30),
+)
 
 
-# --------------------------------------------------------------------------
-# Fake HTTP plumbing
-# --------------------------------------------------------------------------
+def stored_record(store, spec) -> dict:
+    return json.loads(store.read(state_key(spec.name)).data)
 
 
-ALL_SOURCES_OK = {
-    "GROUP=stations": fixture_bytes("celestrak_stations.json"),
-    "GROUP=weather": fixture_bytes("celestrak_weather.json"),
-    "GROUP=starlink": fixture_bytes("celestrak_starlink.json"),
-    "planetary-k-index": fixture_bytes("swpc_kindex.json"),
-    "solar-wind-speed": fixture_bytes("swpc_solar_wind_speed.json"),
-    "solar-wind-mag-field": fixture_bytes("swpc_solar_wind_mag.json"),
-    "solar-cycle": fixture_bytes("swpc_solar_cycle.json"),
-}
-
-#: Every upstream key, for the "fail one at a time" sweep.
-SOURCE_KEYS = list(ALL_SOURCES_OK)
-
-FAILURE_MODES = {
-    "timeout": TimeoutError("timed out"),
-    "dns": urllib.error.URLError("Name or service not known"),
-    "http_500": urllib.error.HTTPError(
-        "https://example.invalid", 500, "Internal Server Error", {}, None
-    ),
-    "http_403": urllib.error.HTTPError(
-        "https://example.invalid", 403, "Forbidden", {}, None
-    ),
-}
+def serve(monkeypatch, mapping, **kwargs) -> list:
+    """Install a fake upstream and return the list its requests are logged to."""
+    calls: list = []
+    monkeypatch.setattr(
+        "urllib.request.urlopen", responder(mapping, calls=calls, **kwargs)
+    )
+    return calls
 
 
 # --------------------------------------------------------------------------
@@ -70,54 +74,59 @@ FAILURE_MODES = {
 # --------------------------------------------------------------------------
 
 
-def test_successful_fetch_populates_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"data.json": {"hello": "world"}})
-    )
+def test_successful_fetch_is_stored_with_its_metadata(state_store, monkeypatch):
+    clock = FakeClock()
+    serve(monkeypatch, {"data.json": {"hello": "world"}})
 
-    result = fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+    result = fetch_source(DEMO, state_store, clock=clock)
 
     assert result.outcome is Outcome.LIVE
     assert result.data == {"hello": "world"}
-    assert result.last_success is not None
-    assert (tmp_path / "demo.json").exists()
-    assert (tmp_path / "demo.json.meta").exists()
+    assert result.last_success == clock.now
+    record = stored_record(state_store, DEMO)
+    assert record["payload"] == {"hello": "world"}
+    assert record["last_outcome"] == "live"
+    assert record["confirmed_at"] == clock.now.isoformat()
+    assert record["payload_retrieved_at"] == clock.now.isoformat()
+    assert record["last_attempt_at"] == clock.now.isoformat()
 
 
 @pytest.mark.parametrize("mode", sorted(FAILURE_MODES))
-def test_fetch_falls_back_to_cache_on_every_failure_mode(tmp_path, monkeypatch, mode):
-    """Whatever goes wrong upstream, a warm cache keeps us serving."""
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"data.json": {"cached": True}})
-    )
-    fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+def test_fetch_falls_back_to_stored_data_on_every_failure_mode(
+    state_store, monkeypatch, mode
+):
+    """Whatever goes wrong upstream, stored data keeps us serving."""
+    clock = FakeClock()
+    serve(monkeypatch, {"data.json": {"stored": True}})
+    fetch_source(DEMO, state_store, clock=clock)
+    first_contact = clock.now
 
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"data.json": FAILURE_MODES[mode]})
-    )
-    result = fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+    clock.advance(timedelta(minutes=10))
+    serve(monkeypatch, {"data.json": FAILURE_MODES[mode]})
+    result = fetch_source(DEMO, state_store, clock=clock)
 
     assert result.outcome is Outcome.CACHE_FALLBACK
-    assert result.data == {"cached": True}
-    assert result.ok
+    assert result.data == {"stored": True}
     assert result.error
+    # The fallback is dated by the last real contact, not by this run.
+    assert result.last_success == first_contact
+    assert result.last_attempt == clock.now
 
 
 @pytest.mark.parametrize("mode", sorted(FAILURE_MODES))
-def test_fetch_reports_failure_when_there_is_no_cache(tmp_path, monkeypatch, mode):
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"data.json": FAILURE_MODES[mode]})
-    )
+def test_fetch_reports_failure_when_nothing_is_stored(state_store, monkeypatch, mode):
+    serve(monkeypatch, {"data.json": FAILURE_MODES[mode]})
 
-    result = fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+    result = fetch_source(DEMO, state_store)
 
     assert result.outcome is Outcome.FAILED
     assert result.data is None
     assert not result.ok
     assert result.error
+    assert result.last_success is None
 
 
-def test_fetch_never_raises_even_on_unexpected_errors(tmp_path, monkeypatch):
+def test_fetch_never_raises_even_on_unexpected_errors(state_store, monkeypatch):
     """The helper's contract is that callers never need a try/except."""
 
     def _explode(request, timeout=None):
@@ -125,14 +134,28 @@ def test_fetch_never_raises_even_on_unexpected_errors(tmp_path, monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", _explode)
 
-    result = fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+    result = fetch_source(DEMO, state_store)
 
     assert result.outcome is Outcome.FAILED
     assert "RuntimeError" in result.error
 
 
-def test_unclassified_error_text_is_not_published(tmp_path, monkeypatch):
-    """An unrecognised exception's message must not reach health.json.
+def test_fetch_never_raises_even_when_its_own_code_breaks(state_store, monkeypatch):
+    """The last line of defence: a bug inside the helper is still a result."""
+
+    def _broken(*args, **kwargs):
+        raise KeyError("a bug in the helper itself")
+
+    monkeypatch.setattr(fetch_module, "_load_state", _broken)
+
+    result = fetch_source(DEMO, state_store)
+
+    assert result.outcome is Outcome.FAILED
+    assert "KeyError" in result.error
+
+
+def test_unclassified_error_text_is_not_published(state_store, monkeypatch):
+    """An unrecognised exception's message must not reach the document.
 
     That string is served verbatim from a public site. A URLError raised
     through a proxy configured with credentials in its URL would otherwise
@@ -146,7 +169,7 @@ def test_unclassified_error_text_is_not_published(tmp_path, monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", _explode)
 
-    result = fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+    result = fetch_source(DEMO, state_store)
 
     assert result.outcome is Outcome.FAILED
     assert leaked not in result.error
@@ -156,141 +179,567 @@ def test_unclassified_error_text_is_not_published(tmp_path, monkeypatch):
     assert "RuntimeError" in result.error
 
 
-def test_malformed_json_does_not_overwrite_a_good_cache(tmp_path, monkeypatch):
-    """A garbage response must not poison the cache we would fall back to."""
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"data.json": {"good": True}})
-    )
-    fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+def test_malformed_json_does_not_overwrite_good_stored_data(state_store, monkeypatch):
+    """A garbage response must not replace the data we would fall back to."""
+    serve(monkeypatch, {"data.json": {"good": True}})
+    fetch_source(DEMO, state_store)
 
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"data.json": b"<html>not json</html>"})
-    )
-    result = fetch_json("demo", "https://example.invalid/data.json", tmp_path)
+    serve(monkeypatch, {"data.json": b"<html>not json</html>"})
+    result = fetch_source(DEMO, state_store)
 
     assert result.outcome is Outcome.CACHE_FALLBACK
     assert result.data == {"good": True}
-    assert json.loads((tmp_path / "demo.json").read_text()) == {"good": True}
+    assert "Malformed JSON" in result.error
+    assert stored_record(state_store, DEMO)["payload"] == {"good": True}
 
 
-def test_celestrak_not_updated_sentinel_is_treated_as_not_modified(tmp_path, monkeypatch):
-    """Celestrak's 200-with-plaintext 'not updated' reply is not an error.
+def test_rejected_payload_does_not_overwrite_good_stored_data(state_store, monkeypatch):
+    """Valid JSON of the wrong shape is refused exactly like invalid JSON."""
+    spec = swpc.KP
+    good = [{"time_tag": "2026-08-06T00:00:00", "Kp": 2.33}]
+    serve(monkeypatch, {"planetary-k-index": good})
+    fetch_source(spec, state_store)
 
-    Re-requesting a GP group inside its 2h refresh window returns HTTP 200
-    with a plain sentence, not JSON. Handled naively this either crashes the
-    build or overwrites the cache with prose. It means 'nothing new', so we
-    serve cache and stay healthy.
+    serve(monkeypatch, {"planetary-k-index": {"a dict": "where a list belongs"}})
+    result = fetch_source(spec, state_store)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert "Rejected payload" in result.error
+    assert stored_record(state_store, spec)["payload"] == good
+
+
+def test_timeout_error_reports_the_timeout_actually_used(state_store, monkeypatch):
+    serve(monkeypatch, {"data.json": TimeoutError("timed out")})
+
+    result = fetch_source(DEMO, state_store, timeout=7.0)
+
+    assert result.error == "Timed out after 7s"
+
+
+def test_oversized_response_is_rejected_not_buffered(state_store, monkeypatch):
+    """A body past the cap is refused before it can exhaust memory."""
+    monkeypatch.setattr(fetch_module, "MAX_RESPONSE_BYTES", 1024)
+    serve(monkeypatch, {"data.json": b"[" + b"1," * 2000 + b"1]"})
+
+    result = fetch_source(DEMO, state_store)
+
+    assert result.outcome is Outcome.FAILED
+    assert "cap" in result.error
+
+
+def test_oversized_response_falls_back_to_stored_data(state_store, monkeypatch):
+    serve(monkeypatch, {"data.json": {"good": True}})
+    fetch_source(DEMO, state_store)
+
+    monkeypatch.setattr(fetch_module, "MAX_RESPONSE_BYTES", 16)
+    serve(monkeypatch, {"data.json": b"[" + b"1," * 2000 + b"1]"})
+    result = fetch_source(DEMO, state_store)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert result.data == {"good": True}
+
+
+# --------------------------------------------------------------------------
+# Politeness: the floor is enforced against stored state
+# --------------------------------------------------------------------------
+
+
+def test_upstream_is_not_asked_again_inside_the_floor(state_store, monkeypatch):
+    """However often the job runs, a polite source is asked once per interval."""
+    clock = FakeClock()
+    calls = serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    fetch_source(POLITE, state_store, clock=clock)
+    contact = clock.now
+
+    for _run in range(11):  # ten-minute runs across most of the two hours
+        clock.advance(timedelta(minutes=10))
+        result = fetch_source(POLITE, state_store, clock=clock)
+        assert result.outcome is Outcome.CACHE_FRESH
+        assert result.data == [{"a": 1}]
+        assert result.last_success == contact
+        assert result.last_attempt == contact
+
+    assert len(calls) == 1, "upstream was contacted inside its floor"
+
+
+def test_upstream_is_asked_again_once_the_floor_clears(state_store, monkeypatch):
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    fetch_source(POLITE, state_store, clock=clock)
+
+    clock.advance(timedelta(hours=2))  # exactly the floor: due
+    calls = serve(monkeypatch, {"gp.php": [{"a": 2}]})
+    result = fetch_source(POLITE, state_store, clock=clock)
+
+    assert len(calls) == 1
+    assert result.outcome is Outcome.LIVE
+    assert result.data == [{"a": 2}]
+
+
+def test_floor_survives_a_new_process(tmp_path, monkeypatch):
+    """The floor lives in the store, not in memory.
+
+    This is the property the first design never had: its floor was enforced
+    against a disk cache that every production run started without. Two
+    separate store objects over the same directory stand in for two separate
+    job executions.
     """
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"gp.php": [{"OBJECT_NAME": "SAT"}]})
-    )
-    fetch_json("gp", "https://celestrak.org/gp.php?GROUP=x", tmp_path)
+    from orbital_watch.store import LocalStore
 
-    sentinel = fixture_bytes("celestrak_not_updated.txt")
-    monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": sentinel}))
-    result = fetch_json("gp", "https://celestrak.org/gp.php?GROUP=x", tmp_path)
+    clock = FakeClock()
+    calls = serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    fetch_source(POLITE, LocalStore(tmp_path / "state"), clock=clock)
 
-    assert result.outcome is Outcome.NOT_MODIFIED
-    assert result.data == [{"OBJECT_NAME": "SAT"}]
-    # Crucially, the cache still holds JSON and not the sentence.
-    assert json.loads((tmp_path / "gp.json").read_text()) == [{"OBJECT_NAME": "SAT"}]
+    clock.advance(timedelta(minutes=10))
+    result = fetch_source(POLITE, LocalStore(tmp_path / "state"), clock=clock)
+
+    assert result.outcome is Outcome.CACHE_FRESH
+    assert len(calls) == 1
 
 
-def test_not_updated_sentinel_is_detected_even_with_an_http_403(tmp_path, monkeypatch):
-    """Celestrak sends the not-updated sentinel with a 403, not a 200.
+def test_failed_attempt_backs_off_and_stays_degraded(state_store, monkeypatch):
+    """Between retries a broken source must not flip back to looking healthy.
 
-    Observed against the live API: re-requesting a group inside its refresh
-    window returns HTTP 403 whose *body* is the "GP data has not updated"
-    sentence. Checking the body only on the success path misses it entirely,
-    and a benign "nothing changed" gets reported as a hard failure while a
-    good cache sits unused. Regression test for that.
+    After a failure the source is not asked again until the retry interval
+    has passed -- and in the meantime it keeps reporting the failure. If the
+    quiet runs reported a deliberate, healthy skip instead, the panel would
+    alternate between stale and fresh while nothing had recovered.
     """
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"gp.php": [{"OBJECT_NAME": "SAT"}]})
-    )
-    fetch_json("gp", "https://celestrak.org/gp.php?GROUP=starlink", tmp_path)
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    fetch_source(POLITE, state_store, clock=clock)
+    contact = clock.now
 
-    sentinel = fixture_bytes("celestrak_not_updated.txt")
+    clock.advance(timedelta(hours=2))
+    calls = serve(monkeypatch, {"gp.php": TimeoutError("timed out")})
+    failed = fetch_source(POLITE, state_store, clock=clock)
+    assert failed.outcome is Outcome.CACHE_FALLBACK
 
-    def _forbidden_with_sentinel(request, timeout=None):
-        raise urllib.error.HTTPError(
-            "https://celestrak.org/gp.php",
-            403,
-            "Forbidden",
-            {},
-            io.BytesIO(sentinel),
+    for _run in range(2):  # +10m, +20m: retry not due
+        clock.advance(timedelta(minutes=10))
+        waiting = fetch_source(POLITE, state_store, clock=clock)
+        assert waiting.outcome is Outcome.CACHE_FALLBACK
+        assert waiting.error == failed.error
+        assert waiting.last_success == contact
+        assert any("next one is due" in note for note in waiting.notes)
+    assert len(calls) == 1, "retried before the retry interval had passed"
+
+    clock.advance(timedelta(minutes=10))  # +30m: due
+    serve(monkeypatch, {"gp.php": [{"a": 2}]})
+    recovered = fetch_source(POLITE, state_store, clock=clock)
+    assert recovered.outcome is Outcome.LIVE
+    assert recovered.data == [{"a": 2}]
+
+
+def test_first_ever_failure_also_backs_off(state_store, monkeypatch):
+    """With nothing stored, a failing upstream is still not hammered."""
+    clock = FakeClock()
+    calls = serve(monkeypatch, {"gp.php": TimeoutError("timed out")})
+    first = fetch_source(POLITE, state_store, clock=clock)
+    assert first.outcome is Outcome.FAILED
+
+    clock.advance(timedelta(minutes=10))
+    waiting = fetch_source(POLITE, state_store, clock=clock)
+
+    assert waiting.outcome is Outcome.FAILED
+    assert waiting.data is None
+    assert waiting.error == first.error
+    assert len(calls) == 1
+
+
+def test_future_attempt_time_does_not_block_a_source_forever(state_store, monkeypatch):
+    """A recorded attempt in the future (clock skew, hand edit) is ignored.
+
+    Treating it as "very recent" would keep the source from being asked until
+    the wall clock caught up with a bogus timestamp.
+    """
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    fetch_source(POLITE, state_store, clock=clock)
+
+    clock.advance(-timedelta(days=3))  # the stored attempt is now 3 days ahead
+    calls = serve(monkeypatch, {"gp.php": [{"a": 2}]})
+    result = fetch_source(POLITE, state_store, clock=clock)
+
+    assert len(calls) == 1
+    assert result.outcome is Outcome.LIVE
+
+
+def test_unreadable_state_store_fails_closed_for_a_polite_source(monkeypatch):
+    """No record of the last attempt means no request, not a free one.
+
+    A storage outage must not turn into a burst of requests against a server
+    that rate-limits: without the stored record there is no way to know
+    whether the floor has cleared.
+    """
+
+    class BrokenStore:
+        def describe(self):
+            return "a store that is down"
+
+        def read(self, key):
+            raise StoreError("backend unavailable")
+
+        def write(self, *args, **kwargs):
+            raise StoreError("backend unavailable")
+
+    calls = serve(monkeypatch, {"gp.php": [{"a": 1}], "data.json": {"ok": True}})
+
+    polite = fetch_source(POLITE, BrokenStore())
+    assert polite.outcome is Outcome.FAILED
+    assert "not contacted" in polite.error
+    assert urls(calls) == []
+
+    # A source with no floor has nothing to protect, so it is still fetched --
+    # the run can publish live space weather through a state-store outage.
+    unfloored = fetch_source(DEMO, BrokenStore())
+    assert unfloored.outcome is Outcome.LIVE
+    assert unfloored.data == {"ok": True}
+    assert any("not saved" in note for note in unfloored.notes)
+
+
+# --------------------------------------------------------------------------
+# Overlapping runs
+# --------------------------------------------------------------------------
+
+
+def test_overlapping_run_does_not_overwrite_newer_state(state_store, monkeypatch):
+    """Two runs fetch the same source at once; the slower one must not win.
+
+    Run A reads the state, then is overtaken: run B fetches and stores newer
+    data before A finishes. A's write carries the generation it read, which is
+    now out of date, so it is refused and B's record stands. A still returns
+    what it fetched -- its result is true -- and says its state was not kept.
+    """
+    clock = FakeClock()
+    serve(monkeypatch, {"data.json": {"version": "original"}})
+    fetch_source(DEMO, state_store, clock=clock)
+
+    def run_b_overtakes(request, timeout=None):
+        # While A is "on the network", B completes a whole fetch-and-store.
+        monkeypatch.setattr(
+            "urllib.request.urlopen", responder({"data.json": {"version": "from B"}})
         )
+        fetch_source(DEMO, state_store, clock=clock)
+        return FakeResponse(json.dumps({"version": "from A"}).encode())
 
-    monkeypatch.setattr("urllib.request.urlopen", _forbidden_with_sentinel)
-    result = fetch_json("gp", "https://celestrak.org/gp.php?GROUP=starlink", tmp_path)
+    monkeypatch.setattr("urllib.request.urlopen", run_b_overtakes)
+    result_a = fetch_source(DEMO, state_store, clock=clock)
+
+    assert result_a.outcome is Outcome.LIVE
+    assert result_a.data == {"version": "from A"}
+    assert any("Another run" in note for note in result_a.notes)
+    assert stored_record(state_store, DEMO)["payload"] == {"version": "from B"}
+
+
+def test_state_write_failure_does_not_fail_the_fetch(state_store, monkeypatch):
+    serve(monkeypatch, {"data.json": {"ok": True}})
+
+    def _refuse(*args, **kwargs):
+        raise StoreError("disk full")
+
+    monkeypatch.setattr(state_store, "write", _refuse)
+    result = fetch_source(DEMO, state_store)
+
+    assert result.outcome is Outcome.LIVE
+    assert result.data == {"ok": True}
+    assert any("could not be saved" in note for note in result.notes)
+
+
+def test_precondition_failure_is_distinguished_from_other_store_errors():
+    assert issubclass(PreconditionFailed, StoreError)
+
+
+# --------------------------------------------------------------------------
+# Conditional requests and "not modified"
+# --------------------------------------------------------------------------
+
+
+def test_validators_are_stored_and_sent_back(state_store, monkeypatch):
+    """What upstream gives us to ask "has it changed?" is remembered and used."""
+    clock = FakeClock()
+    served = FakeResponse(
+        b'{"v": 1}',
+        {"ETag": '"abc123"', "Last-Modified": "Thu, 06 Aug 2026 14:45:00 GMT"},
+    )
+    serve(monkeypatch, {"data.json": served})
+    fetch_source(DEMO, state_store, clock=clock)
+
+    assert stored_record(state_store, DEMO)["validators"] == {
+        "etag": '"abc123"',
+        "last_modified": "Thu, 06 Aug 2026 14:45:00 GMT",
+    }
+
+    clock.advance(timedelta(minutes=10))
+    calls = serve(monkeypatch, {"data.json": served})
+    fetch_source(DEMO, state_store, clock=clock)
+
+    request = calls[0]
+    assert request.get_header("If-none-match") == '"abc123"'
+    assert request.get_header("If-modified-since") == "Thu, 06 Aug 2026 14:45:00 GMT"
+
+
+def test_no_validators_are_sent_when_nothing_is_stored(state_store, monkeypatch):
+    """A "not modified" answer is useless to a run that holds no payload."""
+    calls = serve(monkeypatch, {"data.json": {"v": 1}})
+
+    fetch_source(DEMO, state_store)
+
+    assert calls[0].get_header("If-none-match") is None
+    assert calls[0].get_header("If-modified-since") is None
+
+
+def test_http_304_confirms_the_stored_payload(state_store, monkeypatch):
+    """A 304 is upstream answering: contact is current, the bytes are older."""
+    clock = FakeClock()
+    serve(monkeypatch, {"data.json": FakeResponse(b'{"v": 1}', {"ETag": '"abc"'})})
+    fetch_source(DEMO, state_store, clock=clock)
+    downloaded = clock.now
+
+    clock.advance(timedelta(minutes=10))
+    not_modified = urllib.error.HTTPError(
+        DEMO.url, 304, "Not Modified", {}, io.BytesIO(b"")
+    )
+    serve(monkeypatch, {"data.json": not_modified})
+    result = fetch_source(DEMO, state_store, clock=clock)
+
+    assert result.outcome is Outcome.NOT_MODIFIED
+    assert result.data == {"v": 1}
+    assert result.last_success == clock.now
+    assert result.payload_retrieved_at == downloaded
+    # The validators survive, so the next request is conditional too.
+    assert stored_record(state_store, DEMO)["validators"] == {"etag": '"abc"'}
+
+
+def celestrak_sentinel(quoted: datetime) -> bytes:
+    """Celestrak's "not updated" sentence, naming a given download time."""
+    template = fixture_bytes("celestrak_not_updated.txt").decode()
+    assert "2026-08-06 14:52:37 UTC" in template
+    return template.replace(
+        "2026-08-06 14:52:37 UTC", f"{quoted:%Y-%m-%d %H:%M:%S} UTC"
+    ).encode()
+
+
+def forbidden(body: bytes) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://celestrak.org/gp.php", 403, "Forbidden", {}, io.BytesIO(body)
+    )
+
+
+def test_not_updated_sentinel_with_an_http_403_is_not_modified(state_store, monkeypatch):
+    """Celestrak says "nothing new" with a 403 whose body is a sentence.
+
+    Observed against the live API. Checking the body only on the success path
+    misses it, and a benign "nothing changed" gets reported as a hard failure
+    while good stored data sits unused. And parsed naively, the sentence is
+    not JSON -- it must never be stored in place of the data.
+    """
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"OBJECT_NAME": "SAT"}]})
+    fetch_source(POLITE, state_store, clock=clock)
+    downloaded = clock.now
+
+    clock.advance(timedelta(hours=2, minutes=5))
+    serve(monkeypatch, {"gp.php": forbidden(celestrak_sentinel(downloaded))})
+    result = fetch_source(POLITE, state_store, clock=clock)
 
     assert result.outcome is Outcome.NOT_MODIFIED
     assert result.data == [{"OBJECT_NAME": "SAT"}]
-    assert result.ok
+    # Contact is confirmed now; the bytes are still from the first download.
+    assert result.last_success == clock.now
+    assert result.payload_retrieved_at == downloaded
+    assert stored_record(state_store, POLITE)["payload"] == [{"OBJECT_NAME": "SAT"}]
 
 
-def test_a_genuine_403_is_still_a_failure(tmp_path, monkeypatch):
+def test_not_updated_sentinel_with_an_http_200_is_not_modified(state_store, monkeypatch):
+    """The same sentence on a success status is handled the same way."""
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"OBJECT_NAME": "SAT"}]})
+    fetch_source(POLITE, state_store, clock=clock)
+    downloaded = clock.now
+
+    clock.advance(timedelta(hours=3))
+    serve(monkeypatch, {"gp.php": celestrak_sentinel(downloaded)})
+    result = fetch_source(POLITE, state_store, clock=clock)
+
+    assert result.outcome is Outcome.NOT_MODIFIED
+    assert result.data == [{"OBJECT_NAME": "SAT"}]
+
+
+def test_sentinel_about_someone_elses_download_is_not_a_confirmation(
+    state_store, monkeypatch
+):
+    """ "Not updated since *your* last download" -- but was it ours?
+
+    Celestrak remembers the last download per requesting address, and a cloud
+    platform's egress addresses are shared. If the download it names is later
+    than ours, the data may have been regenerated in between and upstream
+    will not send it. Calling that "confirmed current" would be claiming
+    contact we did not have, so the source degrades instead.
+    """
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"OBJECT_NAME": "SAT"}]})
+    fetch_source(POLITE, state_store, clock=clock)
+    ours = clock.now
+
+    clock.advance(timedelta(hours=2, minutes=5))
+    theirs = ours + timedelta(hours=1, minutes=40)
+    serve(monkeypatch, {"gp.php": forbidden(celestrak_sentinel(theirs))})
+    result = fetch_source(POLITE, state_store, clock=clock)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert result.data == [{"OBJECT_NAME": "SAT"}]
+    assert result.last_success == ours, "contact must not be advanced"
+    assert "was not ours" in result.error
+
+
+def test_sentinel_without_a_readable_time_is_not_a_confirmation(state_store, monkeypatch):
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"OBJECT_NAME": "SAT"}]})
+    fetch_source(POLITE, state_store, clock=clock)
+
+    clock.advance(timedelta(hours=3))
+    garbled = b"GP data has not updated since your last successful download."
+    serve(monkeypatch, {"gp.php": forbidden(garbled)})
+    result = fetch_source(POLITE, state_store, clock=clock)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert "withheld" in result.error.lower()
+
+
+def test_sentinel_with_nothing_stored_is_a_failure(state_store, monkeypatch):
+    """A first run from an address that pulled the group recently gets no data."""
+    serve(
+        monkeypatch,
+        {"gp.php": forbidden(fixture_bytes("celestrak_not_updated.txt"))},
+    )
+
+    result = fetch_source(POLITE, state_store)
+
+    assert result.outcome is Outcome.FAILED
+    assert result.data is None
+    assert "withheld" in result.error.lower()
+
+
+def test_a_genuine_403_is_still_a_failure(state_store, monkeypatch):
     """Only the sentinel body is forgiven -- a real 403 must still degrade."""
+    serve(monkeypatch, {"gp.php": forbidden(b"go away")})
 
-    def _plain_forbidden(request, timeout=None):
-        raise urllib.error.HTTPError(
-            "https://celestrak.org/gp.php",
-            403,
-            "Forbidden",
-            {},
-            io.BytesIO(b"go away"),
-        )
-
-    monkeypatch.setattr("urllib.request.urlopen", _plain_forbidden)
-    result = fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
+    result = fetch_source(POLITE, state_store)
 
     assert result.outcome is Outcome.FAILED
     assert "403" in result.error
 
 
-def test_rate_limit_guard_skips_the_network_entirely(tmp_path, monkeypatch):
-    """A young cache means we do not call Celestrak at all."""
-    monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": [{"a": 1}]}))
-    fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
-
-    def _must_not_be_called(request, timeout=None):
-        raise AssertionError("network was called despite a young cache")
-
-    monkeypatch.setattr("urllib.request.urlopen", _must_not_be_called)
-    result = fetch_json(
-        "gp",
-        "https://celestrak.org/gp.php",
-        tmp_path,
-        min_refetch_interval=timedelta(hours=6),
-    )
-
-    assert result.outcome is Outcome.CACHE_FRESH
-    assert result.data == [{"a": 1}]
+# --------------------------------------------------------------------------
+# Damaged or outdated state
+# --------------------------------------------------------------------------
 
 
-def test_rate_limit_guard_expires(tmp_path, monkeypatch):
-    """An old cache does not block a refetch."""
-    monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": [{"a": 1}]}))
-    fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
+@pytest.mark.parametrize(
+    "damage",
+    [
+        b"",
+        b"not json at all",
+        b"[1, 2, 3]",
+        b'"a bare string"',
+        b'{"schema": 999, "payload": [1]}',
+        b'{"schema": 1, "payload": [1], "confirmed_at": 12345}',
+        b'{"schema": 1, "payload": [1], "validators": "not a dict"}',
+        b"\xff\xfe\x00 not even text",
+    ],
+)
+def test_damaged_state_is_survived_and_then_repaired(state_store, monkeypatch, damage):
+    """Any shape of damage degrades to "nothing stored", and heals on success.
 
-    stale_time = (datetime.now(UTC) - timedelta(hours=12)).isoformat()
-    (tmp_path / "gp.json.meta").write_text(json.dumps({"retrieved_at": stale_time}))
+    The component whose job is keeping data fresh must never be wedged by a
+    malformed state object: a record that crashed the reader would crash
+    every later run identically, because nothing would ever replace it.
+    """
+    state_store.write(state_key(DEMO.name), damage, content_type="application/json")
+    serve(monkeypatch, {"data.json": {"fresh": True}})
 
-    monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": [{"a": 2}]}))
-    result = fetch_json(
-        "gp",
-        "https://celestrak.org/gp.php",
-        tmp_path,
-        min_refetch_interval=timedelta(hours=6),
-    )
+    result = fetch_source(DEMO, state_store)
 
     assert result.outcome is Outcome.LIVE
-    assert result.data == [{"a": 2}]
+    assert stored_record(state_store, DEMO)["payload"] == {"fresh": True}
+
+
+def test_stored_payload_of_an_old_shape_is_dropped_not_served(state_store, monkeypatch):
+    """State outlives the code that wrote it.
+
+    A record written by an older revision is read by a newer one. If the
+    expected shape has changed since, handing the old shape downstream
+    unvalidated is how a fallback turns into a crash. Validating on read
+    means it degrades to "no data" instead.
+    """
+    spec = swpc.KP
+    old_shape = {
+        "schema": 1,
+        "payload": {"a dict": "from an older revision"},
+        "confirmed_at": "2026-08-06T12:00:00+00:00",
+        "last_outcome": "live",
+    }
+    state_store.write(
+        state_key(spec.name),
+        json.dumps(old_shape).encode(),
+        content_type="application/json",
+    )
+    serve(monkeypatch, {"planetary-k-index": TimeoutError("timed out")})
+
+    result = fetch_source(spec, state_store)
+
+    assert result.outcome is Outcome.FAILED
+    assert result.data is None
+
+
+def test_naive_timestamp_in_state_does_not_raise(state_store, monkeypatch):
+    """A timestamp without a zone is read as UTC, not compared and crashed on."""
+    naive = {
+        "schema": 1,
+        "payload": [{"a": 1}],
+        "confirmed_at": "2026-08-06T12:00:00",
+        "payload_retrieved_at": "2026-08-06T12:00:00",
+        "last_attempt_at": "2026-08-06T12:00:00",
+        "last_outcome": "live",
+    }
+    state_store.write(
+        state_key(POLITE.name),
+        json.dumps(naive).encode(),
+        content_type="application/json",
+    )
+    clock = FakeClock(datetime(2026, 8, 6, 12, 30, tzinfo=UTC))
+    calls = serve(monkeypatch, {"gp.php": [{"a": 2}]})
+
+    result = fetch_source(POLITE, state_store, clock=clock)
+
+    assert result.outcome is Outcome.CACHE_FRESH
+    assert result.last_success == datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    assert calls == []
+
+
+def test_stored_data_without_a_date_is_served_undated(state_store, monkeypatch):
+    """Data we cannot date is still served, but never with an invented date."""
+    undated = {"schema": 1, "payload": {"good": True}, "last_outcome": "live"}
+    state_store.write(
+        state_key(DEMO.name),
+        json.dumps(undated).encode(),
+        content_type="application/json",
+    )
+    serve(monkeypatch, {"data.json": TimeoutError("timed out")})
+
+    result = fetch_source(DEMO, state_store)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert result.data == {"good": True}
+    assert result.last_success is None
 
 
 # --------------------------------------------------------------------------
-# Payload validation
+# Celestrak groups
 # --------------------------------------------------------------------------
+
+STATIONS = SatelliteGroup(key="stations", label="Stations", max_objects=100)
 
 
 @pytest.mark.parametrize(
@@ -302,24 +751,21 @@ def test_rate_limit_guard_expires(tmp_path, monkeypatch):
         ["not a dict"],
     ],
 )
-def test_unusable_gp_payloads_are_rejected(tmp_path, monkeypatch, payload):
+def test_unusable_gp_payloads_are_rejected(state_store, monkeypatch, payload):
     """Structurally wrong GP data is refused rather than propagated."""
-    monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": payload}))
-    group = SatelliteGroup(key="stations", label="Stations", max_objects=10)
+    serve(monkeypatch, {"gp.php": payload})
 
-    result = celestrak.fetch_group(group, tmp_path, allow_network=True)
+    result = fetch_source(celestrak.group_spec(STATIONS), state_store)
 
     assert result.outcome is Outcome.FAILED
     assert result.data is None
 
 
-def test_partially_valid_gp_payload_keeps_the_good_records(tmp_path, monkeypatch):
+def test_partially_valid_gp_payload_keeps_the_good_records(state_store, monkeypatch):
     good = json.loads(fixture_bytes("celestrak_stations.json"))
-    mixed = [{"OBJECT_NAME": "JUNK"}, *good]
-    monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": mixed}))
-    group = SatelliteGroup(key="stations", label="Stations", max_objects=100)
+    serve(monkeypatch, {"gp.php": [{"OBJECT_NAME": "JUNK"}, *good]})
 
-    result = celestrak.fetch_group(group, tmp_path, allow_network=True)
+    result = fetch_source(celestrak.group_spec(STATIONS), state_store)
 
     assert result.ok
     assert len(result.data) == len(good)
@@ -335,6 +781,77 @@ def test_select_objects_caps_group_size():
     # We keep the most recent epochs, which carry the least propagation error.
     epochs = [r["EPOCH"] for r in selected]
     assert epochs == sorted(epochs, reverse=True)
+
+
+def test_group_is_stored_trimmed_with_its_full_size_on_record(state_store, monkeypatch):
+    """What is kept is the sample; how big the group was is kept beside it.
+
+    The page says "5 of 30 starlink". The 30 is not recoverable from the five
+    records stored, so it has to survive as a fact -- including on later runs
+    that serve the stored copy without contacting upstream.
+    """
+    records = json.loads(fixture_bytes("celestrak_starlink.json"))
+    group = SatelliteGroup(key="starlink", label="Starlink", max_objects=5)
+    spec = celestrak.group_spec(group)
+    clock = FakeClock()
+    serve(monkeypatch, {"GROUP=starlink": records})
+
+    first = fetch_source(spec, state_store, clock=clock)
+    clock.advance(timedelta(minutes=10))
+    later = fetch_source(spec, state_store, clock=clock)
+
+    assert len(first.data) == 5
+    assert first.facts == {"available": len(records)}
+    assert later.outcome is Outcome.CACHE_FRESH
+    assert len(later.data) == 5
+    assert later.facts == {"available": len(records)}
+
+
+def test_collapsed_group_does_not_replace_a_substantial_one(state_store, monkeypatch):
+    """A valid but tiny response is upstream trouble, not a real change."""
+    good = json.loads(fixture_bytes("celestrak_stations.json"))
+    assert len(good) >= celestrak.MIN_PLAUSIBLE_RECORDS
+    spec = celestrak.group_spec(STATIONS)
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": good})
+    fetch_source(spec, state_store, clock=clock)
+
+    clock.advance(CELESTRAK_MIN_REFETCH_INTERVAL)
+    serve(monkeypatch, {"gp.php": good[:2]})
+    result = fetch_source(spec, state_store, clock=clock)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert len(result.data) == len(good)
+    assert "shrank" in result.error
+    assert len(stored_record(state_store, spec)["payload"]) == len(good)
+
+
+def test_celestrak_groups_carry_the_configured_floor():
+    spec = celestrak.group_spec(STATIONS)
+
+    assert spec.min_refetch_interval == CELESTRAK_MIN_REFETCH_INTERVAL
+    assert spec.retry_interval == CELESTRAK_RETRY_INTERVAL
+    assert spec.url.endswith("GROUP=stations&FORMAT=json")
+
+
+def test_space_weather_sources_have_no_floor():
+    for spec in (swpc.KP, swpc.SOLAR_WIND, swpc.MAG_FIELD, swpc.SOLAR_CYCLE):
+        assert spec.min_refetch_interval is None
+
+
+def test_parser_may_return_a_bare_value_or_a_payload(state_store, monkeypatch):
+    bare = SourceSpec(name="bare", url="https://example.invalid/a.json", parse=sorted)
+    wrapped = SourceSpec(
+        name="wrapped",
+        url="https://example.invalid/b.json",
+        parse=lambda data: Payload(data=sorted(data), facts={"count": len(data)}),
+    )
+    serve(monkeypatch, {"a.json": [3, 1, 2], "b.json": [3, 1, 2]})
+
+    assert fetch_source(bare, state_store).data == [1, 2, 3]
+    result = fetch_source(wrapped, state_store)
+    assert result.data == [1, 2, 3]
+    assert result.facts == {"count": 3}
 
 
 # --------------------------------------------------------------------------
@@ -362,10 +879,19 @@ def test_kp_series_parses_the_legacy_list_of_lists_shape():
     assert [r.kp for r in readings] == [3.33, 4.67]
 
 
-def test_kp_series_survives_an_unrecognised_shape():
-    assert swpc.parse_kp_series([{"totally": "different"}]) == []
-    assert swpc.parse_kp_series([["unknown", "header"], ["a", "b"]]) == []
-    assert swpc.parse_kp_series([]) == []
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"totally": "different"}],
+        [["unknown", "header"], ["a", "b"]],
+        [],
+        {"a dict": "where a list belongs"},
+        "a bare string",
+        [1, 2, 3],
+    ],
+)
+def test_kp_series_survives_an_unrecognised_shape(payload):
+    assert swpc.parse_kp_series(payload) == []
 
 
 @pytest.mark.parametrize(
@@ -400,263 +926,17 @@ def test_kp_trend_direction():
     assert swpc.kp_trend([]) == "unknown"
 
 
-# --------------------------------------------------------------------------
-# The correlation banner
-# --------------------------------------------------------------------------
-
-
-def test_correlation_banner_raises_on_a_forced_high_kp(tmp_path, monkeypatch):
-    """Force a storm-level Kp through the real pipeline and assert the banner.
-
-    Verifies the requirement end to end rather than by calling the classifier
-    directly: a fabricated upstream payload produces a storm banner in the
-    output JSON.
-    """
-    storm_kp = [
-        {"time_tag": "2026-08-06T03:00:00", "Kp": 5.00, "a_running": 48},
-        {"time_tag": "2026-08-06T06:00:00", "Kp": 7.67, "a_running": 132},
-    ]
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        responder({**ALL_SOURCES_OK, "planetary-k-index": storm_kp}),
-    )
-
-    weather, _ = collect_space_weather(tmp_path)
-    correlation = build_correlation(weather)
-
-    assert weather["kp"] == 7.67
-    assert weather["storm"] is True
-    assert weather["elevated"] is True
-    assert correlation["active"] is True
-    assert correlation["severity"] == "storm"
-    assert "7.67" in correlation["headline"]
-    assert correlation["operational_impacts"], "storm must list operational impacts"
-    assert "drag" in correlation["explanation"].lower()
-
-
-def test_correlation_banner_stays_down_when_quiet(tmp_path, monkeypatch):
-    quiet_kp = [{"time_tag": "2026-08-06T06:00:00", "Kp": 1.33}]
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        responder({**ALL_SOURCES_OK, "planetary-k-index": quiet_kp}),
-    )
-
-    weather, _ = collect_space_weather(tmp_path)
-    correlation = build_correlation(weather)
-
-    assert correlation["active"] is False
-    assert correlation["severity"] == "quiet"
-
-
-def test_correlation_is_honest_when_kp_is_unavailable(tmp_path, monkeypatch):
-    """No Kp means we say so, rather than implying conditions are fine."""
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        responder({**ALL_SOURCES_OK, "planetary-k-index": TimeoutError("timed out")}),
-    )
-
-    weather, _ = collect_space_weather(tmp_path)
-    correlation = build_correlation(weather)
-
-    assert weather["available"] is False
-    assert correlation["severity"] == "unknown"
-    assert correlation["active"] is False
-    assert "unavailable" in correlation["headline"].lower()
-
-
-@pytest.mark.parametrize("kp", [4.0, 4.33, 4.99])
-def test_elevated_band_raises_the_banner_below_storm_level(kp):
-    weather = {
-        "available": True,
-        "kp": kp,
-        "storm": swpc.is_storm(kp),
-        "elevated": swpc.is_elevated(kp),
-    }
-    correlation = build_correlation(weather)
-
-    assert correlation["active"] is True
-    assert correlation["severity"] == "elevated"
+@pytest.mark.parametrize(
+    "records",
+    [None, [], "text", [["a list"]], [{"proton_speed": "not a number"}]],
+)
+def test_latest_value_survives_any_shape(records):
+    value, _stamp = swpc.latest_value(records, "proton_speed")
+    assert value is None
 
 
 # --------------------------------------------------------------------------
-# GRACEFUL DEGRADATION -- the most important tests in the project
-# --------------------------------------------------------------------------
-
-
-def assert_site_is_complete(build_dir: Path) -> dict:
-    """Every expected artefact exists and parses. Returns the health payload."""
-    data_dir = build_dir / DATA_SUBDIR
-    expected = [
-        "meta.json",
-        "sky.json",
-        "passes.json",
-        "space_weather.json",
-        "health.json",
-    ]
-
-    for name in expected:
-        path = data_dir / name
-        assert path.exists(), f"{name} was not written"
-        json.loads(path.read_text())  # must parse
-
-    return json.loads((data_dir / "health.json").read_text())
-
-
-@pytest.mark.parametrize("broken", SOURCE_KEYS)
-@pytest.mark.parametrize("mode", ["timeout", "http_500"])
-def test_build_survives_each_source_failing_individually(
-    tmp_path, monkeypatch, broken, mode
-):
-    """Break one source at a time; the build must still produce a full site.
-
-    This is the project's core promise, checked for every source against
-    multiple failure modes.
-    """
-    mapping = {**ALL_SOURCES_OK, broken: FAILURE_MODES[mode]}
-    monkeypatch.setattr("urllib.request.urlopen", responder(mapping))
-
-    run_build(
-        cache_dir=tmp_path / "cache",
-        build_dir=tmp_path / "dist",
-        web_dir=tmp_path / "nonexistent-web",
-        observer=OBSERVER,
-    )
-
-    health = assert_site_is_complete(tmp_path / "dist")
-
-    # The failure is reported, not hidden.
-    assert health["overall"] in ("stale", "failed")
-    assert health["counts"]["failed"] >= 1
-    failed = [s for s in health["sources"] if s["state"] == "failed"]
-    assert failed, "a source failed but nothing was reported as failed"
-    assert all(s["error"] for s in failed), "a failed source must explain why"
-
-
-def test_build_survives_total_upstream_blackout(tmp_path, monkeypatch):
-    """Every single source down, cold cache. The site must still render.
-
-    The worst realistic case: no network at all on a fresh clone. We expect a
-    valid site, empty data panels, and a health block that says everything is
-    failed rather than pretending otherwise.
-    """
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        responder({}, default=urllib.error.URLError("network is unreachable")),
-    )
-
-    meta = run_build(
-        cache_dir=tmp_path / "cache",
-        build_dir=tmp_path / "dist",
-        web_dir=tmp_path / "nonexistent-web",
-        observer=OBSERVER,
-    )
-
-    health = assert_site_is_complete(tmp_path / "dist")
-
-    assert health["overall"] == "failed"
-    assert health["counts"]["fresh"] == 0
-    assert health["counts"]["failed"] == len(health["sources"])
-    assert meta["counts"]["tracked_satellites"] == 0
-    assert meta["counts"]["above_horizon"] == 0
-
-    # Panels are empty but structurally valid, so the frontend has something
-    # coherent to render rather than undefined.
-    sky = json.loads((tmp_path / "dist" / DATA_SUBDIR / "sky.json").read_text())
-    passes = json.loads((tmp_path / "dist" / DATA_SUBDIR / "passes.json").read_text())
-    weather = json.loads(
-        (tmp_path / "dist" / DATA_SUBDIR / "space_weather.json").read_text()
-    )
-    assert sky["satellites"] == []
-    assert passes["passes"] == []
-    assert weather["weather"]["available"] is False
-    assert weather["correlation"]["severity"] == "unknown"
-
-
-def test_build_serves_cached_data_when_upstream_dies(
-    tmp_path, seeded_cache, celestrak_snapshot
-):
-    """With a warm cache and a dead network, we still publish real numbers.
-
-    This is the normal degraded state in production: the scheduled job runs,
-    upstream is down, and the site keeps showing yesterday's element sets
-    while clearly labelling them as stale.
-    """
-    import urllib.request
-
-    def _dead(request, timeout=None):
-        raise urllib.error.URLError("connection refused")
-
-    original = urllib.request.urlopen
-    urllib.request.urlopen = _dead
-    try:
-        meta = run_build(
-            cache_dir=seeded_cache,
-            build_dir=tmp_path / "dist",
-            web_dir=tmp_path / "nonexistent-web",
-            observer=OBSERVER,
-        )
-    finally:
-        urllib.request.urlopen = original
-
-    health = assert_site_is_complete(tmp_path / "dist")
-
-    # Real satellites came out of the cache.
-    assert meta["counts"]["tracked_satellites"] > 0
-    # But nothing claims to be fresh -- we could not reach anyone.
-    # Celestrak is snapshot-only now, so only the SWPC sources exercise the
-    # cache-fallback path. That is the point of the change: a dead network can
-    # no longer touch the element sets at all.
-    swpc = [s for s in health["sources"] if s["name"].startswith("swpc_")]
-    assert swpc, "expected SWPC sources in the health report"
-    assert all(s["outcome"] == "cache_fallback" for s in swpc)
-    assert all("unreachable" in s["detail"].lower() for s in swpc)
-    assert all(s["state"] != "fresh" for s in swpc)
-    assert health["overall"] in ("stale", "failed")
-
-
-def test_build_completes_when_everything_is_healthy(
-    tmp_path, monkeypatch, celestrak_snapshot
-):
-    """The happy path still works -- degradation handling has not broken it."""
-    monkeypatch.setattr("urllib.request.urlopen", responder(ALL_SOURCES_OK))
-
-    meta = run_build(
-        cache_dir=tmp_path / "cache",
-        build_dir=tmp_path / "dist",
-        web_dir=tmp_path / "nonexistent-web",
-        observer=OBSERVER,
-    )
-
-    health = assert_site_is_complete(tmp_path / "dist")
-
-    assert health["overall"] == "fresh"
-    assert health["counts"]["failed"] == 0
-    assert meta["counts"]["tracked_satellites"] > 0
-    assert meta["schema_version"] >= 1
-    assert meta["observer"]["name"] == "Test Site"
-
-
-def test_build_copies_the_frontend_into_the_output(tmp_path, monkeypatch):
-    monkeypatch.setattr("urllib.request.urlopen", responder(ALL_SOURCES_OK))
-    web = tmp_path / "web"
-    (web / "assets").mkdir(parents=True)
-    (web / "index.html").write_text("<h1>Orbital Watch</h1>")
-    (web / "assets" / "app.js").write_text("// app")
-
-    run_build(
-        cache_dir=tmp_path / "cache",
-        build_dir=tmp_path / "dist",
-        web_dir=web,
-        observer=OBSERVER,
-    )
-
-    assert (tmp_path / "dist" / "index.html").read_text() == "<h1>Orbital Watch</h1>"
-    assert (tmp_path / "dist" / "assets" / "app.js").exists()
-    assert (tmp_path / "dist" / DATA_SUBDIR / "meta.json").exists()
-
-
-# --------------------------------------------------------------------------
-# Misc
+# Small things the panel prints
 # --------------------------------------------------------------------------
 
 
@@ -678,357 +958,6 @@ def test_duration_formatting(delta, expected):
 
 def test_staleness_policy_is_explicit_not_magic():
     """Thresholds must be declared constants the panel can publish."""
-    from orbital_watch.config import SPACE_WEATHER_STALENESS, TLE_STALENESS
-
     for policy in (TLE_STALENESS, SPACE_WEATHER_STALENESS):
         assert isinstance(policy, StalenessPolicy)
         assert policy.fresh_within < policy.stale_within
-
-
-# --------------------------------------------------------------------------
-# Regressions: paths that used to abort the build
-# --------------------------------------------------------------------------
-#
-# Each of these was a real crash found by auditing the resilience contract.
-# They share a shape: the code that was supposed to *absorb* bad data was
-# itself unsafe against bad data, so a degraded input became a dead build --
-# the exact inversion of what this project claims.
-
-
-@pytest.mark.parametrize(
-    "poison",
-    [
-        {"error": "oops"},  # dict where a list was expected
-        ["not-a-record"],  # list of scalars
-        [None],
-        [42],
-        "a bare string",
-        123,
-    ],
-)
-def test_build_survives_a_cache_holding_the_wrong_shape(tmp_path, monkeypatch, poison):
-    """A cache written by an older revision must not take the build down.
-
-    CI restores the previous run's cache by key prefix, so a payload written
-    by older code is routinely loaded by newer code. If the shape has changed
-    since, that must degrade to "no data", never to a crash.
-    """
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    stamp = json.dumps({"retrieved_at": datetime.now(UTC).isoformat()})
-    for name in (
-        "celestrak_stations",
-        "celestrak_weather",
-        "celestrak_starlink",
-        "swpc_kp",
-        "swpc_solar_wind",
-        "swpc_mag_field",
-        "swpc_solar_cycle",
-    ):
-        (cache_dir / f"{name}.json").write_text(json.dumps(poison))
-        (cache_dir / f"{name}.json.meta").write_text(stamp)
-
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        responder({}, default=urllib.error.URLError("offline")),
-    )
-
-    run_build(
-        cache_dir=cache_dir,
-        build_dir=tmp_path / "dist",
-        web_dir=tmp_path / "nonexistent-web",
-        observer=OBSERVER,
-    )
-
-    report = assert_site_is_complete(tmp_path / "dist")
-    # With no seed available the wrong-shaped cache degrades all the way to
-    # "no data" -- the point is that it does so without crashing.
-    assert report["overall"] == "failed"
-    assert report["counts"]["fresh"] == 0
-
-
-def test_build_survives_upstream_serving_the_wrong_shape(tmp_path, monkeypatch):
-    """Same guarantee when the garbage arrives live rather than from cache."""
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        responder({}, default={"totally": "unexpected"}),
-    )
-
-    run_build(
-        cache_dir=tmp_path / "cache",
-        build_dir=tmp_path / "dist",
-        web_dir=tmp_path / "nonexistent-web",
-        observer=OBSERVER,
-    )
-
-    assert_site_is_complete(tmp_path / "dist")
-
-
-def test_naive_timestamp_in_cache_metadata_does_not_raise(tmp_path, monkeypatch):
-    """A tz-naive meta timestamp used to raise TypeError out of fetch_json.
-
-    It happened on a path outside the main try block, so it escaped a function
-    whose entire contract is that it never raises.
-    """
-    monkeypatch.setattr("urllib.request.urlopen", responder({"gp.php": [{"a": 1}]}))
-    fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
-
-    # Naive: no timezone offset at all.
-    (tmp_path / "gp.json.meta").write_text(
-        json.dumps({"retrieved_at": "2026-08-06T12:00:00"})
-    )
-
-    result = fetch_json(
-        "gp",
-        "https://celestrak.org/gp.php",
-        tmp_path,
-        min_refetch_interval=timedelta(hours=6),
-    )
-    assert result.ok
-    assert result.last_success is not None
-    assert result.last_success.tzinfo is not None
-
-
-def test_timeout_error_reports_the_timeout_actually_used(tmp_path, monkeypatch):
-    """The health panel publishes this string, so it must not quote a default."""
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"x.json": TimeoutError("slow")})
-    )
-
-    result = fetch_json("x", "https://example.invalid/x.json", tmp_path, timeout=3.0)
-
-    assert result.error == "Timed out after 3s"
-
-
-def test_health_output_carries_notes_and_elapsed(tmp_path, monkeypatch):
-    """Operator-facing notes must reach health.json, not die in the dataclass."""
-    monkeypatch.setattr("urllib.request.urlopen", responder(ALL_SOURCES_OK))
-    run_build(
-        cache_dir=tmp_path / "cache",
-        build_dir=tmp_path / "dist",
-        web_dir=tmp_path / "nonexistent-web",
-        observer=OBSERVER,
-    )
-
-    health = json.loads((tmp_path / "dist" / DATA_SUBDIR / "health.json").read_text())
-    for source in health["sources"]:
-        assert "notes" in source
-        assert isinstance(source["notes"], list)
-        assert source["elapsed_seconds"] is not None
-
-
-def test_oversized_response_is_rejected_not_buffered(tmp_path, monkeypatch):
-    """A giant body must degrade like any bad payload, not exhaust memory.
-
-    This is the one upstream failure the module cannot otherwise survive: an
-    OOM kill terminates the process before any handler runs, so the cache
-    fallback never happens and the build dies. Capping the read turns it into
-    an ordinary rejected payload.
-    """
-    from orbital_watch.sources import fetch as fetch_module
-
-    monkeypatch.setattr(fetch_module, "MAX_RESPONSE_BYTES", 1024)
-    monkeypatch.setattr("urllib.request.urlopen", responder({"big.json": b"x" * 4096}))
-
-    result = fetch_json("big", "https://example.invalid/big.json", tmp_path)
-
-    assert result.outcome is Outcome.FAILED
-    assert "exceeded" in result.error
-
-
-def test_oversized_response_falls_back_to_cache(tmp_path, monkeypatch):
-    """And with a warm cache it degrades to cached data rather than nothing."""
-    from orbital_watch.sources import fetch as fetch_module
-
-    monkeypatch.setattr("urllib.request.urlopen", responder({"big.json": {"good": True}}))
-    fetch_json("big", "https://example.invalid/big.json", tmp_path)
-
-    monkeypatch.setattr(fetch_module, "MAX_RESPONSE_BYTES", 16)
-    monkeypatch.setattr("urllib.request.urlopen", responder({"big.json": b"y" * 4096}))
-    result = fetch_json("big", "https://example.invalid/big.json", tmp_path)
-
-    assert result.outcome is Outcome.CACHE_FALLBACK
-    assert result.data == {"good": True}
-    # And the oversized body did not overwrite the good cache.
-    assert json.loads((tmp_path / "big.json").read_text()) == {"good": True}
-
-
-# --------------------------------------------------------------------------
-# Seed snapshot: the last resort when there is no cache at all
-# --------------------------------------------------------------------------
-
-
-def test_seed_carries_a_cold_build_with_no_network(tmp_path, monkeypatch, real_seed_dir):
-    """Cold cache plus dead upstream must still yield a populated site.
-
-    This is the Cloudflare Pages case: build containers are ephemeral, so
-    every deploy starts with an empty cache. Without a seed, one upstream
-    hiccup during a deploy publishes an empty dashboard.
-
-    The clock is pinned to the seed's own capture time rather than left at
-    wall-clock ``now``. Age is evaluated before outcome in
-    ``health.classify``, so once the committed snapshot ages past a source's
-    freshness window it is reported STALE *for being old* and the seed-specific
-    wording never appears. Against a live clock this test would therefore pass
-    only for the few hours after each seed refresh and fail permanently
-    afterwards -- a failure about the age of a checked-in fixture, not about
-    the behaviour under test. Deriving the instant from the manifest keeps the
-    assertion pointed at the seed path and survives every future re-seed.
-    """
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        responder({}, default=urllib.error.URLError("offline")),
-    )
-
-    manifest = json.loads((real_seed_dir / "manifest.json").read_text())
-    # Pin to the newest *SWPC* capture: those are the entries exercising the
-    # seed path here (Celestrak reads the snapshot by design, not as a
-    # fallback). The refresher updates the Celestrak entries independently, so
-    # taking the max across all sources would pick a Celestrak time hours
-    # after the SWPC captures -- putting the SWPC seeds past their 3h window
-    # at the pinned instant, firing the age wording instead of the seed
-    # wording, and failing this test for reasons unrelated to what it tests.
-    newest_capture = max(
-        datetime.fromisoformat(entry["retrieved_at"])
-        for name, entry in manifest["sources"].items()
-        if name.startswith("swpc_")
-    )
-
-    meta = run_build(
-        cache_dir=tmp_path / "cache",
-        build_dir=tmp_path / "dist",
-        web_dir=tmp_path / "nonexistent-web",
-        observer=OBSERVER,
-        now=newest_capture + timedelta(seconds=1),
-    )
-
-    health = assert_site_is_complete(tmp_path / "dist")
-
-    assert meta["counts"]["tracked_satellites"] > 0, "seed did not populate the build"
-    # Celestrak comes from the snapshot by design; SWPC falls back to the seed
-    # because its upstream is unreachable and there is no cache.
-    outcomes = {s["name"]: s["outcome"] for s in health["sources"]}
-    assert all(outcomes[n] == "snapshot" for n in outcomes if n.startswith("celestrak_"))
-    assert all(outcomes[n] == "seed" for n in outcomes if n.startswith("swpc_"))
-    # A seed means we reached nobody, so nothing served from one may be fresh.
-    seeded = [s for s in health["sources"] if s["outcome"] == "seed"]
-    assert seeded
-    assert all(s["state"] != "fresh" for s in seeded)
-    assert all("not live" in s["detail"] for s in seeded)
-
-
-def test_seed_is_never_reported_as_fresh(tmp_path, monkeypatch):
-    """Even a snapshot captured seconds ago is not 'fresh'.
-
-    Freshness means we reached upstream. A seed is served precisely because we
-    could not, so recency of the snapshot is beside the point.
-    """
-    seed_dir = tmp_path / "seed"
-    seed_dir.mkdir()
-    now = datetime.now(UTC)
-    (seed_dir / "demo.json").write_text(json.dumps([{"a": 1}]))
-    (seed_dir / "manifest.json").write_text(
-        json.dumps({"sources": {"demo": {"retrieved_at": now.isoformat()}}})
-    )
-
-    from orbital_watch.sources import fetch as fetch_module
-
-    monkeypatch.setattr(fetch_module, "SEED_DIR", seed_dir)
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({}, default=TimeoutError("gone"))
-    )
-
-    result = fetch_json("demo", "https://example.invalid/demo.json", tmp_path / "c")
-    assert result.outcome is Outcome.SEED
-    assert result.ok
-
-    report = health.evaluate(result, TLE_STALENESS, label="Demo")
-    assert report.state is not health.State.FRESH
-    assert report.state is health.State.STALE
-
-
-def test_cache_is_preferred_over_seed(tmp_path, monkeypatch):
-    """A real cached payload always beats the committed snapshot."""
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({"gp.php": [{"OBJECT_NAME": "CACHED"}]})
-    )
-    fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
-
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({}, default=TimeoutError("gone"))
-    )
-    result = fetch_json("gp", "https://celestrak.org/gp.php", tmp_path)
-
-    assert result.outcome is Outcome.CACHE_FALLBACK
-    assert result.data == [{"OBJECT_NAME": "CACHED"}]
-
-
-def test_seed_with_a_stale_shape_is_rejected(tmp_path, monkeypatch):
-    """A snapshot whose shape predates the current parser is not usable."""
-    seed_dir = tmp_path / "seed"
-    seed_dir.mkdir()
-    (seed_dir / "demo.json").write_text(json.dumps({"old": "shape"}))
-
-    from orbital_watch.sources import fetch as fetch_module
-
-    monkeypatch.setattr(fetch_module, "SEED_DIR", seed_dir)
-    monkeypatch.setattr(
-        "urllib.request.urlopen", responder({}, default=TimeoutError("gone"))
-    )
-
-    def _needs_a_list(data):
-        if not isinstance(data, list):
-            raise ValueError("expected a list")
-        return data
-
-    result = fetch_json(
-        "demo", "https://example.invalid/demo.json", tmp_path / "c", parser=_needs_a_list
-    )
-    assert result.outcome is Outcome.FAILED
-
-
-def test_failed_build_leaves_previous_output_untouched(
-    tmp_path, monkeypatch, celestrak_snapshot
-):
-    """A build that dies mid-write must not destroy the published site.
-
-    Output is assembled in a staging directory and swapped in only once every
-    required artifact exists. Without that, anything reading build_dir during
-    a build -- an uploader, a local server -- could publish a half-written
-    mixture of this run and the last.
-    """
-    monkeypatch.setattr("urllib.request.urlopen", responder(ALL_SOURCES_OK))
-    build_dir = tmp_path / "dist"
-
-    run_build(
-        cache_dir=tmp_path / "cache",
-        build_dir=build_dir,
-        web_dir=tmp_path / "nonexistent-web",
-        observer=OBSERVER,
-    )
-    original = (build_dir / DATA_SUBDIR / "meta.json").read_text()
-
-    # Make the *second* build die while writing its final artifact.
-    from orbital_watch import build as build_module
-
-    real_write = build_module.write_json
-
-    def _explode_on_health(path, payload):
-        if path.name == "health.json":
-            raise OSError("disk full (simulated)")
-        real_write(path, payload)
-
-    monkeypatch.setattr(build_module, "write_json", _explode_on_health)
-
-    with pytest.raises(OSError):
-        run_build(
-            cache_dir=tmp_path / "cache",
-            build_dir=build_dir,
-            web_dir=tmp_path / "nonexistent-web",
-            observer=OBSERVER,
-        )
-
-    # The first build's output is still complete and untouched.
-    health_payload = assert_site_is_complete(build_dir)
-    assert health_payload["sources"], "previous health.json should still be intact"
-    assert (build_dir / DATA_SUBDIR / "meta.json").read_text() == original

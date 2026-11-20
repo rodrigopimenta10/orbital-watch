@@ -4,20 +4,27 @@ We pull named groups rather than the full catalogue. Celestrak rate-limits
 abusive clients and blocks them outright, so being a well-behaved consumer of
 a free public service is a requirement, not a nicety.
 
-The load-bearing detail is *who* does the pulling. Builds read a committed
-snapshot and never contact Celestrak; one scheduled refresher owns every
-request. See :func:`fetch_group` for why that inversion was necessary.
+How often each group may be asked is not decided here or by the job's
+schedule. It is a property of the source (:func:`group_spec`), and
+:func:`orbital_watch.sources.fetch.fetch_source` enforces it against the
+stored record of the last attempt. The job can run every ten minutes, or be
+started by hand five times in a row, and Celestrak still sees one request per
+group per publication interval.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from pathlib import Path
 from urllib.parse import urlencode
 
-from orbital_watch.config import CELESTRAK_GP_URL, SatelliteGroup
-from orbital_watch.sources.fetch import FetchResult, fetch_json, load_snapshot
+from orbital_watch.config import (
+    CELESTRAK_GP_URL,
+    CELESTRAK_MIN_REFETCH_INTERVAL,
+    CELESTRAK_RETRY_INTERVAL,
+    SatelliteGroup,
+)
+from orbital_watch.sources.fetch import Payload, SourceSpec
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +44,17 @@ REQUIRED_GP_FIELDS = (
     "BSTAR",
 )
 
+#: A newly fetched group must keep at least this fraction of the object count
+#: we already hold, once that count is big enough for the ratio to mean
+#: anything. Guards against a truncated-but-valid response silently replacing
+#: a full group.
+SHRINKAGE_FLOOR = 0.5
+MIN_PLAUSIBLE_RECORDS = 10
+
+
+def source_name(group: SatelliteGroup) -> str:
+    return f"celestrak_{group.key}"
+
 
 def group_url(group_key: str) -> str:
     """Build the GP API URL for a named group."""
@@ -44,12 +62,12 @@ def group_url(group_key: str) -> str:
     return f"{CELESTRAK_GP_URL}?{query}"
 
 
-def _validate_gp_payload(data: object) -> list[dict]:
+def validate_gp_records(data: object) -> list[dict]:
     """Reject anything that isn't a usable list of GP records.
 
-    Raising :class:`ValueError` here routes through the fetch helper's cache
-    fallback, so a garbage upstream response degrades to cached data instead
-    of poisoning the cache.
+    Raising :class:`ValueError` here routes through the fetch helper's
+    fallback, so a garbage upstream response degrades to stored data instead
+    of replacing it.
     """
     if not isinstance(data, list):
         raise ValueError(f"expected a list of GP records, got {type(data).__name__}")
@@ -74,61 +92,12 @@ def _validate_gp_payload(data: object) -> list[dict]:
     return usable
 
 
-def fetch_group(
-    group: SatelliteGroup, cache_dir: Path, *, allow_network: bool = False
-) -> FetchResult:
-    """Load one Celestrak GP group.
-
-    By default this reads the **committed snapshot** and never touches the
-    network. That is a deliberate inversion of the obvious design, and the
-    reason is structural rather than stylistic.
-
-    ``fetch`` refuses to re-request a group whose cache is under
-    the refetch floor old — but Cloudflare Pages build
-    containers are ephemeral, so the cache is cold on *every* production build
-    and that floor never applied where it mattered. The politeness guarantee
-    existed only in local runs. In practice every build hit Celestrak three
-    times, and Celestrak intermittently throttled Cloudflare's egress: in one
-    observed build all three groups timed out at 20s and fell back to the seed,
-    while the build ten minutes later got all three live.
-
-    So a single scheduled job now owns all Celestrak traffic (see
-    :func:`orbital_watch.refresh.refresh_snapshot`), commits what it fetches,
-    and the build reads that. The refetch floor becomes real because one owner
-    enforces it, builds stop depending on a rate-limited third party, and they
-    become reproducible offline. The cost is that element sets are as old as
-    the last snapshot — which the health panel reports, because the snapshot
-    carries its true capture time.
-
-    ``allow_network=True`` is for the refresher itself.
-    """
-    if allow_network:
-        # No min_refetch_interval here. The refresher enforces the floor
-        # itself, against the snapshot's manifest timestamp, which is the only
-        # state that actually persists between runs. Applying the cache-based
-        # floor as well would let a warm local cache silently block a refresh
-        # the refresher had already decided was due -- two mechanisms guarding
-        # the same thing, with the weaker one winning.
-        return fetch_json(
-            name=f"celestrak_{group.key}",
-            url=group_url(group.key),
-            cache_dir=cache_dir,
-            parser=_validate_gp_payload,
-        )
-
-    return load_snapshot(
-        name=f"celestrak_{group.key}",
-        url=group_url(group.key),
-        parser=_validate_gp_payload,
-    )
-
-
 def select_objects(records: list[dict], group: SatelliteGroup) -> list[dict]:
     """Trim a group down to the objects we will actually propagate.
 
-    Starlink ships ~11k objects. Propagating all of them would dominate build
-    time and produce an output file no browser should be asked to parse, for
-    no analytical gain -- the point of the dashboard is representative
+    Starlink ships ~11k objects. Propagating all of them would dominate run
+    time and produce a document no browser should be asked to parse, for no
+    analytical gain -- the point of the dashboard is representative
     visibility, not a catalogue browser (explicitly out of scope, brief §4.2).
 
     We keep the objects with the most recent epochs, since those have the
@@ -155,3 +124,50 @@ def _epoch_sort_key(record: dict) -> datetime:
     except (TypeError, ValueError):
         return datetime.min.replace(tzinfo=UTC)
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _refuse_collapse(new: list[dict], previous: list[dict]) -> None:
+    """Reject a payload that validates but has collapsed in size.
+
+    Two stations where we hold twenty-two is upstream trouble, not a real
+    change: constellations do not lose most of their objects between two
+    publications. Refusing it keeps the stored group, and if the shrinkage is
+    real and persists, the group's age tells the story.
+    """
+    if (
+        len(previous) >= MIN_PLAUSIBLE_RECORDS
+        and len(new) < len(previous) * SHRINKAGE_FLOOR
+    ):
+        raise ValueError(
+            f"group shrank from {len(previous)} to {len(new)} objects, below the "
+            f"{int(SHRINKAGE_FLOOR * 100)}% floor; keeping the stored group"
+        )
+
+
+def group_spec(group: SatelliteGroup) -> SourceSpec:
+    """Describe one GP group to the fetch helper.
+
+    What is kept in the state store is the *trimmed* group -- the objects we
+    propagate -- because the full Starlink group is about 5 MB and would be
+    rewritten every two hours for nothing. The size of the group before
+    trimming is recorded as a fact alongside it, since the page states its own
+    sampling ("60 of 11,205 starlink") and that number is not recoverable from
+    the sixty records kept.
+    """
+
+    def parse(data: object) -> Payload:
+        records = validate_gp_records(data)
+        return Payload(
+            data=select_objects(records, group),
+            facts={"available": len(records)},
+        )
+
+    return SourceSpec(
+        name=source_name(group),
+        url=group_url(group.key),
+        parse=parse,
+        revalidate=validate_gp_records,
+        plausible=_refuse_collapse,
+        min_refetch_interval=CELESTRAK_MIN_REFETCH_INTERVAL,
+        retry_interval=CELESTRAK_RETRY_INTERVAL,
+    )
