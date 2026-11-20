@@ -85,6 +85,11 @@ run "the_published_bucket_answers_only_the_sites_own_origins" {
   }
 
   assert {
+    condition     = contains(google_storage_bucket.public.cors[0].response_header, "Date")
+    error_message = "The page reads the server's Date as a floor under the reader's clock; the bucket must expose it."
+  }
+
+  assert {
     condition     = length(google_storage_bucket.state.cors) == 0
     error_message = "No browser has any business reading the state bucket."
   }

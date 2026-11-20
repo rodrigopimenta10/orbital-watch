@@ -136,7 +136,23 @@
   }
 
   /**
-   * Fetch one URL and resolve to {ok, document, error}. Never rejects.
+   * When the server says it sent a response, in milliseconds, or null.
+   *
+   * Read from the Date header where the browser lets the page see it (the
+   * bucket is configured to expose it). Used only as a *lower bound* on the
+   * true time -- see readerClock -- so a cached response carrying an old
+   * Date makes the bound weaker and never wrong.
+   */
+  function serverTimeOf(response) {
+    var headers = response && response.headers;
+    if (!headers || typeof headers.get !== "function") return null;
+    var parsed = Date.parse(headers.get("Date") || "");
+    return isNumber(parsed) ? parsed : null;
+  }
+
+  /**
+   * Fetch one URL and resolve to {ok, document, error, serverTimeMs}. Never
+   * rejects.
    *
    * `env` carries the browser facilities this needs (fetch, timers,
    * AbortController), so a test can substitute its own.
@@ -166,6 +182,7 @@
 
       var options = { cache: "no-cache" };
       if (controller) options.signal = controller.signal;
+      var serverTimeMs = null;
 
       Promise.resolve()
         .then(function () {
@@ -175,12 +192,13 @@
           if (!response.ok) {
             throw new Error("HTTP " + response.status);
           }
+          serverTimeMs = serverTimeOf(response);
           return response.json();
         })
         .then(function (parsed) {
           var problem = documentProblem(parsed);
           if (problem) throw new Error(problem);
-          settle({ ok: true, document: parsed, error: null });
+          settle({ ok: true, document: parsed, error: null, serverTimeMs: serverTimeMs });
         })
         .catch(function (error) {
           settle({
@@ -214,6 +232,7 @@
           origin: "live",
           liveError: null,
           bakedError: null,
+          serverTimeMs: live.serverTimeMs,
         };
       }
       return fetchDocument(bakedUrl, timeoutMs, env).then(function (baked) {
@@ -223,6 +242,7 @@
           origin: baked.ok ? "baked" : null,
           liveError: live.error,
           bakedError: baked.error,
+          serverTimeMs: baked.ok ? baked.serverTimeMs : null,
         };
       });
     });
@@ -252,6 +272,19 @@
     var offered = loaded.ok ? parseTime(loaded.document.generated_at) : null;
 
     if (loaded.ok && loaded.origin === "live") {
+      // "Live" is not the same as "newest": a cache between the page and the
+      // bucket can answer with a copy older than the one already on screen.
+      // The page keeps the newer one and says the check did not help.
+      if (offered < held) {
+        return {
+          document: current.document,
+          origin: current.origin,
+          changed: false,
+          refreshError: "the copy offered was older than the one already shown",
+          liveError: current.origin === "live" ? null : current.liveError || null,
+          bakedError: null,
+        };
+      }
       return {
         document: loaded.document,
         origin: "live",
@@ -281,6 +314,43 @@
       refreshError: loaded.liveError || "the live document could not be loaded",
       liveError: loaded.liveError,
       bakedError: loaded.bakedError,
+    };
+  }
+
+  // ------------------------------------------------------- what time it is
+  //
+  // Everything below judges age against "now", and the only clock a page has
+  // is the reader's device. If that clock is slow, everything looks younger
+  // than it is: a stale source reads fresh, a silent pipeline is not flagged,
+  // and satellite positions are shown as current after their track has run
+  // out. A page cannot find out the true time, but it can refuse to believe
+  // a time it knows is too early. It knows two things:
+  //
+  //   * It cannot be earlier than the moment the document it is showing was
+  //     generated.
+  //   * It cannot be earlier than the Date a server stamped on a response,
+  //     plus the time that has passed on this device since that response
+  //     arrived (measured on a clock that does not jump).
+  //
+  // "Now" is the latest of the device's clock and those two. A device whose
+  // clock is fast is left alone: it makes things look older, which errs on
+  // the side this page is meant to err on.
+
+  /**
+   * The page's working clock: {now, behindSeconds}.
+   *
+   * `parts` is {deviceMs, documentMs, serverMs}; the last two may be missing.
+   * `behindSeconds` is how far the device's own clock is behind the result,
+   * so the page can say that it is.
+   */
+  function readerClock(parts) {
+    var deviceMs = parts.deviceMs;
+    var best = deviceMs;
+    if (isNumber(parts.documentMs) && parts.documentMs > best) best = parts.documentMs;
+    if (isNumber(parts.serverMs) && parts.serverMs > best) best = parts.serverMs;
+    return {
+      now: new Date(best),
+      behindSeconds: Math.round((best - deviceMs) / 1000),
     };
   }
 
@@ -321,6 +391,7 @@
   // long the page outlives its data.
 
   var KNOWN_STATES = { fresh: true, stale: true, failed: true, unknown: true };
+  var SEVERITY_RANK = { fresh: 0, stale: 1, failed: 2 };
 
   /**
    * A source's state as of `now`.
@@ -353,13 +424,19 @@
     }
 
     var age = (now - t) / 1000;
-    if (age > stale) return "failed";
-    if (age > fresh) return "stale";
+    var recomputed = "fresh";
+    if (age > stale) recomputed = "failed";
+    else if (age > fresh) recomputed = "stale";
     // Inside the freshness window by age -- but if the pipeline could not
     // reach upstream at its last attempt, it is not fresh.
-    if (source.outcome === "cache_fallback") return "stale";
-    if (fallbackCopy) return "stale";
-    return "fresh";
+    else if (source.outcome === "cache_fallback") recomputed = "stale";
+    else if (fallbackCopy) recomputed = "stale";
+
+    // Time only makes a source worse. Whatever the reader's clock says, the
+    // state shown is never better than the one the pipeline published: a
+    // recomputation that comes out better can only mean the clock is wrong.
+    var published = has(SEVERITY_RANK, source.state) ? SEVERITY_RANK[source.state] : 0;
+    return SEVERITY_RANK[recomputed] >= published ? recomputed : source.state;
   }
 
   /* Worst-first. "unknown" outranks "fresh": a source that cannot be
@@ -394,6 +471,35 @@
       worst: worst,
       label: total === 0 ? "unknown" : unanimous ? worst : "degraded",
       detail: total === 0 ? "" : fresh + " of " + total + " sources fresh",
+    };
+  }
+
+  /**
+   * The assessment to show now, given the Kp source's current state.
+   *
+   * The banner is written in the present tense -- "storm in progress". The
+   * pipeline already declines to write one from a Kp value whose source has
+   * failed by age. But a document that was fine when published keeps being
+   * read: once the page's own recomputation puts the Kp source at failed,
+   * the banner is replaced by one that says what the assessment was and that
+   * it can no longer be taken as describing the present.
+   */
+  function assessmentNow(correlation, kpState) {
+    if (!isObject(correlation)) return correlation;
+    if (kpState !== "failed" || correlation.severity === "unknown") return correlation;
+    return {
+      active: false,
+      severity: "unknown",
+      headline: "Geomagnetic assessment no longer current",
+      detail:
+        "When this data was published the assessment read: “" +
+        String(correlation.headline || "") +
+        "”. The Kp value it rests on has since gone past the age limit shown " +
+        "in system health, so it is not presented as a description of " +
+        "conditions now. Treat drag-driven error growth as unquantified.",
+      explanation: correlation.explanation,
+      operational_impacts: [],
+      source: correlation.source,
     };
   }
 
@@ -532,6 +638,8 @@
     fetchDocument: fetchDocument,
     loadDocument: loadDocument,
     adoptLoad: adoptLoad,
+    readerClock: readerClock,
+    assessmentNow: assessmentNow,
     pipelineStatus: pipelineStatus,
     stateNow: stateNow,
     worstState: worstState,

@@ -49,6 +49,43 @@
    * the last check for a newer one worked. */
   var shown = null;
 
+  /* The latest time a server has told us, and when (on a clock that does not
+   * jump) it told us. See Core.readerClock for what it is used for. */
+  var serverClock = null;
+
+  function steadyMs() {
+    return window.performance && typeof window.performance.now === "function"
+      ? window.performance.now()
+      : Date.now();
+  }
+
+  /* The page's working clock. Every "now" on this page comes from here and
+   * never straight from the device: it is the device's clock, but not
+   * earlier than the document on screen or than a server has said it is. */
+  function pageClock() {
+    return Core.readerClock({
+      deviceMs: Date.now(),
+      documentMs: shown && shown.document ? Date.parse(shown.document.generated_at) : null,
+      serverMs: serverClock ? serverClock.atMs + (steadyMs() - serverClock.seenAt) : null,
+    });
+  }
+
+  function clockNow() {
+    return pageClock().now;
+  }
+
+  /* Remember a server's time, but only ever move the floor forward: a cached
+   * response can carry a Date older than one already seen. */
+  function noteServerTime(serverTimeMs) {
+    if (typeof serverTimeMs !== "number" || !isFinite(serverTimeMs)) return;
+    var projected = serverClock
+      ? serverClock.atMs + (steadyMs() - serverClock.seenAt)
+      : -Infinity;
+    if (serverTimeMs > projected) {
+      serverClock = { atMs: serverTimeMs, seenAt: steadyMs() };
+    }
+  }
+
   /* Closures that refresh one piece of volatile content. Registered during
    * render, replayed on every tick. Cleared before a full re-render so they
    * cannot accumulate or point at detached nodes. */
@@ -71,7 +108,7 @@
 
   /** A node whose text is recomputed from the clock on every tick. */
   function live(tag, className, compute) {
-    var node = el(tag, className, compute(new Date()));
+    var node = el(tag, className, compute(clockNow()));
     onTick(function (now) {
       node.textContent = compute(now);
     });
@@ -81,7 +118,7 @@
   /** A holder whose contents are rebuilt from the clock on every tick. */
   function liveNode(tag, className, build) {
     var holder = el(tag, className);
-    holder.appendChild(build(new Date()));
+    holder.appendChild(build(clockNow()));
     onTick(function (now) {
       clear(holder);
       holder.appendChild(build(now));
@@ -208,6 +245,20 @@
 
   // ------------------------------------------------- which copy, and how old
 
+  /* Said only when it matters: ages on this page are worked out from a clock,
+   * and if the device's is clearly behind, the reader should know that the
+   * page is not using it as it stands. */
+  function clockNote() {
+    var behind = pageClock().behindSeconds;
+    if (behind < 60) return "";
+    return (
+      " This device's clock appears to be at least " +
+      humanDuration(behind) +
+      " slow; times here are worked out from the later of it, the document, " +
+      "and the server's own clock."
+    );
+  }
+
   /** One sentence saying which copy of the document is on screen. */
   function sourceLine(now) {
     if (!shown || !shown.document) return "";
@@ -223,10 +274,12 @@
         age +
         "). The live document could not be loaded (" +
         (shown.liveError || "unknown error") +
-        "), so nothing below is reported as fresh."
+        "), so nothing below is reported as fresh." +
+        clockNote()
       );
     }
     var text = "Showing the live document, published " + stamp + " UTC (" + age + ").";
+    text += clockNote();
     if (shown.refreshError) {
       text +=
         " The last check for a newer one failed (" +
@@ -291,9 +344,9 @@
 
   // ----------------------------------------------------------- correlation
 
-  function renderCorrelation(container, payload) {
+  function renderCorrelation(container, payload, kpState) {
     clear(container);
-    var c = payload.correlation;
+    var c = Core.assessmentNow(payload.correlation, kpState);
     if (!c) {
       showError(
         container,
@@ -776,7 +829,7 @@
     }
 
     container.appendChild(holder);
-    update(new Date());
+    update(clockNow());
     onTick(update);
 
     container.appendChild(caption);
@@ -1161,7 +1214,7 @@
   function render() {
     var doc = shown.document;
     var meta = doc.meta || {};
-    var now = new Date();
+    var now = clockNow();
 
     // Anything registered by a previous render points at DOM that is about to
     // be replaced. Drop it so closures cannot accumulate across renders.
@@ -1211,9 +1264,28 @@
       })
     );
 
+    // The assessment speaks about the present, so it is only shown as
+    // written while the Kp source behind it is still current. That can
+    // change while the page is open; when it does, the banner is redrawn.
     var correlationEl = byId("correlation");
+    var kpSource = (healthSources || []).filter(function (source) {
+      var named = (doc.space_weather.correlation || {}).source || "swpc_kp";
+      return source && source.name === named;
+    })[0];
+    function kpStateAt(t) {
+      return kpSource ? stateNow(kpSource, t) : null;
+    }
+    var drawnFor = kpStateAt(now);
     guard(correlationEl, "Operational assessment", function () {
-      renderCorrelation(correlationEl, doc.space_weather);
+      renderCorrelation(correlationEl, doc.space_weather, drawnFor);
+    });
+    onTick(function (t) {
+      var state = kpStateAt(t);
+      if ((state === "failed") === (drawnFor === "failed")) return;
+      drawnFor = state;
+      keepingReaderState(function () {
+        renderCorrelation(correlationEl, doc.space_weather, state);
+      });
     });
     var tilesEl = byId("weather-tiles");
     guard(tilesEl, "Space weather", function () {
@@ -1302,6 +1374,7 @@
       AbortController: window.AbortController,
     })
       .then(function (loaded) {
+        noteServerTime(loaded.serverTimeMs);
         var next = Core.adoptLoad(shown, loaded);
         if (!next.document) {
           shown = null;
@@ -1313,7 +1386,7 @@
         if (first) render();
         else if (next.changed) keepingReaderState(render);
         // Unchanged: the tick below picks up any change to refreshError.
-        runTicks(new Date());
+        runTicks(clockNow());
       })
       .catch(function (error) {
         // Last line of defence. Nothing above should reject, but a blank page
@@ -1338,13 +1411,13 @@
     window.setInterval(refresh, POLL_MS);
     // Refresh only the volatile parts. See RETICK_MS for why not everything.
     window.setInterval(function () {
-      runTicks(new Date());
+      runTicks(clockNow());
     }, RETICK_MS);
     // A tab that was in the background has been throttled; catch up at once
     // instead of showing minutes-old positions until the next tick.
     document.addEventListener("visibilitychange", function () {
       if (!document.hidden) {
-        runTicks(new Date());
+        runTicks(clockNow());
         refresh();
       }
     });

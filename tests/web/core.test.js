@@ -39,10 +39,11 @@ function documentAt(generatedAt, extra = {}) {
 
 // ------------------------------------------------------------- fake browser
 
-function jsonResponse(body, status = 200) {
+function jsonResponse(body, status = 200, headers = {}) {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: { get: (name) => (name in headers ? headers[name] : null) },
     json: async () => {
       if (body instanceof Error) throw body;
       return body;
@@ -586,4 +587,116 @@ test("the page's idea of the document matches the pipeline's", () => {
   // Pinned to the Python side by tests/test_repo_conventions.py.
   assert.equal(Core.SCHEMA_VERSION, 2);
   assert.equal(Core.DOCUMENT_KIND, "orbital-watch.latest");
+});
+
+// ------------------------------- review findings before the first deploy
+//
+// Each test below first reproduced a defect found by an independent review
+// (DECISIONS.md §30) and now pins its fix.
+
+test("a live poll that returns an older document does not move the page backwards", () => {
+  // A cache between the page and the bucket can answer with a copy older
+  // than the one already on screen.
+  const held = documentAt(minutesAgo(2));
+  const current = { document: held, origin: "live" };
+  const older = documentAt(minutesAgo(12));
+
+  const next = Core.adoptLoad(current, { ok: true, document: older, origin: "live" });
+
+  assert.equal(next.document, held);
+  assert.equal(next.changed, false);
+  assert.equal(next.origin, "live");
+  assert.match(next.refreshError, /older/);
+});
+
+test("a state is never reported better than the pipeline published it", () => {
+  // The reader's clock is an hour slow, so everything looks an hour younger.
+  const slow = new Date(NOW.getTime() - 3600000);
+  const publishedStale = source({ state: "stale", outcome: "live", last_success: minutesAgo(45) });
+  const publishedFailed = source({ state: "failed", outcome: "live", last_success: minutesAgo(200) });
+
+  assert.equal(Core.stateNow(publishedStale, slow), "stale");
+  assert.equal(Core.stateNow(publishedFailed, slow), "failed");
+  // It can still get worse with time, as before.
+  assert.equal(Core.stateNow(publishedStale, new Date(NOW.getTime() + 4 * 3600000)), "failed");
+  // And an unrecognised published state does not make anything better either.
+  assert.equal(Core.stateNow(source({ state: "great" }), NOW), "fresh");
+});
+
+test("the page's clock is never earlier than the document it is showing", () => {
+  const doc = documentAt(minutesAgo(5));
+  const slowDevice = NOW.getTime() - 3600000;
+
+  const clock = Core.readerClock({ deviceMs: slowDevice, documentMs: Date.parse(doc.generated_at), serverMs: null });
+
+  assert.equal(+clock.now, Date.parse(doc.generated_at));
+  assert.equal(clock.behindSeconds, 55 * 60);
+});
+
+test("a server's Date header keeps a slow device clock from hiding a silent pipeline", () => {
+  // The device is an hour slow and the document is two hours old. By the
+  // device's clock it is one hour old; by the document alone, zero. Only a
+  // time from outside the device shows how old it really is.
+  const doc = documentAt(minutesAgo(120));
+  const slowDevice = NOW.getTime() - 3600000;
+
+  const deviceOnly = Core.readerClock({ deviceMs: slowDevice, documentMs: Date.parse(doc.generated_at), serverMs: null });
+  const withServer = Core.readerClock({ deviceMs: slowDevice, documentMs: Date.parse(doc.generated_at), serverMs: NOW.getTime() });
+
+  assert.equal(Core.pipelineStatus(doc, deviceOnly.now).ageSeconds, 3600);
+  assert.equal(Core.pipelineStatus(doc, withServer.now).ageSeconds, 7200);
+  assert.equal(withServer.behindSeconds, 3600);
+
+  // And positions are withheld once the track has really run out, although
+  // the device still believes it is inside the window.
+  const sky = { ephemeris: { start: minutesAgo(70), step_seconds: 30, samples: 61 }, satellites: [] };
+  assert.equal(Core.skyAt(sky, new Date(slowDevice)).status, "current", "the defect: believed current");
+  assert.equal(Core.skyAt(sky, withServer.now).status, "expired");
+});
+
+test("a device clock that is ahead is left alone, and nonsense inputs are ignored", () => {
+  const fast = Core.readerClock({ deviceMs: NOW.getTime() + 600000, documentMs: NOW.getTime(), serverMs: NOW.getTime() });
+  assert.equal(+fast.now, NOW.getTime() + 600000);
+  assert.equal(fast.behindSeconds, 0);
+
+  const sparse = Core.readerClock({ deviceMs: NOW.getTime(), documentMs: NaN, serverMs: undefined });
+  assert.equal(+sparse.now, NOW.getTime());
+});
+
+test("loading reports the server's time when the response carries one", async () => {
+  const stamp = "Thu, 06 Aug 2026 15:00:00 GMT";
+  const withDate = fakeBrowser({ [LIVE]: jsonResponse(documentAt(minutesAgo(3)), 200, { Date: stamp }) });
+  const without = fakeBrowser({ [LIVE]: jsonResponse(documentAt(minutesAgo(3))) });
+  const garbled = fakeBrowser({ [LIVE]: jsonResponse(documentAt(minutesAgo(3)), 200, { Date: "yesterday-ish" }) });
+
+  assert.equal((await Core.loadDocument(CONFIG, withDate.env)).serverTimeMs, Date.parse(stamp));
+  assert.equal((await Core.loadDocument(CONFIG, without.env)).serverTimeMs, null);
+  assert.equal((await Core.loadDocument(CONFIG, garbled.env)).serverTimeMs, null);
+});
+
+test("the assessment is withdrawn once the Kp behind it is no longer current", () => {
+  const storm = {
+    severity: "storm",
+    active: true,
+    headline: "Geomagnetic storm in progress — Kp 7.67",
+    detail: "Kp is 7.67.",
+    explanation: "Why it matters.",
+    operational_impacts: ["Increased tracking error."],
+    source: "swpc_kp",
+  };
+
+  for (const state of ["fresh", "stale"]) {
+    assert.equal(Core.assessmentNow(storm, state), storm, `a ${state} Kp still describes now`);
+  }
+  const withdrawn = Core.assessmentNow(storm, "failed");
+  assert.equal(withdrawn.severity, "unknown");
+  assert.equal(withdrawn.active, false);
+  assert.deepEqual(withdrawn.operational_impacts, []);
+  assert.doesNotMatch(withdrawn.headline, /in progress/);
+  assert.match(withdrawn.detail, /Geomagnetic storm in progress — Kp 7.67/);
+  assert.equal(withdrawn.explanation, storm.explanation);
+
+  // Nothing to withdraw when no assessment was being made.
+  const none = { severity: "unknown", headline: "Space weather unavailable" };
+  assert.equal(Core.assessmentNow(none, "failed"), none);
 });

@@ -71,10 +71,14 @@ resource "google_storage_bucket" "public" {
   # The page is on another origin (Firebase Hosting), so the browser will only hand it the
   # document if the bucket says that origin may read it. GET and HEAD, from the site's own
   # addresses and a developer's localhost, and nothing else.
+  #
+  # "Date" is in the list of headers the page may read for a reason: the page uses the server's
+  # own time as a floor under the reader's clock, so that a device whose clock is slow cannot
+  # make old data look current. A browser hides that header from another origin unless told not to.
   cors {
     origin          = local.site_origins
     method          = ["GET", "HEAD"]
-    response_header = ["Content-Type", "Cache-Control", "ETag", "Last-Modified"]
+    response_header = ["Content-Type", "Cache-Control", "Date", "ETag", "Last-Modified"]
     max_age_seconds = 3600
   }
 
