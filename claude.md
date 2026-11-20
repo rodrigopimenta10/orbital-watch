@@ -523,3 +523,67 @@ isolation, and the bug lives only in their interaction.
 
 Record it in `DECISIONS.md` as the fourth production bug, with the reasoning that a
 correct component plus a correct component can still compose into an incorrect system.
+
+---
+
+# 12. The "no runtime backend" constraint is replaced — owner's decision, 2026-11-20
+
+**Read this before acting on §2, §5, §6.4, §10 or §11.** Those sections
+describe the first delivery architecture and are kept as the record of how the
+project got here. Where they conflict with this section, this section wins.
+
+On 2026-11-20 the owner replaced two constraints from §2:
+
+| §2 said | Now |
+|---|---|
+| Hosting target: static files on GitHub Pages, Netlify or Cloudflare Pages, "with no backend server" | The page is static files on **Firebase Hosting**. The data it reads is produced by a **scheduled container** on Google Cloud and published to a storage bucket |
+| "There is no runtime backend... Do not add a live proxy or serverless function" | There is a scheduled job. There is still **nothing that serves requests**: a visitor's request is answered by a CDN or a bucket and never causes code to run or an upstream to be called. Do not add a live proxy or a request handler |
+
+**Why.** The site was found serving 15-hour-old element sets against an
+8-hour freshness window because the design depended, for the second time, on
+the punctuality of a scheduler that gives no such guarantee (§10.1, §11, and
+`DECISIONS.md` §19). The underlying flaws were structural: no persistent
+state, so "state" was commits to git; refreshing data meant rebuilding and
+redeploying the site against a build cap; three schedulers on two platforms
+had to line up.
+
+**What the design is now** (`DECISIONS.md` §19–§29, `README.md`,
+`infra/README.md`):
+
+- One Cloud Run job, `orbital-watch-refresh`, started by Cloud Scheduler
+  every 10 minutes. Entry point: `python -m orbital_watch.job`.
+- State in a private Cloud Storage bucket, behind `store.py`, written with
+  generation preconditions. A local directory stands in for it in tests, CI
+  and local development; no cloud account is needed to run anything.
+- Per-source cadence enforced against stored state: NOAA SWPC every run,
+  each Celestrak group at most once per 2 hours.
+- One published document, `latest.json`, validated before it is written.
+- The sky view is interpolated in the browser along a published track; no
+  orbital mechanics in the browser.
+- The page loads the live document, falls back to a copy baked in at deploy,
+  says which it is showing, and reports a silent pipeline from its own clock.
+- Cloud Monitoring alerts on a failed run, on no successful run for 30
+  minutes, and on content checks of the document and the site.
+- Terraform in `infra/`. Applied by hand, never from a workflow.
+
+**What did not change, and must not:**
+
+- Every honesty rule. A fallback never claims freshness; lost contact is
+  stale even with good numbers; undated data is not fresh; a malformed
+  response never replaces good stored data. These are now also checked on
+  the finished document before it is published.
+- One never-raising function for all upstream I/O.
+- No secrets, no API keys, no paid data sources, no login.
+- `uv`, `ruff`, `pytest`; no test makes a network call.
+- No new panels or sources (§4.2, §10.5).
+
+**Superseded outright:** the repo structure in §5 (`build.py`,
+`update-data.yml`); the deploy instructions in §6.4; the work items in §10.1
+to §10.3 (the Worker, the build budget, the committed snapshot); the fix in
+§11. The §8 definition of done reads, for "build", "a run of the job", and
+for `python -m orbital_watch.build`, `python -m orbital_watch.job`.
+
+**If asked to change scheduling, state or delivery again:** there is one
+schedule (Cloud Scheduler) and it must stay one. Do not add a cron to this
+repository; a test fails if a scheduled workflow appears. Do not move state
+back into git.

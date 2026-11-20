@@ -1,9 +1,9 @@
 """Configuration for Orbital Watch.
 
-Every tunable lives here as a named constant. Staleness thresholds in
-particular are deliberately explicit -- the health panel reports them to the
-user, so they must be inspectable values rather than magic numbers buried in
-logic.
+Every tunable lives here as a named constant. The health thresholds in
+particular are derived from stated facts -- how often the job runs and how
+often each upstream publishes -- and are shown to the reader in the health
+panel, so they must be inspectable values rather than numbers buried in logic.
 """
 
 from __future__ import annotations
@@ -15,34 +15,39 @@ from datetime import timedelta
 from pathlib import Path
 
 # --------------------------------------------------------------------------
-# Paths
+# Paths (local runs only; the deployed job keeps everything in Cloud Storage)
 # --------------------------------------------------------------------------
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parent.parent
 
-#: Disk cache for upstream responses. Machine-local and ephemeral in every
-#: CI/build environment this project uses -- which is exactly why the
-#: committed seed/ snapshot exists as the durable fallback, and why the
-#: snapshot refresher pre-warms this cache from seed/ before fetching.
-CACHE_DIR = Path(os.environ.get("ORBITAL_WATCH_CACHE", REPO_ROOT / ".cache"))
-
-#: Frontend source. Copied verbatim into the build output.
+#: Frontend source. Copied verbatim into the site output.
 WEB_DIR = REPO_ROOT / "web"
 
-#: Build output. Static files + generated JSON; this is what gets deployed.
+#: Site output for a local run: the frontend plus a baked copy of the document.
+#: This is also what the deploy workflow uploads to Firebase Hosting.
 BUILD_DIR = Path(os.environ.get("ORBITAL_WATCH_BUILD", REPO_ROOT / "dist"))
 
-#: Committed last-resort snapshot, used when there is no cache AND upstream
-#: is unreachable. Build environments without persistent disk (Cloudflare
-#: Pages containers are ephemeral) start cold every time, so without this a
-#: single upstream hiccup during a deploy would publish an empty site.
-#: Its manifest records each snapshot's true capture time, so the health
-#: panel ages it honestly rather than presenting it as current.
-SEED_DIR = Path(os.environ.get("ORBITAL_WATCH_SEED", REPO_ROOT / "seed"))
+#: Where a local run keeps what the deployed job keeps in its two buckets:
+#: ``state/`` for per-source state and ``public/`` for the published document.
+LOCAL_DIR = Path(os.environ.get("ORBITAL_WATCH_LOCAL", REPO_ROOT / ".local"))
 
-#: Generated JSON lands here, under the build dir.
-DATA_SUBDIR = "data"
+#: Environment variables that switch the job to Cloud Storage. Both or neither.
+STATE_BUCKET_ENV = "ORBITAL_WATCH_STATE_BUCKET"
+PUBLIC_BUCKET_ENV = "ORBITAL_WATCH_PUBLIC_BUCKET"
+
+#: Set by the container image build to the commit it was built from, so the
+#: published document says which code produced it.
+REVISION_ENV = "ORBITAL_WATCH_REVISION"
+
+#: Object name of the one document the job publishes.
+DOCUMENT_KEY = "latest.json"
+
+#: Where the site keeps the copy of the document baked in at deploy time.
+BAKED_DOCUMENT_PATH = "data/latest.json"
+
+#: Where a local site build puts its stand-in for the public bucket.
+LOCAL_LIVE_DOCUMENT_PATH = "live/latest.json"
 
 
 # --------------------------------------------------------------------------
@@ -64,7 +69,7 @@ def _env_float(name: str, default: float, *, low: float, high: float) -> float:
     """Read a float from the environment, falling back loudly on bad input.
 
     This runs at import time, before logging is configured, so a bare
-    ``float()`` here would abort the build with an unexplained ValueError
+    ``float()`` here would abort the run with an unexplained ValueError
     traceback -- a mistyped coordinate should not look like a crash. Out-of-
     range values are rejected too: a longitude of 771528 (a missed decimal
     point) would otherwise silently produce a site on the wrong side of the
@@ -92,7 +97,7 @@ def _env_float(name: str, default: float, *, low: float, high: float) -> float:
     return value
 
 
-#: Default observer. Overridable via environment so the same build can be
+#: Default observer. Overridable via environment so the same job can be
 #: pointed at a different ground station without a code change.
 DEFAULT_OBSERVER = Observer(
     name=os.environ.get("ORBITAL_WATCH_SITE_NAME", "Rockville, MD"),
@@ -103,62 +108,117 @@ DEFAULT_OBSERVER = Observer(
 
 
 # --------------------------------------------------------------------------
+# The pipeline's own schedule
+# --------------------------------------------------------------------------
+
+#: Name of the environment variable through which the deployment tells the job
+#: how often it is started. Terraform sets the Cloud Scheduler cron and this
+#: variable from the same value (``refresh_cadence_minutes``), so the cadence
+#: the code reasons about is the cadence it is actually run at.
+CADENCE_ENV = "ORBITAL_WATCH_CADENCE_MINUTES"
+
+#: Cadence assumed when nothing sets the variable (local runs, tests). A test
+#: pins this to the Terraform default so the two cannot drift apart.
+DEFAULT_REFRESH_CADENCE_MINUTES = 10
+
+
+def _refresh_cadence() -> timedelta:
+    minutes = _env_float(
+        CADENCE_ENV, float(DEFAULT_REFRESH_CADENCE_MINUTES), low=1.0, high=1440.0
+    )
+    return timedelta(minutes=minutes)
+
+
+#: How often the job runs. Every other time constant below that depends on
+#: scheduling is written in terms of this one.
+REFRESH_CADENCE = _refresh_cadence()
+
+#: Runs in a row that may go missing before anyone is told. One missed run is
+#: an ordinary event (a slow start, a deploy); three in a row is not.
+MISSED_RUNS_BEFORE_ALARM = 3
+
+#: After this long without a new document the pipeline counts as silent: the
+#: page tells the visitor, and the "no successful run" alert tells the owner
+#: (Terraform derives the same figure from the same cadence).
+PIPELINE_SILENCE_LIMIT = REFRESH_CADENCE * MISSED_RUNS_BEFORE_ALARM
+
+#: Wall-clock allowance for one run, from start to published document. Well
+#: under the cadence, so one run has finished before the next starts; the
+#: Cloud Run task timeout sits above it as the hard stop.
+RUN_DEADLINE_SECONDS = 180.0
+
+#: Time kept back from that allowance for work that comes after the network:
+#: propagating and searching for passes, then validating and publishing.
+#: Network requests may not begin to use it, whatever the upstreams do.
+COMPUTE_RESERVE_SECONDS = 20.0
+PUBLISH_RESERVE_SECONDS = 30.0
+
+
+# --------------------------------------------------------------------------
 # Upstream sources
 # --------------------------------------------------------------------------
 
 USER_AGENT = (
-    "OrbitalWatch/1.0 (+https://github.com/rodrigopimenta10/orbital-watch) "
+    "OrbitalWatch/2.0 (+https://github.com/rodrigopimenta10/orbital-watch) "
     "portfolio project; contact via GitHub issues"
 )
 
-#: Hard ceiling on any single network call. No unbounded waits, ever.
+#: Longest a connection may go without sending anything: while connecting,
+#: while waiting for the headers, or between two pieces of a body. This is
+#: the socket timeout. It catches an upstream that has gone silent; it cannot
+#: catch one that is merely slow, which is what the ceilings below are for.
+HTTP_STALL_TIMEOUT_SECONDS = 10.0
+
+#: Ceiling on one whole request, from sending it to the last byte of the
+#: body. No unbounded waits, ever. Every source here but one answers in well
+#: under a second with at most half a megabyte.
 HTTP_TIMEOUT_SECONDS = 20.0
 
-#: Ceiling on total network wait across the whole build. Per-call timeouts
-#: alone are not enough: with every source down, N sources x 20s serialises
-#: into minutes of waiting before propagation even starts. Once this budget is
-#: spent, remaining fetches get whatever is left (minimum 1s), so a
-#: degraded-everything build still finishes promptly. The value covers all
-#: SWPC sources timing out fully with room to spare -- it only bites when
-#: several sources hang in sequence, which is exactly the case it exists for.
-NETWORK_BUDGET_SECONDS = 60.0
+#: The one large response is the Starlink group: about 5 MB. A healthy
+#: transfer takes a few seconds. 45 s lets it complete at a ninth of a
+#: megabyte per second, more than ten times slower than healthy; anything
+#: slower than that is a throttled connection (8 KB/s was seen on the first
+#: real run, which would need ten minutes) and is better abandoned, reported,
+#: and retried in half an hour than waited on.
+STARLINK_TIMEOUT_SECONDS = 45.0
+
+#: Ceilings on total network time per upstream provider in one run, kept
+#: separate so that one provider being slow cannot spend the other's
+#: allowance. Per-request ceilings alone are not enough: several sources each
+#: using theirs in full serialises into minutes of waiting before propagation
+#: starts. Once a budget is spent, remaining requests to that provider get a
+#: second each, so a run in which everything is down still finishes promptly.
+#: SWPC's covers three of its four small products timing out outright;
+#: Celestrak's covers the Starlink ceiling plus one more group's.
+SWPC_NETWORK_BUDGET_SECONDS = 60.0
+CELESTRAK_NETWORK_BUDGET_SECONDS = 65.0
+
+#: The default for a budget built without a figure.
+NETWORK_BUDGET_SECONDS = SWPC_NETWORK_BUDGET_SECONDS
 
 CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
 
-#: Slack absorbed by the scheduling chain: GitHub Actions cron ticks are
-#: routinely minutes late, and the refresher itself takes time to run and
-#: commit. The politeness floor is derived leaving this much headroom.
-SNAPSHOT_SCHEDULING_MARGIN = timedelta(minutes=30)
+#: Celestrak regenerates GP data about every two hours and says so in its own
+#: "not updated" reply. This is a fact about the upstream, not a setting.
+CELESTRAK_PUBLICATION_INTERVAL = timedelta(hours=2)
 
-#: Celestrak refreshes GP data every 2 hours and rate-limits repeat callers.
-#: The snapshot refresher refuses to re-fetch a group whose committed snapshot
-#: is younger than this, regardless of how often it runs.
-#:
-#: NOT a free parameter. It is derived from the invariant in DECISIONS.md
-#: §18: floor + cadence + margin <= TLE_STALENESS.fresh_within, i.e.
-#: 8h - 2h - 30m = 5h30m. The obvious-looking 6h value fails that invariant
-#: by converging, in steady state, to a refresh gap of *exactly* the
-#: freshness window: each capture lands moments after a tick, so the tick at
-#: floor-age arrives moments too early, skips, and the refresh always slides
-#: to the next tick. Discovered by simulation while fixing the production
-#: bug where floor == cadence produced the same disease at twice the size.
-#: A scheduling test asserts the derivation, so changing any of the three
-#: numbers alone fails CI.
-CELESTRAK_MIN_REFETCH_INTERVAL = timedelta(hours=5, minutes=30)
+#: The job never asks Celestrak for a group again within this long of the last
+#: time Celestrak answered for it. Equal to the publication interval: asking
+#: sooner cannot return newer element sets, and Celestrak rate-limits callers
+#: who try. Enforced against the stored state, so it holds however often the
+#: job is started.
+CELESTRAK_MIN_REFETCH_INTERVAL = CELESTRAK_PUBLICATION_INTERVAL
 
-#: How often the snapshot refresher's cron fires (refresh-snapshot.yml). Held
-#: here so code can reason about scheduling and so a test can pin the workflow
-#: cron to it.
-#:
-#: The invariant that binds these three numbers, learned in production
-#: (DECISIONS.md §18): the cadence must be meaningfully SHORTER than the
-#: politeness floor, and floor + cadence must not exceed
-#: ``TLE_STALENESS.fresh_within``. When cadence equalled the floor, every
-#: other run landed minutes under the threshold and correctly skipped, making
-#: the effective refresh interval ~2x the floor -- deterministically outside
-#: the freshness window, so the site spent hours STALE every cycle while
-#: every individual component behaved exactly as designed.
-SNAPSHOT_REFRESH_CADENCE = timedelta(hours=2)
+#: After a failed attempt the job waits this long before trying that group
+#: again, instead of hammering a struggling or rate-limiting server on every
+#: run. Three cadences: short enough to recover well inside the freshness
+#: window, long enough that an outage costs Celestrak two requests per group
+#: an hour at the default cadence, not six.
+CELESTRAK_RETRY_INTERVAL = PIPELINE_SILENCE_LIMIT
+
+#: NOAA SWPC products are small and refreshed by the minute; they are fetched
+#: on every run with no floor. Kp itself is a three-hourly index.
+KP_PUBLICATION_INTERVAL = timedelta(hours=3)
 
 
 @dataclass(frozen=True)
@@ -168,15 +228,22 @@ class SatelliteGroup:
     key: str
     label: str
     #: Cap on how many objects from this group we propagate. Starlink alone is
-    #: ~11k objects; propagating all of them would blow up build time and the
-    #: output JSON for no analytical gain. See DECISIONS.md.
+    #: ~11k objects; propagating all of them would blow up run time and the
+    #: published document for no analytical gain. See DECISIONS.md.
     max_objects: int
+    #: Ceiling on one whole request for this group, body included.
+    fetch_seconds: float = HTTP_TIMEOUT_SECONDS
 
 
 TRACKED_GROUPS: tuple[SatelliteGroup, ...] = (
     SatelliteGroup(key="stations", label="Space Stations", max_objects=40),
     SatelliteGroup(key="weather", label="Weather Satellites", max_objects=90),
-    SatelliteGroup(key="starlink", label="Starlink", max_objects=60),
+    SatelliteGroup(
+        key="starlink",
+        label="Starlink",
+        max_objects=60,
+        fetch_seconds=STARLINK_TIMEOUT_SECONDS,
+    ),
 )
 
 SWPC_KP_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
@@ -195,13 +262,15 @@ SWPC_MAG_FIELD_URL = (
 
 
 # --------------------------------------------------------------------------
-# Staleness thresholds
+# Health thresholds
 # --------------------------------------------------------------------------
 #
-# A source is FRESH if its last successful fetch is within `fresh_within`,
+# A source is FRESH if upstream last answered for it within `fresh_within`,
 # STALE if within `stale_within`, and FAILED beyond that (or if it has never
-# succeeded). These are surfaced verbatim in the health panel so a viewer can
-# check our arithmetic.
+# answered). Both numbers are published in the health panel so a reader can
+# check the arithmetic. Each is written as an expression over the facts above
+# rather than as a bare number, so changing the cadence moves the thresholds
+# with it and there is no pair of constants to keep in step by hand.
 
 
 @dataclass(frozen=True)
@@ -210,18 +279,24 @@ class StalenessPolicy:
     stale_within: timedelta
 
 
-#: TLEs age slowly -- a 6-hour-old element set is operationally fine, and SGP4
-#: accuracy degrades gradually rather than falling off a cliff.
+#: Element sets. A group is asked for every CELESTRAK_MIN_REFETCH_INTERVAL, so
+#: in normal running its last answer is never older than that plus one cadence.
+#: Fresh therefore means "not more than MISSED_RUNS_BEFORE_ALARM runs overdue".
+#: The outer limit is a judgement rather than a derivation: element sets age
+#: gracefully, and two days (24 upstream publications) is where this project
+#: stops calling predictions made from them current.
 TLE_STALENESS = StalenessPolicy(
-    fresh_within=timedelta(hours=8),
-    stale_within=timedelta(hours=48),
+    fresh_within=CELESTRAK_MIN_REFETCH_INTERVAL + PIPELINE_SILENCE_LIMIT,
+    stale_within=CELESTRAK_PUBLICATION_INTERVAL * 24,
 )
 
-#: Space weather is the opposite: a 3-hour-old Kp is the current Kp, but a
-#: day-old one tells you nothing about right now.
+#: Space weather. Asked for on every run, so anything older than the silence
+#: limit means runs are being missed. Past one full Kp interval the newest
+#: index value has never been seen, and a solar wind reading that old says
+#: nothing about now.
 SPACE_WEATHER_STALENESS = StalenessPolicy(
-    fresh_within=timedelta(hours=3),
-    stale_within=timedelta(hours=12),
+    fresh_within=PIPELINE_SILENCE_LIMIT,
+    stale_within=KP_PUBLICATION_INTERVAL,
 )
 
 
@@ -244,6 +319,26 @@ MAX_PASSES_PER_SAT = 3
 
 #: Passes retained overall in the output.
 MAX_PASSES_TOTAL = 40
+
+#: Length of the position track published for the sky view. The browser
+#: interpolates along it to its own clock, so it has to outlast the wait for
+#: the next document. Equal to the silence limit on purpose: the moment the
+#: track runs out is the moment the page starts saying the pipeline is silent,
+#: so positions are never shown as current after the page has stopped
+#: believing the pipeline is alive.
+EPHEMERIS_WINDOW = PIPELINE_SILENCE_LIMIT
+
+#: Spacing of the samples in that track. A low-Earth-orbit satellite moves
+#: about 230 km in 30 s along a path whose curvature puts the straight line
+#: between two samples under 1 km from the true position -- a fraction of a
+#: degree at any range a ground station sees. A test holds the published
+#: track to that.
+EPHEMERIS_STEP = timedelta(seconds=30)
+
+#: An object gets a track only if it comes within this many degrees of the
+#: horizon during the window. The margin below zero is there so the samples on
+#: either side of a rise or a set are always present to interpolate between.
+EPHEMERIS_HORIZON_MARGIN_DEG = 2.0
 
 
 # --------------------------------------------------------------------------

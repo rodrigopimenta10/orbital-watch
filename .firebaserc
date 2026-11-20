@@ -1,0 +1,12 @@
+{
+  "projects": {
+    "default": "portfolio-prod-0p1ht"
+  },
+  "targets": {
+    "portfolio-prod-0p1ht": {
+      "hosting": {
+        "orbital-watch": ["rodrigopimenta-orbital-watch"]
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "hosting": {
+    "target": "orbital-watch",
+    "public": "dist",
+    "ignore": ["firebase.json", "**/.*"],
+    "headers": [
+      {
+        "source": "**",
+        "headers": [
+          {
+            "key": "Content-Security-Policy",
+            "value": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://storage.googleapis.com; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+          },
+          { "key": "X-Content-Type-Options", "value": "nosniff" },
+          { "key": "Referrer-Policy", "value": "no-referrer" },
+          { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" },
+          {
+            "key": "Permissions-Policy",
+            "value": "geolocation=(), camera=(), microphone=(), payment=(), usb=(), interest-cohort=()"
+          }
+        ]
+      },
+      {
+        "source": "/data/**",
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }]
+      },
+      {
+        "source": "/assets/**",
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=3600, must-revalidate" }]
+      }
+    ]
+  }
+}

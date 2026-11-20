@@ -1,0 +1,15 @@
+# Local Terraform state and caches. State lives in the GCS bucket, never here.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+
+# A variable file could hold the alert email. It is passed in the environment instead
+# (TF_VAR_alert_email) and must not be written down.
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+
+# Saved plans contain every value, including sensitive ones.
+*.tfplan
+plan.out

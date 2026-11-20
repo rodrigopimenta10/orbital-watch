@@ -139,6 +139,17 @@ body {
   font-size: 0.85rem;
 }
 
+/* Which copy of the data is on screen. Quiet, but always present. */
+.document-source {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  margin: 0.75rem 0;
+}
+
+.noscript-box {
+  margin-top: 1.25rem;
+}
+
 .masthead-right {
   display: flex;
   align-items: center;
@@ -531,4 +542,14 @@ footer a {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* The count beside the masthead badge ("6 of 7 sources fresh"): quieter than
+ * the state word, and not uppercased with it. */
+.status .status-detail {
+  margin-left: 0.6em;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-muted);
 }

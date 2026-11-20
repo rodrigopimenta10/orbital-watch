@@ -133,6 +133,24 @@ def test_not_modified_is_fresh():
     assert evaluate(result, POLICY, label="Test", now=NOW).state is State.FRESH
 
 
+def test_not_modified_reports_both_the_confirmation_and_the_download():
+    """ "Fresh" must not hide that the bytes themselves are older.
+
+    Upstream confirming our copy is current makes the *contact* recent, not
+    the download. The detail says both, so a reader is never led to think the
+    element sets were fetched a minute ago when they were confirmed a minute
+    ago and fetched four hours ago.
+    """
+    result = make_result(outcome=Outcome.NOT_MODIFIED, age=timedelta(minutes=1))
+    result.payload_retrieved_at = NOW - timedelta(hours=4)
+
+    health = evaluate(result, POLICY, label="Test", now=NOW)
+
+    assert health.state is State.FRESH
+    assert "1m ago" in health.detail
+    assert "4h ago" in health.detail
+
+
 def test_deliberate_cache_hit_is_fresh():
     """Skipping a fetch to respect a rate limit is a healthy state."""
     result = make_result(outcome=Outcome.CACHE_FRESH, age=timedelta(hours=2))
@@ -164,6 +182,22 @@ def test_fetch_after_the_reference_instant_is_age_zero_not_negative():
     assert health.state is State.FRESH
     assert health.age_seconds == 0
     assert "future" not in health.detail
+
+
+def test_stale_by_age_still_reports_lost_contact():
+    """Old *and* cut off: the detail must say both, not only the age.
+
+    An operator wants to know contact has been lost, not just that the
+    numbers are old -- the second half is the actionable one.
+    """
+    result = make_result(
+        outcome=Outcome.CACHE_FALLBACK, age=timedelta(hours=12), error="HTTP 503"
+    )
+    health = evaluate(result, POLICY, label="Test", now=NOW)
+
+    assert health.state is State.STALE
+    assert "freshness window" in health.detail
+    assert "HTTP 503" in health.detail
 
 
 def test_old_cache_fallback_is_failed_not_merely_stale():
@@ -222,3 +256,48 @@ def test_health_dict_is_json_serialisable():
 
     payload = summarize([_health(timedelta(hours=1))])
     assert json.loads(json.dumps(payload)) == payload
+
+
+# --------------------------------------------------------------------------
+# The configured thresholds follow from the schedule
+# --------------------------------------------------------------------------
+
+
+def test_thresholds_are_derived_from_the_schedule_not_chosen_beside_it():
+    """The relations that used to be invariants are now definitions.
+
+    The first design had a cron cadence, a politeness floor and a freshness
+    window as three independent numbers, and twice shipped a combination in
+    which every component behaved correctly and the site still spent hours
+    stale (DECISIONS.md §18, §19). Here the windows are written as
+    expressions over the cadence and the upstream facts, so this test is a
+    statement of what they mean rather than a guard on hand-tuned values.
+    """
+    from orbital_watch import config
+
+    # A new document is expected every cadence; three missing is the alarm.
+    assert config.PIPELINE_SILENCE_LIMIT == config.REFRESH_CADENCE * 3
+
+    # Celestrak is never asked more often than it publishes.
+    assert config.CELESTRAK_MIN_REFETCH_INTERVAL >= config.CELESTRAK_PUBLICATION_INTERVAL
+
+    # In normal running a group's last answer is at most floor + one cadence
+    # old, so it is always inside its freshness window with runs to spare...
+    worst_normal_age = config.CELESTRAK_MIN_REFETCH_INTERVAL + config.REFRESH_CADENCE
+    assert worst_normal_age < config.TLE_STALENESS.fresh_within
+    # ...and one failed attempt plus its retry still lands inside it.
+    assert (
+        config.TLE_STALENESS.fresh_within
+        >= config.CELESTRAK_MIN_REFETCH_INTERVAL + config.CELESTRAK_RETRY_INTERVAL
+    )
+
+    # Space weather is asked for on every run.
+    assert config.SPACE_WEATHER_STALENESS.fresh_within > config.REFRESH_CADENCE
+
+    # The position track outlasts the wait for the next document, and runs out
+    # no later than the page starts calling the pipeline silent.
+    assert config.EPHEMERIS_WINDOW > config.REFRESH_CADENCE
+    assert config.EPHEMERIS_WINDOW <= config.PIPELINE_SILENCE_LIMIT
+
+    # One run finishes before the next starts.
+    assert config.REFRESH_CADENCE.total_seconds() > config.RUN_DEADLINE_SECONDS
