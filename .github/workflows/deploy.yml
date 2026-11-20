@@ -1,0 +1,155 @@
+# Deploys Orbital Watch on every push to main: the refresh job's image to Cloud Run, then the
+# page to Firebase Hosting.
+#
+# It does nothing until the repository variables below exist: the job is skipped while
+# GCP_PROJECT_ID is empty. Set them only after the Terraform in infra/ has been applied; its
+# `repository_variables` output is the values (infra/README.md, "After the apply").
+#
+#   GCP_PROJECT_ID                  e.g. portfolio-prod-0p1ht
+#   GCP_REGION                      e.g. us-east4
+#   GCP_WORKLOAD_IDENTITY_PROVIDER  projects/<number>/locations/global/workloadIdentityPools/github/providers/orbital-watch
+#   GCP_DEPLOY_SERVICE_ACCOUNT      orbital-watch-deploy@<project>.iam.gserviceaccount.com
+#   IMAGE_REPOSITORY                <region>-docker.pkg.dev/<project>/orbital-watch
+#   REFRESH_JOB                     orbital-watch-refresh
+#   LIVE_DOCUMENT_URL               https://storage.googleapis.com/<public bucket>/latest.json
+#   FIREBASE_HOSTING_SITE           e.g. rodrigopimenta-orbital-watch
+#
+# There are no keys and no secrets. GitHub gives each run a short-lived token that says which
+# repository and workflow it is, and Google Cloud exchanges it for credentials (Workload Identity
+# Federation). The deploy service account can be used only by this workflow file on main.
+#
+# Deploying does not refresh the data: Cloud Scheduler does that every ten minutes whether or not
+# anything is ever deployed again. A deploy changes which code runs, and which copy of the
+# document the page falls back to.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    # Terraform is applied by hand, and prose changes nothing that runs.
+    paths-ignore: ["infra/**", "docs/**", "**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.13.9"
+  FIREBASE_TOOLS: firebase-tools@15.36.0
+
+jobs:
+  production:
+    name: Production
+    if: ${{ vars.GCP_PROJECT_ID != '' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    # One deploy at a time, in order; a second push waits for the first to finish.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      JOB: ${{ vars.REFRESH_JOB }}
+      IMAGE: ${{ vars.IMAGE_REPOSITORY }}/refresh:${{ github.sha }}
+      LIVE_URL: ${{ vars.LIVE_DOCUMENT_URL }}
+      SITE: ${{ vars.FIREBASE_HOSTING_SITE }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      # CI runs the same checks on the same commit, but as a separate workflow that this one
+      # does not wait for. Running them here means a deploy cannot go out ahead of a red build.
+      - name: Tests
+        run: |
+          uv sync --locked --dev
+          uv run pytest -q
+          node --test tests/web/
+
+      - name: Build the image and check it runs
+        run: |
+          docker build --build-arg REVISION="$GITHUB_SHA" --tag "$IMAGE" .
+          docker run --rm --network none "$IMAGE" --no-site
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Push the image
+        run: |
+          gcloud auth configure-docker "${IMAGE%%/*}" --quiet
+          docker push "$IMAGE"
+
+      # From here on, scheduled runs use the new image too.
+      - name: Point the job at the new image
+        run: |
+          gcloud run jobs update "$JOB" --project "$PROJECT" --region "$REGION" \
+            --image "$IMAGE" --quiet
+
+      # Start one run now instead of waiting for the next tick, and then wait for what matters:
+      # not "the execution ended", but "the document readers fetch was written by this commit".
+      # The job stamps the document with the revision of the image that produced it, so this
+      # checks the whole path -- image, permissions, both buckets, public read -- from outside.
+      - name: Run the job once and wait for the document it publishes
+        run: |
+          gcloud run jobs execute "$JOB" --project "$PROJECT" --region "$REGION" --async --quiet
+
+          for attempt in $(seq 1 36); do
+            sleep 10
+            if curl --silent --show-error --fail --max-time 20 --output latest.json "$LIVE_URL"; then
+              revision=$(jq -r '.meta.pipeline.revision // empty' latest.json)
+              if [ "$revision" = "$GITHUB_SHA" ]; then
+                echo "Published by this commit after about $((attempt * 10))s:"
+                jq '{generated_at, overall: .health.overall, counts: .health.counts}' latest.json
+                exit 0
+              fi
+              echo "attempt $attempt: document is from revision ${revision:-unknown}; waiting"
+            else
+              echo "attempt $attempt: document not readable yet; waiting"
+            fi
+          done
+
+          echo "::error::No document from $GITHUB_SHA appeared at $LIVE_URL within 6 minutes."
+          echo "The job's executions and their logs:"
+          echo "  gcloud run jobs executions list --job $JOB --region $REGION --project $PROJECT"
+          exit 1
+
+      # The page shows this copy when it cannot reach the live one. Baking refuses a document
+      # that fails validation, so a deploy cannot ship a fallback the page cannot draw.
+      - name: Assemble the site around that document
+        run: |
+          uv run python -m orbital_watch.site --document latest.json --live-url "$LIVE_URL" --out dist
+          grep --quiet --fixed-strings "$LIVE_URL" dist/assets/config.js
+
+      - name: Publish to Firebase Hosting
+        run: |
+          npx --yes "$FIREBASE_TOOLS" target:apply hosting orbital-watch "$SITE" --project "$PROJECT"
+          npx --yes "$FIREBASE_TOOLS" deploy --only hosting:orbital-watch --project "$PROJECT" \
+            --non-interactive --message "$GITHUB_SHA"
+
+      # Checked at the address Firebase always serves, so this works before and after the custom
+      # domain is moved. Content and headers, not only a 200.
+      - name: Check what was published
+        run: |
+          base="https://$SITE.web.app"
+          curl --silent --show-error --fail --retry 5 --retry-delay 3 "$base/" \
+            | grep --quiet --fixed-strings "<title>Orbital Watch"
+          curl --silent --show-error --fail "$base/assets/config.js" \
+            | grep --quiet --fixed-strings "$LIVE_URL"
+          curl --silent --show-error --fail "$base/data/latest.json" \
+            | jq --exit-status '.kind == "orbital-watch.latest"' > /dev/null
+          curl --silent --show-error --fail --head "$base/" \
+            | grep --ignore-case --quiet "^content-security-policy: default-src 'none'"
+          echo "Published: $base" | tee -a "$GITHUB_STEP_SUMMARY"

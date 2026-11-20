@@ -4,12 +4,11 @@
 *.tfstate.*
 crash.log
 
-# Variable files could hold the billing account ID or the alert email. They are passed in the
-# environment instead (TF_VAR_billing_account_id, TF_VAR_alert_email) and must not be written down.
+# A variable file could hold the alert email. It is passed in the environment instead
+# (TF_VAR_alert_email) and must not be written down.
 *.tfvars
 *.tfvars.json
 *.auto.tfvars
-!example.tfvars
 
 # Saved plans contain every value, including sensitive ones.
 *.tfplan

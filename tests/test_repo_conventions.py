@@ -260,3 +260,73 @@ def test_terraform_ignores_only_the_image_the_deploy_owns():
         "client_version",
         "template[0].template[0].containers[0].image",
     }
+
+
+# --------------------------------------------------------------------------
+# Automation
+# --------------------------------------------------------------------------
+
+WORKFLOWS = sorted((REPO / ".github" / "workflows").glob("*.yml"))
+
+
+def test_only_the_two_expected_workflows_exist():
+    """No scheduled workflow: the schedule lives in Cloud Scheduler, once.
+
+    A third file here -- in particular anything with a cron trigger -- would
+    be a second scheduler, which is how the first design broke.
+    """
+    assert [path.name for path in WORKFLOWS] == ["ci.yml", "deploy.yml"]
+    for path in WORKFLOWS:
+        assert "schedule:" not in path.read_text(), f"{path.name} has a cron trigger"
+
+
+def test_every_action_is_pinned_to_a_commit():
+    """A tag can be re-pointed at other code; a commit SHA cannot."""
+    for path in WORKFLOWS:
+        uses = re.findall(r"^\s*-?\s*uses:\s*(\S+)(.*)$", path.read_text(), re.M)
+        assert uses, f"{path.name} uses no actions?"
+        for reference, trailing in uses:
+            assert re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", reference), (
+                f"{path.name}: {reference} is not pinned to a full commit SHA"
+            )
+            assert re.search(r"#\s*v\d+\.\d+\.\d+", trailing), (
+                f"{path.name}: {reference} should say which release the SHA is"
+            )
+
+
+def test_workflows_use_no_secrets():
+    """Keyless by construction: there is nothing to store and nothing to leak."""
+    for path in WORKFLOWS:
+        assert not re.search(r"secrets\.\w|secrets\[", path.read_text()), path.name
+
+
+def test_only_the_deploy_job_may_request_an_identity_token():
+    import yaml
+
+    for path in WORKFLOWS:
+        workflow = yaml.safe_load(path.read_text())
+        assert workflow["permissions"] == {"contents": "read"}, path.name
+        for name, job_definition in workflow["jobs"].items():
+            wants_token = "id-token" in job_definition.get("permissions", {})
+            assert wants_token == (path.name == "deploy.yml" and name == "production"), (
+                f"{path.name}:{name}"
+            )
+
+
+def test_ci_and_the_image_build_use_the_same_uv():
+    (image_version,) = re.findall(r"astral-sh/uv:([\d.]+)@sha256", read("Dockerfile"))
+
+    for path in WORKFLOWS:
+        (workflow_version,) = re.findall(r'UV_VERSION: "([\d.]+)"', path.read_text())
+        assert workflow_version == image_version, path.name
+
+
+def test_container_base_images_are_pinned_by_digest():
+    images = re.findall(r"^ARG \w+_IMAGE=(\S+)$", read("Dockerfile"), re.M)
+
+    assert len(images) == 2
+    for image in images:
+        assert re.search(r":[\w.-]+@sha256:[0-9a-f]{64}$", image), image
+    # And nothing is pulled by a bare name further down.
+    for line in re.findall(r"^FROM (\S+)", read("Dockerfile"), re.M):
+        assert line.startswith("${"), f"FROM {line} bypasses the pinned images"

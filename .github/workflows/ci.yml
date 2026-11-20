@@ -1,3 +1,7 @@
+# Checks for every push and pull request. Nothing here deploys, signs in anywhere or needs a
+# secret, and nothing reaches the network once dependencies are installed: the Python tests
+# block sockets, the container is run with networking off, and Terraform runs against mocked
+# providers.
 name: CI
 
 on:
@@ -13,29 +17,34 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The same uv the container image is built with (see Dockerfile).
+  UV_VERSION: "0.13.9"
+
 jobs:
-  check:
+  python:
     name: ruff + pytest (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        # pyproject declares requires-python = ">=3.11". Testing both ends of
-        # that range means the claim is enforced rather than asserted -- if a
-        # 3.12-only feature creeps in, CI says so instead of a user finding out.
+        # pyproject declares requires-python = ">=3.11", and the container runs 3.12. Testing
+        # both means the lower bound is enforced rather than asserted -- if a 3.12-only feature
+        # creeps in, CI says so instead of a user finding out.
         python-version: ["3.11", "3.12"]
     # Every uv command in this job targets the matrix interpreter.
     env:
       UV_PYTHON: ${{ matrix.python-version }}
     steps:
-      # Pinned to a commit SHA, not a tag. Tags are movable: a compromised
-      # action repository can re-point v7 at attacker code, and the job
-      # would pick it up silently. Dependabot updates SHA pins fine.
+      # Actions are pinned to a commit SHA, not a tag. Tags are movable: a compromised action
+      # repository can re-point v7 at other code, and the job would pick it up silently.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -50,60 +59,17 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
 
-      # The suite blocks network access at the fixture level, so this step
-      # passing is also evidence that nothing here depends on a live API.
+      # The suite blocks network access at the fixture level -- urlopen and sockets both -- so
+      # this step passing is also evidence that nothing here depends on a live API. It includes
+      # the tests that pin what the page, the pipeline and the Terraform must agree on.
       - name: Tests
         run: uv run pytest -v
 
-      # The committed snapshot ages into FAILED on the live site correctly,
-      # but nothing would prompt anyone to refresh it -- the repo should
-      # complain before the site does. 30 days is far past the point where
-      # the scheduled refresher has obviously stopped working.
-      - name: Seed snapshot must not be rotting
-        run: |
-          uv run python - <<'PY'
-          import json
-          import pathlib
-          import sys
-          from datetime import UTC, datetime, timedelta
-
-          LIMIT = timedelta(days=30)
-          manifest = json.loads(pathlib.Path("seed/manifest.json").read_text())
-          now = datetime.now(UTC)
-          rotten = []
-          for name, entry in sorted(manifest["sources"].items()):
-              raw = entry.get("retrieved_at")
-              # A missing or unparseable capture time is treated as rotten,
-              # not as a crash: the step exists to complain clearly, and a
-              # TypeError traceback is not a clear complaint.
-              try:
-                  stamp = datetime.fromisoformat(raw)
-              except (TypeError, ValueError):
-                  print(f"  {name}: capture time missing or unparseable ({raw!r})")
-                  rotten.append(f"{name} (no capture time)")
-                  continue
-              if stamp.tzinfo is None:
-                  stamp = stamp.replace(tzinfo=UTC)
-              age = now - stamp
-              print(f"  {name}: captured {age.days}d ago")
-              if age > LIMIT:
-                  rotten.append(f"{name} ({age.days}d)")
-          if rotten:
-              print(
-                  f"\nFAIL: snapshot older than {LIMIT.days} days: {', '.join(rotten)}\n"
-                  "The scheduled refresher (refresh-snapshot.yml) has probably "
-                  "stopped. Run it manually or investigate why it is not firing."
-              )
-              sys.exit(1)
-          print("Seed snapshot is acceptably fresh.")
-          PY
-
-      # Proves the definition-of-done requirement directly, in both of the
-      # shapes it can take: with the committed seed available, and without it.
-      # These are genuinely different guarantees -- the seed keeps a cold
-      # build container serving real data, and its absence must still produce
-      # a complete site rather than a crash.
-      - name: Build must survive a total upstream blackout
+      # The claim the project rests on, proved through the real entry point rather than through
+      # a test's fixtures: with every socket refused and nothing stored, the job still exits 0
+      # and publishes a complete document that passes its own validation and says, truthfully,
+      # that every source failed. Then the site is assembled around it.
+      - name: A run with no network must publish a complete, truthful document
         run: |
           uv run python - <<'PY'
           import json
@@ -120,66 +86,93 @@ jobs:
           socket.create_connection = unreachable
           socket.getaddrinfo = unreachable
 
-          EXPECTED = [
-              "meta.json",
-              "sky.json",
-              "passes.json",
-              "space_weather.json",
-              "health.json",
-          ]
+          from orbital_watch import job
+          from orbital_watch.document import validate
+          from orbital_watch.pipeline import SOURCE_LABELS
 
+          with tempfile.TemporaryDirectory() as scratch:
+              root = pathlib.Path(scratch)
+              code = job.main(["--local-dir", str(root / "local"), "--out", str(root / "dist")])
+              assert code == 0, f"the job exited {code} with no network"
 
-          def build(tag, seed_dir=None):
-              """Run the real entry point and return its health block."""
-              import orbital_watch.config as config
-              import orbital_watch.sources.fetch as fetch
+              published = root / "local" / "public" / "latest.json"
+              document = json.loads(published.read_text())
+              problems = validate(document, expected_sources=SOURCE_LABELS)
+              assert not problems, problems
 
-              if seed_dir is not None:
-                  config.SEED_DIR = pathlib.Path(seed_dir)
-                  fetch.SEED_DIR = pathlib.Path(seed_dir)
+              health = document["health"]
+              assert health["overall"] == "failed", health["overall"]
+              assert health["counts"] == {"fresh": 0, "stale": 0, "failed": 7}, health["counts"]
+              assert all(source["error"] for source in health["sources"])
+              assert document["sky"]["satellites"] == []
+              assert document["space_weather"]["correlation"]["severity"] == "unknown"
 
-              from orbital_watch.build import main
+              dist = root / "dist"
+              assert (dist / "index.html").is_file()
+              assert json.loads((dist / "data" / "latest.json").read_text()) == document
 
-              out = f"dist-offline-{tag}"
-              code = main(["--build-dir", out, "--cache-dir", f".cache-{tag}"])
-              assert code == 0, f"[{tag}] build exited {code} with no network"
-
-              data = pathlib.Path(out) / "data"
-              for name in EXPECTED:
-                  payload = json.loads((data / name).read_text())
-                  assert payload, f"[{tag}] {name} is empty"
-
-              return json.loads((data / "health.json").read_text())
-
-
-          # 1. Seed present. Celestrak reads the committed snapshot BY DESIGN
-          #    (outcome "snapshot", freshness judged by the snapshot's age, so
-          #    not asserted here -- it depends on when the refresher last ran).
-          #    SWPC has no cache and a dead network, so it must fall back to
-          #    the seed -- and nothing served from a seed may claim freshness,
-          #    because a seed means we reached nobody.
-          seeded = build("seeded")
-          outcomes = {s["name"]: s for s in seeded["sources"]}
-          for name, source in outcomes.items():
-              if name.startswith("celestrak_"):
-                  assert source["outcome"] == "snapshot", (name, source["outcome"])
-              else:
-                  assert source["outcome"] == "seed", (name, source["outcome"])
-                  assert source["state"] != "fresh", (name, source["state"])
-          print(
-              f"OK seeded: {len(EXPECTED)} files, overall={seeded['overall']}, "
-              f"celestrak from snapshot, swpc from seed, no seed claims fresh"
-          )
-
-          # 2. No seed at all: the site must still be complete and must report
-          #    total failure rather than pretending.
-          with tempfile.TemporaryDirectory() as empty:
-              bare = build("bare", seed_dir=empty)
-          assert bare["overall"] == "failed", bare["overall"]
-          assert bare["counts"]["fresh"] == 0, bare["counts"]
-          assert bare["counts"]["failed"] == len(bare["sources"])
-          print(
-              f"OK bare: {len(EXPECTED)} files, "
-              f"{bare['counts']['failed']} sources reported failed"
-          )
+          print("OK: exit 0, document valid, 7 of 7 sources reported failed, site assembled")
           PY
+
+  frontend:
+    name: page logic (node --test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The runner's own Node, and Node's built-in test runner: the frontend has no package.json
+      # and no dependencies, and its tests keep it that way.
+      - name: Every script parses
+        run: |
+          node --version
+          for file in web/assets/*.js; do node --check "$file"; done
+
+      - name: Tests
+        run: node --test tests/web/
+
+  container:
+    name: container image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The image builds
+        run: docker build --build-arg REVISION="$GITHUB_SHA" --tag orbital-watch-refresh:ci .
+
+      - name: It does not run as root
+        run: test "$(docker run --rm --entrypoint id orbital-watch-refresh:ci -u)" = "10001"
+
+      # The same promise as above, through the image that will actually run: no network at all,
+      # and it still exits 0 having published a document.
+      - name: It runs with no network and exits 0
+        run: docker run --rm --network none orbital-watch-refresh:ci --no-site
+
+  terraform:
+    name: terraform (mocked providers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.17.2
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      # No backend, so no state and no credentials. Applying is done by hand (infra/README.md),
+      # never from a workflow.
+      - name: Providers
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Tests (mocked providers, nothing created)
+        run: terraform test
