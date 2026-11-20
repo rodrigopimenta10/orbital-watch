@@ -126,20 +126,30 @@ def _epoch_sort_key(record: dict) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _refuse_collapse(new: list[dict], previous: list[dict]) -> None:
+def _offered(payload: Payload) -> int:
+    """How many objects the group held upstream, as far as this payload knows."""
+    available = payload.facts.get("available")
+    kept = len(payload.data)
+    return available if isinstance(available, int) and available >= kept else kept
+
+
+def _refuse_collapse(new: Payload, previous: Payload) -> None:
     """Reject a payload that validates but has collapsed in size.
 
     Two stations where we hold twenty-two is upstream trouble, not a real
     change: constellations do not lose most of their objects between two
     publications. Refusing it keeps the stored group, and if the shrinkage is
     real and persists, the group's age tells the story.
+
+    Judged on how many objects the group *offered*, not on how many were
+    kept. Only a sample of Starlink is kept, so a response cut from eleven
+    thousand objects to a few hundred still fills the sample, and comparing
+    sample with sample would see nothing wrong.
     """
-    if (
-        len(previous) >= MIN_PLAUSIBLE_RECORDS
-        and len(new) < len(previous) * SHRINKAGE_FLOOR
-    ):
+    before, after = _offered(previous), _offered(new)
+    if before >= MIN_PLAUSIBLE_RECORDS and after < before * SHRINKAGE_FLOOR:
         raise ValueError(
-            f"group shrank from {len(previous)} to {len(new)} objects, below the "
+            f"group shrank from {before} to {after} objects, below the "
             f"{int(SHRINKAGE_FLOOR * 100)}% floor; keeping the stored group"
         )
 
@@ -170,4 +180,5 @@ def group_spec(group: SatelliteGroup) -> SourceSpec:
         plausible=_refuse_collapse,
         min_refetch_interval=CELESTRAK_MIN_REFETCH_INTERVAL,
         retry_interval=CELESTRAK_RETRY_INTERVAL,
+        max_seconds=group.fetch_seconds,
     )

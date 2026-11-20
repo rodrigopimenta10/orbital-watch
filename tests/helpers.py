@@ -116,3 +116,70 @@ def responder(mapping: dict[str, object], *, default=None, calls: list | None = 
 def urls(calls: list) -> list[str]:
     """The URLs of the requests a ``responder`` recorded."""
     return [request.full_url for request in calls]
+
+
+class FakeMonotonic:
+    """Stands in for ``time.monotonic`` so a test can make time pass."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TricklingResponse:
+    """An upstream that answers at once and then sends its body slowly.
+
+    Every piece it hands over costs ``seconds_per_piece`` of (fake) time, and
+    no single read ever stalls -- which is exactly the case a per-read socket
+    timeout cannot catch. ``read(n)`` behaves like a real buffered read: it
+    keeps going until it has ``n`` bytes or the body ends.
+    """
+
+    def __init__(
+        self,
+        body: bytes,
+        monotonic: FakeMonotonic,
+        *,
+        piece: int = 8 * 1024,
+        seconds_per_piece: float = 1.0,
+    ) -> None:
+        self._body = body
+        self._position = 0
+        self._monotonic = monotonic
+        self._piece = piece
+        self._seconds = seconds_per_piece
+        self.headers: dict[str, str] = {}
+        self.pieces_sent = 0
+
+    def read1(self, size: int = -1) -> bytes:
+        if self._position >= len(self._body):
+            return b""
+        self._monotonic.advance(self._seconds)
+        take = self._piece if size < 0 else min(self._piece, size)
+        piece = self._body[self._position : self._position + take]
+        self._position += len(piece)
+        self.pieces_sent += 1
+        return piece
+
+    def read(self, size: int = -1) -> bytes:
+        collected = b""
+        while size < 0 or len(collected) < size:
+            piece = self.read1(-1 if size < 0 else size - len(collected))
+            if not piece:
+                break
+            collected += piece
+        return collected
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False

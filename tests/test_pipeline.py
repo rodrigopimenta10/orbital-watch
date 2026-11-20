@@ -42,6 +42,8 @@ from tests.helpers import (
     FAILURE_MODES,
     SWPC_KEYS,
     FakeClock,
+    FakeMonotonic,
+    TricklingResponse,
     responder,
     urls,
 )
@@ -533,3 +535,186 @@ def test_elevated_band_raises_the_banner_below_storm_level(kp):
 
     assert correlation["active"] is True
     assert correlation["severity"] == "elevated"
+
+
+# --------------------------------------------------------------------------
+# Review findings before the first deploy (DECISIONS.md §30)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def monotonic(monkeypatch) -> FakeMonotonic:
+    import time
+
+    fake = FakeMonotonic()
+    monkeypatch.setattr(time, "monotonic", fake)
+    return fake
+
+
+def throttle(monkeypatch, monotonic, slow_keys) -> None:
+    """Upstreams matching ``slow_keys`` send 5 MB at 8 KB/s; the rest are healthy."""
+    body = b"[" + b"1," * (5 * 1024 * 1024 // 2) + b"1]"
+    healthy = responder(ALL_SOURCES_OK)
+
+    def _urlopen(request, timeout=None):
+        if any(key in request.full_url for key in slow_keys):
+            return TricklingResponse(body, monotonic)
+        return healthy(request, timeout)
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+
+
+def test_throttled_celestrak_cannot_cost_the_run_its_passes_or_its_deadline(
+    state_store, monkeypatch, monotonic
+):
+    """Defect 1, end to end, as it happened on the first real run.
+
+    Celestrak sent every group at a trickle. Before the fix the job read for
+    as long as the bytes kept coming: past 150 s the pass list was published
+    empty, past 300 s the platform killed the task and nothing was published.
+    Now the three groups together cost at most Celestrak's budget, the rest
+    of the run is untouched, and the document says what happened.
+    """
+    from orbital_watch.config import CELESTRAK_NETWORK_BUDGET_SECONDS
+
+    clock = FakeClock()
+    serve(monkeypatch, ALL_SOURCES_OK)
+    run(state_store, clock)  # a healthy run first, so there is state to serve
+    clock.advance(CELESTRAK_MIN_REFETCH_INTERVAL)
+
+    throttle(monkeypatch, monotonic, CELESTRAK_KEYS)
+    started = monotonic.now
+    document = run(state_store, clock)
+
+    waited = monotonic.now - started
+    assert waited <= CELESTRAK_NETWORK_BUDGET_SECONDS + 5, f"waited {waited:.0f}s"
+    by_name = sources(document)
+    for name in ("celestrak_stations", "celestrak_weather", "celestrak_starlink"):
+        assert by_name[name]["outcome"] == "cache_fallback"
+        assert "incomplete" in by_name[name]["error"]
+    assert by_name["swpc_kp"]["state"] == "fresh"
+    assert document["passes"]["complete"] is True
+    assert document["passes"]["passes"], "stored element sets still yield passes"
+
+
+def test_every_upstream_throttled_still_leaves_time_to_compute_and_publish(
+    state_store, monkeypatch, monotonic
+):
+    """The run's overall deadline is real: the network cannot spend the reserves."""
+    from orbital_watch.config import (
+        COMPUTE_RESERVE_SECONDS,
+        HTTP_STALL_TIMEOUT_SECONDS,
+        PUBLISH_RESERVE_SECONDS,
+        RUN_DEADLINE_SECONDS,
+    )
+
+    throttle(monkeypatch, monotonic, list(ALL_SOURCES_OK))
+    started = monotonic.now
+
+    document = run(state_store, FakeClock())
+
+    network_limit = (
+        RUN_DEADLINE_SECONDS - COMPUTE_RESERVE_SECONDS - PUBLISH_RESERVE_SECONDS
+    )
+    assert monotonic.now - started <= network_limit + HTTP_STALL_TIMEOUT_SECONDS
+    assert document["health"]["counts"] == {"fresh": 0, "stale": 0, "failed": 7}
+    assert document["passes"]["complete"] is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'[{"time_tag": "2026-08-06T12:00:00", "Kp": NaN}]',
+        b'[{"time_tag": "2026-08-06T12:00:00", "Kp": Infinity}]',
+        b'[{"time_tag": "2026-08-06T12:00:00", "Kp": 1e999}]',
+    ],
+)
+def test_non_finite_upstream_value_degrades_one_source_and_the_run_still_publishes(
+    tmp_path, monkeypatch, body
+):
+    """Defect 2, end to end: this used to exit 3 with nothing published.
+
+    The value was stored, the document built from it failed validation, and
+    every run after that failed the same way until upstream changed.
+    """
+    from orbital_watch import job
+    from orbital_watch.store import LocalStore
+
+    state, public = LocalStore(tmp_path / "state"), LocalStore(tmp_path / "public")
+    serve(monkeypatch, {**ALL_SOURCES_OK, "planetary-k-index": body})
+
+    assert job.run(state, public) == job.EXIT_OK
+
+    document = json.loads(public.read("latest.json").data)
+    assert validate(document, expected_sources=SOURCE_LABELS) == []
+    by_name = sources(document)
+    assert by_name["swpc_kp"]["state"] == "failed"
+    assert (
+        "Rejected payload" in by_name["swpc_kp"]["error"]
+        or "Malformed" in (by_name["swpc_kp"]["error"])
+    )
+    assert document["health"]["counts"] == {"fresh": 6, "stale": 0, "failed": 1}
+    assert state.read("state/swpc_kp.json") is not None
+    assert json.loads(state.read("state/swpc_kp.json").data)["payload"] is None
+
+
+def test_non_finite_reading_spelt_as_text_is_skipped_and_the_rest_used(
+    state_store, monkeypatch
+):
+    readings = [
+        {"time_tag": "2026-08-06T09:00:00", "Kp": "2.67"},
+        {"time_tag": "2026-08-06T12:00:00", "Kp": "NaN"},
+    ]
+    wind = [{"proton_speed": "Infinity", "time_tag": "2026-08-06T14:54:00Z"}]
+    serve(
+        monkeypatch,
+        {**ALL_SOURCES_OK, "planetary-k-index": readings, "solar-wind-speed": wind},
+    )
+
+    document = run(state_store, FakeClock())
+
+    weather = document["space_weather"]["weather"]
+    assert weather["kp"] == 2.67
+    assert weather["solar_wind_speed_km_s"] is None
+    assert document["health"]["overall"] == "fresh"
+
+
+def test_assessment_is_withdrawn_when_the_kp_behind_it_is_no_longer_current(
+    state_store, monkeypatch
+):
+    """ "Storm in progress" must not outlive the data it was read from.
+
+    The banner is written in the present tense. Once the Kp source has gone
+    unanswered past its limit the health panel calls it failed -- "not
+    operationally current" -- and the banner cannot go on asserting a storm
+    on the strength of it.
+    """
+    storm_kp = [{"time_tag": "2026-08-06T12:00:00", "Kp": 7.67}]
+    clock = FakeClock()
+    serve(monkeypatch, {**ALL_SOURCES_OK, "planetary-k-index": storm_kp})
+    during = run(state_store, clock)["space_weather"]["correlation"]
+    assert during["severity"] == "storm"
+    assert during["source"] == "swpc_kp"
+
+    clock.advance(SPACE_WEATHER_STALENESS.fresh_within + timedelta(minutes=10))
+    serve(
+        monkeypatch,
+        {**ALL_SOURCES_OK, "planetary-k-index": TimeoutError("timed out")},
+    )
+    stale = run(state_store, clock)
+    assert sources(stale)["swpc_kp"]["state"] == "stale"
+    assert stale["space_weather"]["correlation"]["severity"] == "storm", (
+        "a stale Kp is still within one Kp interval and still describes now"
+    )
+
+    clock.advance(SPACE_WEATHER_STALENESS.stale_within)
+    document = run(state_store, clock)
+    correlation = document["space_weather"]["correlation"]
+
+    assert sources(document)["swpc_kp"]["state"] == "failed"
+    assert correlation["severity"] == "unknown"
+    assert correlation["active"] is False
+    assert correlation["operational_impacts"] == []
+    assert "not current" in correlation["headline"]
+    assert "7.67" in correlation["headline"]
+    assert "in progress" not in correlation["headline"]

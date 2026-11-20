@@ -3,14 +3,18 @@
 Every upstream read in this project goes through :func:`fetch_source`, which
 guarantees the same things regardless of caller:
 
-1. The call has a hard timeout.
+1. The call has a hard ceiling on its *whole* duration, body included, and
+   a shorter limit on how long the connection may go silent.
 2. Failure is caught, logged with source and elapsed time, and falls back to
    the last good payload held in the state store.
 3. The outcome is recorded in a result object the health panel can report
    truthfully -- including *why* a source degraded.
 4. A source with a politeness floor is not contacted again until the floor
    has cleared, and that is decided from the stored record of the last
-   attempt, not from how often the job happens to run.
+   attempt, not from how often the job happens to run. The attempt is
+   recorded *before* the request is made, so the record exists even if the
+   run is stopped half way, and a request that cannot be recorded is not
+   made.
 5. It never raises. A caller cannot accidentally abort the run by forgetting
    a try/except, because there is nothing to catch.
 
@@ -31,8 +35,10 @@ interleave their writes.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
+import math
 import re
 import time
 import urllib.error
@@ -44,6 +50,7 @@ from enum import StrEnum
 from typing import Any
 
 from orbital_watch.config import (
+    HTTP_STALL_TIMEOUT_SECONDS,
     HTTP_TIMEOUT_SECONDS,
     NETWORK_BUDGET_SECONDS,
     USER_AGENT,
@@ -109,9 +116,12 @@ class SourceSpec:
     #: been written by an older revision of this code. Returns the data or
     #: raises ``ValueError``. Defaults to accepting it as stored.
     revalidate: Callable[[Any], Any] | None = None
-    #: Given (new data, previously stored data), raises ``ValueError`` if the
-    #: new payload is implausible next to the old one.
-    plausible: Callable[[Any, Any], None] | None = None
+    #: Given (the new payload, the previously stored one), raises
+    #: ``ValueError`` if the new one is implausible next to the old.
+    plausible: Callable[[Payload, Payload], None] | None = None
+    #: Ceiling on one whole request to this source, from sending it to the
+    #: last byte of the body, in seconds.
+    max_seconds: float = HTTP_TIMEOUT_SECONDS
     #: Do not contact upstream again within this long of its last answer.
     min_refetch_interval: timedelta | None = None
     #: Do not retry within this long of a failed attempt. Only meaningful
@@ -178,32 +188,52 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 #: few hundred characters, so they need far less room.
 _ERROR_BODY_BYTES = 64 * 1024
 
+#: How much of a body is asked for at a time. The deadline is checked between
+#: pieces, so this is also the granularity at which a slow transfer is noticed.
+_READ_PIECE_BYTES = 64 * 1024
+
+#: The least time any attempt is given, however little of the budget is left.
+#: Enough to succeed against a healthy endpoint, short enough that a dead one
+#: costs almost nothing further.
+_MIN_ATTEMPT_SECONDS = 1.0
+
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
 class NetworkBudget:
-    """A shared wall-clock allowance across every fetch in one run.
+    """A shared wall-clock allowance across several fetches in one run.
 
-    Per-call timeouts bound each request, but with every upstream hanging they
-    serialise: N sources x 20s is minutes of dead waiting before propagation
-    starts. This caps the *sum*. Each caller asks :meth:`per_call_timeout` for
-    the smaller of its own default and what remains; once the budget is spent,
-    calls get a 1-second timeout -- enough to succeed against a healthy
-    endpoint, short enough that a dead one costs almost nothing further.
+    Each source has its own ceiling, but with every upstream slow they add
+    up: N sources each using their full allowance is minutes of waiting
+    before propagation starts. This caps the *sum*. Each caller asks
+    :meth:`deadline_for` for the instant its request must be finished by: its
+    own ceiling from now, or the end of the budget, whichever comes first.
 
-    Never blocks a fetch outright: a run with an exhausted budget still
-    *attempts* every source that is due, because an attempt is also how the
-    health panel learns and reports what is wrong.
+    ``not_after`` ties the budget to the run's overall deadline, so that no
+    amount of slowness upstream can use up the time kept for computing and
+    publishing.
+
+    Never blocks a fetch outright: with the budget spent, an attempt still
+    gets a second, because an attempt is also how the health panel learns and
+    reports what is wrong.
     """
 
-    def __init__(self, total_seconds: float = NETWORK_BUDGET_SECONDS) -> None:
-        self._deadline = time.monotonic() + total_seconds
+    def __init__(
+        self,
+        total_seconds: float = NETWORK_BUDGET_SECONDS,
+        *,
+        not_after: float | None = None,
+    ) -> None:
+        self._ends = time.monotonic() + total_seconds
+        if not_after is not None:
+            self._ends = min(self._ends, not_after)
 
-    def per_call_timeout(self, default: float = HTTP_TIMEOUT_SECONDS) -> float:
-        remaining = self._deadline - time.monotonic()
-        return max(1.0, min(default, remaining))
+    def deadline_for(self, ceiling: float = HTTP_TIMEOUT_SECONDS) -> float:
+        """The monotonic instant by which one request must be complete."""
+        now = time.monotonic()
+        return max(now + _MIN_ATTEMPT_SECONDS, min(now + ceiling, self._ends))
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +252,10 @@ class _State:
     last_attempt_at: datetime | None = None
     last_outcome: Outcome | None = None
     last_error: str | None = None
+    #: True from the moment an attempt is claimed until its result is
+    #: recorded. Still true in a record found later means that attempt never
+    #: finished: the run was stopped, or another run is making it right now.
+    attempt_open: bool = False
     validators: dict[str, str] = field(default_factory=dict)
     #: Generation the record was read at; ``ABSENT`` if there was none. Used
     #: as the precondition when writing it back.
@@ -277,7 +311,7 @@ def _load_state(spec: SourceSpec, store: Store) -> _State:
 
     state = _State(generation=stored.generation)
     try:
-        record = json.loads(stored.data)
+        record = _loads(stored.data)
     except (ValueError, UnicodeDecodeError) as exc:
         log.warning(
             "source=%s stored state is not JSON (%s); ignoring it", spec.name, exc
@@ -295,11 +329,13 @@ def _load_state(spec: SourceSpec, store: Store) -> _State:
         state.last_outcome = Outcome(record.get("last_outcome"))
     except ValueError:
         state.last_outcome = None
+    state.attempt_open = record.get("attempt_open") is True
 
     payload = record.get("payload")
     if payload is None:
         return state
     try:
+        _refuse_non_finite(payload)
         state.data = spec.revalidate(payload) if spec.revalidate else payload
     except Exception as exc:
         log.warning(
@@ -324,12 +360,24 @@ def _load_state(spec: SourceSpec, store: Store) -> _State:
     return state
 
 
-def _save_state(spec: SourceSpec, store: Store, state: _State) -> str | None:
-    """Write a source's record back. Returns a note if it could not be saved.
+#: What became of an attempt to write a source's record.
+_SAVED, _CONFLICT, _UNWRITABLE = "saved", "conflict", "unwritable"
 
-    Never raises: a state write that fails must not turn a successful fetch
-    into a failed one. The run still publishes what it fetched; the cost is
-    that the next run will not know about this one.
+_CONFLICT_NOTE = (
+    "Another run updated this source's stored state at the same time; its "
+    "record was kept."
+)
+_UNWRITABLE_NOTE = (
+    "This result could not be saved to the state store, so the next run will "
+    "not know about it."
+)
+
+
+def _write_state(spec: SourceSpec, store: Store, state: _State) -> str:
+    """Write a source's record, conditional on it not having changed.
+
+    Returns ``_SAVED``, ``_CONFLICT`` (somebody else wrote it since we read
+    it; nothing was written) or ``_UNWRITABLE``. Never raises.
     """
 
     def stamp(value: datetime | None) -> str | None:
@@ -340,6 +388,7 @@ def _save_state(spec: SourceSpec, store: Store, state: _State) -> str | None:
         "name": spec.name,
         "url": spec.url,
         "last_attempt_at": stamp(state.last_attempt_at),
+        "attempt_open": state.attempt_open,
         "last_outcome": state.last_outcome.value if state.last_outcome else None,
         "last_error": state.last_error,
         "confirmed_at": stamp(state.confirmed_at),
@@ -357,18 +406,69 @@ def _save_state(spec: SourceSpec, store: Store, state: _State) -> str | None:
             if_generation_match=state.generation,
         )
     except PreconditionFailed:
-        # Another run wrote this source's state while we were fetching. Its
-        # record is at least as new as ours, so it stays; overwriting it is
-        # exactly the interleaving the precondition exists to prevent.
-        log.warning(
-            "source=%s state changed during this run; keeping the other run's record",
-            spec.name,
-        )
-        return "Another run updated this source's stored state at the same time; its record was kept."
+        return _CONFLICT
     except (StoreError, ValueError, TypeError) as exc:
         log.warning("source=%s state could not be saved: %s", spec.name, exc)
-        return "This result could not be saved to the state store, so the next run will not know about it."
-    return None
+        return _UNWRITABLE
+    return _SAVED
+
+
+def _save_result(spec: SourceSpec, store: Store, state: _State) -> str | None:
+    """Record how an attempt ended. Returns a note if it could not be kept.
+
+    Never raises: a state write that fails must not turn a successful fetch
+    into a failed one. The run still publishes what it fetched.
+
+    The write is conditional, so it can lose to another run that wrote the
+    same source's record in the meantime. What happens then depends on who
+    holds what:
+
+    * We failed. The other record stays. Whatever it says, it is not worth
+      replacing with a failure.
+    * We succeeded, and the other record is a success at least as recent.
+      It stays.
+    * We succeeded, and the other record is a failure or an older success.
+      Ours is written over it, once. Giving up here would discard a payload
+      this run had just downloaded in favour of a record saying there was
+      none -- and for a rate-limited source it could not be fetched again
+      until the floor cleared.
+    """
+    state.attempt_open = False
+    status = _write_state(spec, store, state)
+    if status == _SAVED:
+        return None
+    if status == _UNWRITABLE:
+        return _UNWRITABLE_NOTE
+
+    if state.last_outcome in CONTACT_OUTCOMES:
+        try:
+            theirs = _load_state(spec, store)
+        except _StateUnreadable:
+            return _UNWRITABLE_NOTE
+        newer_success = (
+            theirs.last_outcome in CONTACT_OUTCOMES
+            and theirs.confirmed_at is not None
+            and state.confirmed_at is not None
+            and theirs.confirmed_at >= state.confirmed_at
+        )
+        if not newer_success:
+            state.generation = theirs.generation
+            status = _write_state(spec, store, state)
+            if status == _SAVED:
+                log.info(
+                    "source=%s another run recorded an older result meanwhile; "
+                    "this run's was written over it",
+                    spec.name,
+                )
+                return None
+            if status == _UNWRITABLE:
+                return _UNWRITABLE_NOTE
+
+    log.warning(
+        "source=%s state changed during this run; keeping the other run's record",
+        spec.name,
+    )
+    return _CONFLICT_NOTE
 
 
 # --------------------------------------------------------------------------
@@ -384,11 +484,31 @@ class _Withheld(Exception):
     """Upstream declined to send data, and what we hold may not be current."""
 
 
+class _Incomplete(Exception):
+    """The request's ceiling passed before the whole response had arrived."""
+
+    def __init__(self, received: int) -> None:
+        super().__init__(f"{received} bytes received")
+        self.received = received
+
+
+@dataclass(frozen=True)
+class _Allowance:
+    """How long one attempt was given, so a failure can say so accurately."""
+
+    #: The instant, on the monotonic clock, by which the response must be complete.
+    deadline: float
+    #: Seconds from the start of the attempt to that instant.
+    total: float
+    #: Seconds the connection may go without sending anything.
+    stall: float
+
+
 def fetch_source(
     spec: SourceSpec,
     store: Store,
     *,
-    timeout: float = HTTP_TIMEOUT_SECONDS,
+    deadline: float | None = None,
     clock: Callable[[], datetime] = utcnow,
 ) -> FetchResult:
     """Read one upstream source, falling back to stored data on any failure.
@@ -398,12 +518,24 @@ def fetch_source(
     Args:
         spec: Which upstream, how to validate it, and how often it may be asked.
         store: Where the source's state is kept between runs.
-        timeout: Hard per-call timeout in seconds.
+        deadline: The instant on the monotonic clock by which the request,
+            body included, must be complete. Defaults to the source's own
+            ceiling from now; a :class:`NetworkBudget` hands out earlier ones.
         clock: Source of the current time. Injectable so tests can move it.
     """
     started = time.monotonic()
+    if deadline is None:
+        deadline = started + spec.max_seconds
+    total = max(deadline - started, 0.0)
+    allowance = _Allowance(
+        deadline=deadline,
+        total=total,
+        # A connection that goes silent is cut sooner than one that is merely
+        # slow, but never later than the attempt as a whole.
+        stall=max(min(HTTP_STALL_TIMEOUT_SECONDS, total), 0.1),
+    )
     try:
-        return _fetch(spec, store, timeout, clock, started)
+        return _fetch(spec, store, allowance, clock, started)
     except Exception as exc:
         # Nothing below is expected to raise, and this handler is what makes
         # "never raises" a property rather than a hope. The message is not
@@ -423,7 +555,7 @@ def fetch_source(
 def _fetch(
     spec: SourceSpec,
     store: Store,
-    timeout: float,
+    allowance: _Allowance,
     clock: Callable[[], datetime],
     started: float,
 ) -> FetchResult:
@@ -487,15 +619,27 @@ def _fetch(
     if wait is not None:
         return _not_due(spec, state, wait, now, started, result)
 
+    # --- A floored source is claimed before it is contacted.
+    if spec.min_refetch_interval is not None:
+        state, refusal = _claim_attempt(spec, store, state, now, started, result)
+        if refusal is not None:
+            return refusal
+    else:
+        state.last_attempt_at = now
+
+    def save(current: _State) -> str | None:
+        return _save_result(spec, store, current) if state_usable else _UNSAVED_NOTE
+
     # --- Live attempt.
-    state.last_attempt_at = now
     try:
-        raw, validators = _http_get(spec, state, timeout)
-        payload = _as_payload(
-            spec.parse(json.loads(raw)) if spec.parse else json.loads(raw)
-        )
+        raw, validators = _http_get(spec, state, allowance)
+        decoded = _loads(raw)
+        payload = _as_payload(spec.parse(decoded) if spec.parse else decoded)
+        # After parsing, so that a reading the parser already set aside does
+        # not cost the whole payload; whatever is kept must be finite.
+        _refuse_non_finite(payload.data)
         if spec.plausible is not None and state.data is not None:
-            spec.plausible(payload.data, state.data)
+            spec.plausible(payload, Payload(data=state.data, facts=state.facts))
 
         fetched = clock()
         state.data = payload.data
@@ -505,7 +649,7 @@ def _fetch(
         state.validators = validators
         state.last_outcome = Outcome.LIVE
         state.last_error = None
-        note = _save_state(spec, store, state) if state_usable else _UNSAVED_NOTE
+        note = save(state)
         log.info(
             "source=%s outcome=live elapsed=%.3fs chars=%d",
             spec.name,
@@ -520,17 +664,16 @@ def _fetch(
             # first run from an address that pulled the same group recently.
             return _degrade(
                 spec,
-                store,
                 state,
                 f"Upstream withheld data and nothing is stored: {exc}",
-                state_usable,
+                save,
                 started,
                 result,
             )
         state.confirmed_at = clock()
         state.last_outcome = Outcome.NOT_MODIFIED
         state.last_error = None
-        note = _save_state(spec, store, state) if state_usable else _UNSAVED_NOTE
+        note = save(state)
         log.info(
             "source=%s outcome=not_modified elapsed=%.3fs (upstream reports no "
             "new data since our last download)",
@@ -545,14 +688,92 @@ def _fetch(
 
     except Exception as exc:
         return _degrade(
-            spec,
-            store,
-            state,
-            _describe_error(exc, timeout),
-            state_usable,
-            started,
-            result,
+            spec, state, _describe_error(exc, allowance), save, started, result
         )
+
+
+_OPEN_ATTEMPT_ERROR = "An attempt was started and has not recorded a result."
+
+
+def _claim_attempt(
+    spec: SourceSpec,
+    store: Store,
+    state: _State,
+    now: datetime,
+    started: float,
+    result: Callable[..., FetchResult],
+) -> tuple[_State, FetchResult | None]:
+    """Record that a rate-limited upstream is about to be asked.
+
+    Returns the state to carry on with and ``None``, or a result to return
+    *instead of* making the request.
+
+    The politeness floor is only as good as the record it is checked against.
+    Writing that record after the request leaves three holes, all of which
+    were found by review before this ran in production:
+
+    * a run stopped mid-request (the platform's timeout, a crash) leaves no
+      trace, so the next run asks again, and the next;
+    * a store that can be read but not written lets every run ask;
+    * two overlapping runs both see "due" and both ask.
+
+    So the attempt is written first, conditionally. If the write cannot be
+    made, the request is not made either: an upstream that rate-limits is not
+    contacted on the strength of a record that does not exist. If another run
+    wrote first, that run is doing the asking.
+
+    The claim is marked open. Until a result replaces it, the source counts
+    as having failed at this instant, which is what makes the shorter retry
+    interval -- not "ask again at once" -- apply to an attempt that never
+    finished.
+    """
+    claim = dataclasses.replace(
+        state,
+        last_attempt_at=now,
+        attempt_open=True,
+        last_outcome=(
+            Outcome.CACHE_FALLBACK if state.data is not None else Outcome.FAILED
+        ),
+        last_error=_OPEN_ATTEMPT_ERROR,
+    )
+    status = _write_state(spec, store, claim)
+    if status == _SAVED:
+        return claim, None
+
+    if status == _CONFLICT:
+        try:
+            theirs = _load_state(spec, store)
+        except _StateUnreadable:
+            theirs = None
+        if theirs is not None:
+            wait = _time_until_due(spec, theirs, now)
+            if wait is not None:
+                return state, _not_due(spec, theirs, wait, now, started, result)
+            state = theirs
+        error = (
+            "Another run was contacting this upstream at the same moment; "
+            "this run left it alone."
+        )
+    else:
+        error = (
+            "The state store could not be written, so this request could not "
+            "be recorded; the upstream was not contacted."
+        )
+
+    serving = state.data is not None
+    log.warning(
+        "source=%s outcome=%s elapsed=%.3fs error=attempt-not-claimed (%s)",
+        spec.name,
+        "cache_fallback" if serving else "failed",
+        time.monotonic() - started,
+        status,
+    )
+    return state, result(
+        state,
+        Outcome.CACHE_FALLBACK if serving else Outcome.FAILED,
+        error=error,
+        serve=serving,
+    )
 
 
 _UNSAVED_NOTE = (
@@ -632,10 +853,20 @@ def _not_due(
     # the state that attempt left it in: reporting it as a deliberate, healthy
     # skip would make a broken source flip back to "fresh" between retries.
     error = state.last_error or "The last attempt failed."
-    note = (
-        f"Last attempt was {since} ago and failed; the next one is due in "
-        f"{format_duration(wait)}."
-    )
+    if state.attempt_open:
+        # Either another run is making that attempt right now, or the run
+        # that started it was stopped before it could say how it went. From
+        # here the two cannot be told apart, and the note does not pretend to.
+        note = (
+            f"An attempt started {since} ago has not recorded a result "
+            f"(another run may still be making it, or it was cut off); the "
+            f"next one is due in {format_duration(wait)}."
+        )
+    else:
+        note = (
+            f"Last attempt was {since} ago and failed; the next one is due in "
+            f"{format_duration(wait)}."
+        )
     if state.data is not None:
         log.warning(
             "source=%s outcome=cache_fallback elapsed=%.3fs error=%s (retry in %s)",
@@ -658,10 +889,9 @@ def _not_due(
 
 def _degrade(
     spec: SourceSpec,
-    store: Store,
     state: _State,
     detail: str,
-    state_usable: bool,
+    save: Callable[[_State], str | None],
     started: float,
     result: Callable[..., FetchResult],
 ) -> FetchResult:
@@ -674,7 +904,7 @@ def _degrade(
     serving = state.data is not None
     state.last_outcome = Outcome.CACHE_FALLBACK if serving else Outcome.FAILED
     state.last_error = detail
-    note = _save_state(spec, store, state) if state_usable else _UNSAVED_NOTE
+    note = save(state)
 
     elapsed = time.monotonic() - started
     if serving:
@@ -701,13 +931,23 @@ def _degrade(
 
 
 def _http_get(
-    spec: SourceSpec, state: _State, timeout: float
+    spec: SourceSpec, state: _State, allowance: _Allowance
 ) -> tuple[str, dict[str, str]]:
     """GET the source. Returns (body, validators) or raises.
 
     Raises :class:`_NotModified` when upstream says our copy is current,
-    :class:`_Withheld` when it says so about a download that was not ours, and
-    whatever ``urlopen`` raises otherwise.
+    :class:`_Withheld` when it says so about a download that was not ours,
+    :class:`_Incomplete` when the ceiling passed mid-response, and whatever
+    ``urlopen`` raises otherwise.
+
+    Two limits apply, and they catch different things. The socket timeout
+    handed to ``urlopen`` bounds each *wait* -- connecting, the headers, any
+    one read -- so a connection that goes silent is dropped. It cannot bound
+    the response as a whole: a server sending a few bytes every few seconds
+    never trips it, and a 5 MB body at 8 KB/s (seen from Celestrak on the first
+    real run of this job) would be read for ten minutes. So the body is read in
+    pieces against a deadline, and abandoned when the deadline passes. The
+    longest an attempt can run is its allowance plus one socket timeout.
     """
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     # Conditional request, but only when there is a payload to keep using: a
@@ -720,8 +960,10 @@ def _http_get(
 
     request = urllib.request.Request(spec.url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = _read_capped(response).decode("utf-8", errors="replace")
+        with urllib.request.urlopen(request, timeout=allowance.stall) as response:
+            raw = _read_capped(response, deadline=allowance.deadline).decode(
+                "utf-8", errors="replace"
+            )
             validators = _validators_from(response)
     except urllib.error.HTTPError as http_error:
         if http_error.code == 304:
@@ -730,7 +972,7 @@ def _http_get(
         # 200, so the body has to be inspected on the error path too. Without
         # this, "nothing has changed since your last download" -- a completely
         # benign condition -- is reported as a hard failure.
-        _raise_if_not_updated(_read_error_body(http_error), state)
+        _raise_if_not_updated(_read_error_body(http_error, allowance.deadline), state)
         raise
 
     _raise_if_not_updated(raw, state)
@@ -790,59 +1032,116 @@ def _as_payload(parsed: Any) -> Payload:
     return parsed if isinstance(parsed, Payload) else Payload(data=parsed)
 
 
-def _read_capped(response: Any, limit: int | None = None) -> bytes:
-    """Read at most ``limit`` bytes, rejecting anything larger.
+def _read_capped(
+    response: Any, limit: int | None = None, *, deadline: float | None = None
+) -> bytes:
+    """Read a body piece by piece, bounded in size and in time.
 
-    An unbounded ``read()`` is the one failure mode this module's contract
-    cannot survive. Every other upstream problem raises an exception that is
-    turned into a fallback; a multi-gigabyte body instead gets the process
-    killed for memory, which is not catchable. The run dies, no fallback
-    happens, and the property this project exists to demonstrate fails -- not
-    because of a bug in the logic, but because the logic never got to run.
+    Bounded in size: an unbounded ``read()`` is one failure mode this
+    module's contract cannot survive. Every other upstream problem raises an
+    exception that is turned into a fallback; a multi-gigabyte body instead
+    gets the process killed for memory, which is not catchable. Raising
+    ValueError routes an oversized body through the normal rejected-payload
+    path, so it degrades to stored data like any other bad response.
 
-    Raising ValueError routes an oversized body through the normal rejected-
-    payload path, so it degrades to stored data like any other bad response.
+    Bounded in time: the other one. A body that arrives slowly but steadily
+    never trips a socket timeout, and a single ``read()`` of it returns only
+    when the last byte does. Asking for a piece at a time and checking the
+    clock in between means the read stops when the attempt's time is up.
+    ``read1`` is used where the stream has it: it hands back whatever has
+    arrived instead of waiting to fill the request, so a trickle is noticed
+    within one socket timeout rather than one full piece.
 
-    The cap is read from the module at call time rather than bound as a default
-    argument, so it stays a single tunable value rather than one frozen when
-    this function was defined.
+    The size cap is read from the module at call time rather than bound as a
+    default argument, so it stays a single tunable value.
     """
     limit = MAX_RESPONSE_BYTES if limit is None else limit
-    body = response.read(limit + 1)
-    if len(body) > limit:
-        raise ValueError(
-            f"response exceeded the {limit // (1024 * 1024)} MB cap; refusing to buffer it"
-        )
-    return body
+    read_some = getattr(response, "read1", None) or response.read
+    pieces: list[bytes] = []
+    received = 0
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _Incomplete(received)
+        piece = read_some(min(_READ_PIECE_BYTES, limit + 1 - received))
+        if not piece:
+            return b"".join(pieces)
+        pieces.append(piece)
+        received += len(piece)
+        if received > limit:
+            raise ValueError(
+                f"response exceeded the {limit // (1024 * 1024)} MB cap; refusing to buffer it"
+            )
 
 
-def _read_error_body(error: urllib.error.HTTPError) -> str:
+def _read_error_body(error: urllib.error.HTTPError, deadline: float) -> str:
     """Best-effort read of an HTTPError's body. Never raises.
 
     Only the first few hundred characters are ever inspected (for Celestrak's
-    not-updated sentinel), so this is capped far tighter than a success body.
+    not-updated sentinel), so this is capped far tighter than a success body,
+    and it is read against the same deadline: an error page can trickle too.
     """
     try:
-        return error.read(_ERROR_BODY_BYTES).decode("utf-8", errors="replace")
+        if error.fp is None:
+            return ""
+        body = _read_capped(error.fp, _ERROR_BODY_BYTES, deadline=deadline)
     except Exception:
         # Diagnostic read only; a failure here must not mask the original error.
         return ""
+    return body.decode("utf-8", errors="replace")
 
 
-def _describe_error(exc: Exception, timeout: float) -> str:
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not a number JSON can carry")
+
+
+def _loads(raw: str | bytes) -> Any:
+    """Decode JSON, refusing the non-standard words NaN and Infinity.
+
+    Python's parser accepts them by default and returns floats that no
+    browser's JSON parser will read back. A document carrying one cannot be
+    published, so one is not let in.
+    """
+    return json.loads(raw, parse_constant=_reject_constant)
+
+
+def _refuse_non_finite(value: Any, path: str = "payload") -> None:
+    """Raise ValueError if a NaN or infinity is anywhere in ``value``.
+
+    Refusing the words NaN and Infinity is not enough: a number too large
+    for a float (``1e999``) is valid JSON and decodes to infinity. Checked on
+    what a parser *kept*, so a parser may still set one bad reading aside
+    and keep the rest.
+    """
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite number at {path}")
+    elif isinstance(value, dict):
+        for key, child in value.items():
+            _refuse_non_finite(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _refuse_non_finite(child, f"{path}[{index}]")
+
+
+def _describe_error(exc: Exception, allowance: _Allowance) -> str:
     """Human-readable one-liner for the health panel.
 
     Published verbatim in the document, so it must describe what the code
-    actually did -- including the timeout actually used, not the default.
+    actually did -- including the limits actually applied, not the defaults.
     """
     if isinstance(exc, _Withheld):
         return str(exc)
+    if isinstance(exc, _Incomplete):
+        return (
+            f"Gave up after {allowance.total:.0f}s with the response incomplete "
+            f"({exc.received // 1024} KB received)"
+        )
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP {exc.code} {exc.reason}"
     if isinstance(exc, urllib.error.URLError):
         return f"Network error: {exc.reason}"
     if isinstance(exc, TimeoutError):
-        return f"Timed out after {timeout:.0f}s"
+        return f"Timed out after {allowance.stall:.0f}s without a response"
     if isinstance(exc, json.JSONDecodeError):
         return f"Malformed JSON: {exc.msg}"
     if isinstance(exc, ValueError):

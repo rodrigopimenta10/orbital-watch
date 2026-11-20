@@ -12,6 +12,7 @@ kinds of failure and only the second should fail the run.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections.abc import Callable
@@ -21,8 +22,10 @@ from typing import Any
 from orbital_watch import health
 from orbital_watch.config import (
     CELESTRAK_MIN_REFETCH_INTERVAL,
+    CELESTRAK_NETWORK_BUDGET_SECONDS,
     CELESTRAK_PUBLICATION_INTERVAL,
     CELESTRAK_RETRY_INTERVAL,
+    COMPUTE_RESERVE_SECONDS,
     DEFAULT_OBSERVER,
     EPHEMERIS_STEP,
     EPHEMERIS_WINDOW,
@@ -33,10 +36,12 @@ from orbital_watch.config import (
     MIN_PASS_ELEVATION_DEG,
     PASS_SEARCH_HOURS,
     PIPELINE_SILENCE_LIMIT,
+    PUBLISH_RESERVE_SECONDS,
     REFRESH_CADENCE,
     REVISION_ENV,
     RUN_DEADLINE_SECONDS,
     SPACE_WEATHER_STALENESS,
+    SWPC_NETWORK_BUDGET_SECONDS,
     TLE_STALENESS,
     TRACKED_GROUPS,
     Observer,
@@ -67,11 +72,6 @@ from orbital_watch.store import Store
 
 log = logging.getLogger(__name__)
 
-#: Time kept back from the run deadline for validating and publishing the
-#: document. The pass search, the only long computation, stops early enough
-#: to leave this much.
-PUBLISH_RESERVE_SECONDS = 30.0
-
 #: Every source the health panel must account for, in display order. The
 #: document is checked against this list before it is published, so a run
 #: cannot quietly drop a source from the panel.
@@ -99,6 +99,17 @@ class Deadline:
     def too_late_to_compute(self) -> bool:
         """Whether a long computation should stop so the run can still publish."""
         return self.remaining() <= PUBLISH_RESERVE_SECONDS
+
+    def network_must_end_by(self) -> float:
+        """The monotonic instant after which no upstream request may still run.
+
+        Upstreams get what is left of the run once computing and publishing
+        have been provided for, and not a second of what those need. Without
+        this the run deadline was only a hope: a slow upstream could take as
+        long as it liked, and the time came out of the pass search and then
+        out of publication itself.
+        """
+        return self._ends - PUBLISH_RESERVE_SECONDS - COMPUTE_RESERVE_SECONDS
 
 
 # --------------------------------------------------------------------------
@@ -136,19 +147,28 @@ def empty_weather() -> dict[str, Any]:
 
 
 def collect_space_weather(
-    store: Store, *, clock: Callable[[], datetime] = utcnow
+    store: Store,
+    *,
+    clock: Callable[[], datetime] = utcnow,
+    not_after: float | None = None,
 ) -> tuple[dict, list[health.SourceHealth]]:
-    """Fetch and interpret space weather. Degrades field by field."""
-    # One budget across the four SWPC reads: individually bounded calls still
-    # serialise into minutes when everything hangs, and the budget caps the
-    # sum. It is separate from Celestrak's so that one provider hanging cannot
-    # spend the other's allowance.
-    budget = NetworkBudget()
+    """Fetch and interpret space weather. Degrades field by field.
+
+    ``not_after`` is the monotonic instant by which every request must be
+    over, from the run's deadline.
+    """
+    # One budget across the four SWPC reads: individually bounded requests
+    # still serialise into minutes when everything is slow, and the budget
+    # caps the sum. It is separate from Celestrak's so that one provider
+    # being slow cannot spend the other's allowance.
+    budget = NetworkBudget(SWPC_NETWORK_BUDGET_SECONDS, not_after=not_after)
 
     results: dict[str, FetchResult] = {}
     reports: list[health.SourceHealth] = []
     for spec in (swpc.KP, swpc.SOLAR_WIND, swpc.MAG_FIELD, swpc.SOLAR_CYCLE):
-        result = fetch_source(spec, store, timeout=budget.per_call_timeout(), clock=clock)
+        result = fetch_source(
+            spec, store, deadline=budget.deadline_for(spec.max_seconds), clock=clock
+        )
         results[spec.name] = result
         reports.append(
             health.evaluate(
@@ -223,7 +243,11 @@ def collect_space_weather(
 
 
 def collect_satellites(
-    store: Store, ts, *, clock: Callable[[], datetime] = utcnow
+    store: Store,
+    ts,
+    *,
+    clock: Callable[[], datetime] = utcnow,
+    not_after: float | None = None,
 ) -> tuple[list, list[health.SourceHealth], list[dict]]:
     """Load every tracked group and build propagatable satellites.
 
@@ -242,11 +266,13 @@ def collect_satellites(
     tracked: list = []
     reports: list[health.SourceHealth] = []
     coverage: list[dict] = []
-    budget = NetworkBudget()
+    budget = NetworkBudget(CELESTRAK_NETWORK_BUDGET_SECONDS, not_after=not_after)
 
     for group in TRACKED_GROUPS:
         spec = celestrak.group_spec(group)
-        result = fetch_source(spec, store, timeout=budget.per_call_timeout(), clock=clock)
+        result = fetch_source(
+            spec, store, deadline=budget.deadline_for(spec.max_seconds), clock=clock
+        )
         reports.append(
             health.evaluate(
                 result, TLE_STALENESS, label=SOURCE_LABELS[spec.name], now=clock()
@@ -314,8 +340,15 @@ CORRELATION_EXPLANATION = (
 )
 
 
-def build_correlation(weather: dict) -> dict:
-    """Decide whether to raise the operational banner, and say why."""
+def build_correlation(weather: dict, *, kp_current: bool = True) -> dict:
+    """Decide whether to raise the operational banner, and say why.
+
+    ``kp_current`` is false when the Kp source has aged past its limit. The
+    banner speaks in the present tense -- "storm in progress" -- and a Kp
+    value the health panel calls not operationally current is not evidence
+    about the present. In that case no assessment is made, and the banner
+    says what the last value was and that it is too old to act on.
+    """
     if not weather.get("available"):
         return {
             "active": False,
@@ -328,9 +361,28 @@ def build_correlation(weather: dict) -> dict:
             ),
             "explanation": CORRELATION_EXPLANATION,
             "operational_impacts": [],
+            "source": swpc.KP.name,
         }
 
     kp = weather["kp"]
+
+    if not kp_current:
+        return {
+            "active": False,
+            "severity": "unknown",
+            "headline": f"Geomagnetic assessment not current — last Kp {kp:g}",
+            "detail": (
+                f"The last Kp value received was {kp:g}, and its source has "
+                f"gone unanswered for longer than the limit shown in system "
+                f"health. That is too old to describe conditions now, so no "
+                f"assessment is made from it. Pass predictions below are "
+                f"unaffected, but treat drag-driven error growth as "
+                f"unquantified."
+            ),
+            "explanation": CORRELATION_EXPLANATION,
+            "operational_impacts": [],
+            "source": swpc.KP.name,
+        }
 
     if weather["storm"]:
         return {
@@ -354,6 +406,7 @@ def build_correlation(weather: dict) -> dict:
                 "Ionospheric scintillation may degrade UHF/L-band, including GNSS "
                 "timing and positioning.",
             ],
+            "source": swpc.KP.name,
         }
 
     if weather["elevated"]:
@@ -372,6 +425,7 @@ def build_correlation(weather: dict) -> dict:
                 "Minor growth in along-track error between element-set updates.",
                 "Occasional HF degradation at high latitude.",
             ],
+            "source": swpc.KP.name,
         }
 
     return {
@@ -385,6 +439,7 @@ def build_correlation(weather: dict) -> dict:
         ),
         "explanation": CORRELATION_EXPLANATION,
         "operational_impacts": [],
+        "source": swpc.KP.name,
     }
 
 
@@ -462,8 +517,11 @@ def build_document(
 
     # Space weather first. Its four reads are small and quick; Celestrak's are
     # the ones that hang when it throttles, and they should not delay these.
+    network_ends = deadline.network_must_end_by()
     try:
-        weather, weather_reports = collect_space_weather(store, clock=clock)
+        weather, weather_reports = collect_space_weather(
+            store, clock=clock, not_after=network_ends
+        )
     except Exception:
         log.exception("space weather collection failed; continuing without it")
         weather = empty_weather()
@@ -474,7 +532,9 @@ def build_document(
         )
 
     try:
-        tracked, tle_reports, coverage = collect_satellites(store, ts, clock=clock)
+        tracked, tle_reports, coverage = collect_satellites(
+            store, ts, clock=clock, not_after=network_ends
+        )
     except Exception:
         log.exception("satellite collection failed; continuing with no satellites")
         tracked, coverage = [], []
@@ -506,7 +566,19 @@ def build_document(
     except Exception:
         log.exception("pass computation failed; continuing with no passes")
         search = PassSearch(passes=[], searched=0, total=len(tracked))
-    upcoming = search.passes[:MAX_PASSES_TOTAL]
+    # A pass with a number JSON cannot carry would stop the whole document at
+    # validation. It costs that pass instead.
+    upcoming = [
+        item
+        for item in search.passes
+        if math.isfinite(item.peak_elevation_deg) and math.isfinite(item.duration_seconds)
+    ][:MAX_PASSES_TOTAL]
+
+    # The banner speaks about now; a Kp source past its limit cannot.
+    kp_current = not any(
+        report.name == swpc.KP.name and report.state is health.State.FAILED
+        for report in weather_reports
+    )
 
     reports = _in_display_order(tle_reports + weather_reports)
     health_block = health.summarize(reports)
@@ -574,7 +646,7 @@ def build_document(
         },
         "space_weather": {
             "weather": weather,
-            "correlation": build_correlation(weather),
+            "correlation": build_correlation(weather, kp_current=kp_current),
         },
         "health": health_block,
     }

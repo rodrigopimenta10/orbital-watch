@@ -147,6 +147,12 @@ PIPELINE_SILENCE_LIMIT = REFRESH_CADENCE * MISSED_RUNS_BEFORE_ALARM
 #: Cloud Run task timeout sits above it as the hard stop.
 RUN_DEADLINE_SECONDS = 180.0
 
+#: Time kept back from that allowance for work that comes after the network:
+#: propagating and searching for passes, then validating and publishing.
+#: Network requests may not begin to use it, whatever the upstreams do.
+COMPUTE_RESERVE_SECONDS = 20.0
+PUBLISH_RESERVE_SECONDS = 30.0
+
 
 # --------------------------------------------------------------------------
 # Upstream sources
@@ -157,15 +163,38 @@ USER_AGENT = (
     "portfolio project; contact via GitHub issues"
 )
 
-#: Hard ceiling on any single network call. No unbounded waits, ever.
+#: Longest a connection may go without sending anything: while connecting,
+#: while waiting for the headers, or between two pieces of a body. This is
+#: the socket timeout. It catches an upstream that has gone silent; it cannot
+#: catch one that is merely slow, which is what the ceilings below are for.
+HTTP_STALL_TIMEOUT_SECONDS = 10.0
+
+#: Ceiling on one whole request, from sending it to the last byte of the
+#: body. No unbounded waits, ever. Every source here but one answers in well
+#: under a second with at most half a megabyte.
 HTTP_TIMEOUT_SECONDS = 20.0
 
-#: Ceiling on total network wait across one run. Per-call timeouts alone are
-#: not enough: with every source down, seven sources x 20s serialises into
-#: minutes of waiting before propagation even starts. Once this budget is
-#: spent, remaining fetches get whatever is left (minimum 1s), so a run in
-#: which everything is down still finishes promptly.
-NETWORK_BUDGET_SECONDS = 60.0
+#: The one large response is the Starlink group: about 5 MB. A healthy
+#: transfer takes a few seconds. 45 s lets it complete at a ninth of a
+#: megabyte per second, more than ten times slower than healthy; anything
+#: slower than that is a throttled connection (8 KB/s was seen on the first
+#: real run, which would need ten minutes) and is better abandoned, reported,
+#: and retried in half an hour than waited on.
+STARLINK_TIMEOUT_SECONDS = 45.0
+
+#: Ceilings on total network time per upstream provider in one run, kept
+#: separate so that one provider being slow cannot spend the other's
+#: allowance. Per-request ceilings alone are not enough: several sources each
+#: using theirs in full serialises into minutes of waiting before propagation
+#: starts. Once a budget is spent, remaining requests to that provider get a
+#: second each, so a run in which everything is down still finishes promptly.
+#: SWPC's covers three of its four small products timing out outright;
+#: Celestrak's covers the Starlink ceiling plus one more group's.
+SWPC_NETWORK_BUDGET_SECONDS = 60.0
+CELESTRAK_NETWORK_BUDGET_SECONDS = 65.0
+
+#: The default for a budget built without a figure.
+NETWORK_BUDGET_SECONDS = SWPC_NETWORK_BUDGET_SECONDS
 
 CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
 
@@ -202,12 +231,19 @@ class SatelliteGroup:
     #: ~11k objects; propagating all of them would blow up run time and the
     #: published document for no analytical gain. See DECISIONS.md.
     max_objects: int
+    #: Ceiling on one whole request for this group, body included.
+    fetch_seconds: float = HTTP_TIMEOUT_SECONDS
 
 
 TRACKED_GROUPS: tuple[SatelliteGroup, ...] = (
     SatelliteGroup(key="stations", label="Space Stations", max_objects=40),
     SatelliteGroup(key="weather", label="Weather Satellites", max_objects=90),
-    SatelliteGroup(key="starlink", label="Starlink", max_objects=60),
+    SatelliteGroup(
+        key="starlink",
+        label="Starlink",
+        max_objects=60,
+        fetch_seconds=STARLINK_TIMEOUT_SECONDS,
+    ),
 )
 
 SWPC_KP_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"

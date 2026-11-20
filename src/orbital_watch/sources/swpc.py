@@ -14,6 +14,7 @@ more.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -210,6 +211,10 @@ def _reading_from(raw_time: object, raw_kp: object) -> KpReading | None:
         kp = float(raw_kp)
     except (TypeError, ValueError):
         return None
+    # float() reads "NaN" and "Infinity" without complaint. Neither is a
+    # reading, and neither can be written into the published document.
+    if not math.isfinite(kp):
+        return None
     return KpReading(time_tag=stamp, kp=kp)
 
 
@@ -253,6 +258,8 @@ def latest_value(records: list, *keys: str) -> tuple[float | None, datetime | No
             try:
                 value = float(row[key])
             except (TypeError, ValueError):
+                value = None
+            if value is not None and not math.isfinite(value):
                 value = None
             break
 

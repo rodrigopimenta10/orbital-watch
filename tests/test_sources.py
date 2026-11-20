@@ -39,7 +39,9 @@ from orbital_watch.store import PreconditionFailed, StoreError
 from tests.helpers import (
     FAILURE_MODES,
     FakeClock,
+    FakeMonotonic,
     FakeResponse,
+    TricklingResponse,
     fixture_bytes,
     responder,
     urls,
@@ -210,10 +212,11 @@ def test_rejected_payload_does_not_overwrite_good_stored_data(state_store, monke
 
 def test_timeout_error_reports_the_timeout_actually_used(state_store, monkeypatch):
     serve(monkeypatch, {"data.json": TimeoutError("timed out")})
+    spec = SourceSpec(name="demo", url=DEMO.url, max_seconds=7)
 
-    result = fetch_source(DEMO, state_store, timeout=7.0)
+    result = fetch_source(spec, state_store)
 
-    assert result.error == "Timed out after 7s"
+    assert result.error == "Timed out after 7s without a response"
 
 
 def test_oversized_response_is_rejected_not_buffered(state_store, monkeypatch):
@@ -961,3 +964,395 @@ def test_staleness_policy_is_explicit_not_magic():
     for policy in (TLE_STALENESS, SPACE_WEATHER_STALENESS):
         assert isinstance(policy, StalenessPolicy)
         assert policy.fresh_within < policy.stale_within
+
+
+# --------------------------------------------------------------------------
+# Review findings before the first deploy (DECISIONS.md §30)
+# --------------------------------------------------------------------------
+#
+# Each test below first reproduced a defect an independent review found, and
+# now pins its fix.
+
+
+@pytest.fixture
+def monotonic(monkeypatch) -> FakeMonotonic:
+    """Replace the monotonic clock, so "ninety seconds pass" takes no time."""
+    import time
+
+    fake = FakeMonotonic()
+    monkeypatch.setattr(time, "monotonic", fake)
+    return fake
+
+
+def trickle(monkeypatch, monotonic, body: bytes, **kwargs) -> list[TricklingResponse]:
+    """Install an upstream that sends ``body`` slowly; returns the responses made."""
+    made: list[TricklingResponse] = []
+
+    def _urlopen(request, timeout=None):
+        made.append(TricklingResponse(body, monotonic, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    return made
+
+
+FIVE_MEGABYTES = b"[" + b"1," * (5 * 1024 * 1024 // 2) + b"1]"
+
+
+def test_throttled_body_is_abandoned_at_the_ceiling_not_read_to_the_end(
+    state_store, monkeypatch, monotonic
+):
+    """Defect 1: a slow body never tripped the "hard timeout".
+
+    Seen live: Celestrak served the 5 MB Starlink group at about 8 KB/s. No
+    single socket read stalled, so the per-read timeout never fired, and the
+    job read on for minutes -- past the point where it could still publish.
+    The request as a whole now has a ceiling.
+    """
+    made = trickle(monkeypatch, monotonic, FIVE_MEGABYTES)  # 8 KB/s: 640 s in all
+    spec = SourceSpec(
+        name="slow", url="https://example.invalid/slow.json", max_seconds=20
+    )
+    started = monotonic.now
+
+    result = fetch_source(spec, state_store)
+
+    waited = monotonic.now - started
+    assert result.outcome is Outcome.FAILED
+    assert waited <= 21, f"read for {waited:.0f}s against a 20s ceiling"
+    assert made[0].pieces_sent <= 21
+    assert "incomplete" in result.error
+    assert "20s" in result.error
+
+
+def test_throttled_body_falls_back_to_stored_data(state_store, monkeypatch, monotonic):
+    spec = SourceSpec(
+        name="slow", url="https://example.invalid/slow.json", max_seconds=20
+    )
+    serve(monkeypatch, {"slow.json": [1, 2, 3]})
+    fetch_source(spec, state_store)
+
+    trickle(monkeypatch, monotonic, FIVE_MEGABYTES)
+    result = fetch_source(spec, state_store)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert result.data == [1, 2, 3]
+    assert stored_record(state_store, spec)["payload"] == [1, 2, 3]
+
+
+def test_slow_but_adequate_transfer_still_completes(state_store, monkeypatch, monotonic):
+    """The ceiling must not cut off a transfer that is merely unhurried."""
+    body = json.dumps(list(range(50_000))).encode()
+    trickle(monkeypatch, monotonic, body, piece=64 * 1024, seconds_per_piece=2.0)
+    spec = SourceSpec(
+        name="slow", url="https://example.invalid/slow.json", max_seconds=20
+    )
+
+    result = fetch_source(spec, state_store)
+
+    assert result.outcome is Outcome.LIVE
+    assert len(result.data) == 50_000
+
+
+def test_error_body_is_read_against_the_same_ceiling(state_store, monkeypatch, monotonic):
+    """An error response can trickle too; its body is only read for a sentence."""
+
+    def _urlopen(request, timeout=None):
+        body = TricklingResponse(b"x" * 10_000_000, monotonic, piece=16)
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, body)
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    spec = SourceSpec(
+        name="slow", url="https://example.invalid/slow.json", max_seconds=20
+    )
+    started = monotonic.now
+
+    result = fetch_source(spec, state_store)
+
+    assert result.outcome is Outcome.FAILED
+    assert "403" in result.error
+    assert monotonic.now - started <= 21
+
+
+def test_budget_caps_the_sum_of_slow_bodies(state_store, monkeypatch, monotonic):
+    """Three throttled sources in a row cost the budget, not three ceilings."""
+    from orbital_watch.sources.fetch import NetworkBudget
+
+    trickle(monkeypatch, monotonic, FIVE_MEGABYTES)
+    budget = NetworkBudget(total_seconds=30)
+    started = monotonic.now
+
+    for index in range(3):
+        spec = SourceSpec(
+            name=f"slow{index}", url="https://example.invalid/slow.json", max_seconds=20
+        )
+        fetch_source(spec, state_store, deadline=budget.deadline_for(spec.max_seconds))
+
+    assert monotonic.now - started <= 33, "the budget did not bound the body reads"
+
+
+def test_socket_timeout_never_exceeds_what_is_left(state_store, monkeypatch, monotonic):
+    """A connection that goes silent is cut by the socket; it gets no more than remains."""
+    from orbital_watch.config import HTTP_STALL_TIMEOUT_SECONDS
+
+    seen: list[float] = []
+
+    def _urlopen(request, timeout=None):
+        seen.append(timeout)
+        return FakeResponse(b"[1]")
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    roomy = SourceSpec(name="a", url="https://example.invalid/a.json", max_seconds=45)
+    tight = SourceSpec(name="b", url="https://example.invalid/b.json", max_seconds=3)
+
+    fetch_source(roomy, state_store)
+    fetch_source(tight, state_store)
+
+    assert seen == [HTTP_STALL_TIMEOUT_SECONDS, 3]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'[{"time_tag": "2026-08-06T00:00:00", "Kp": NaN}]',
+        b'[{"time_tag": "2026-08-06T00:00:00", "Kp": Infinity}]',
+        b'[{"time_tag": "2026-08-06T00:00:00", "Kp": -Infinity}]',
+        b'[{"time_tag": "2026-08-06T00:00:00", "Kp": 1e999}]',
+    ],
+)
+def test_non_finite_numbers_from_upstream_are_refused_at_the_boundary(
+    state_store, monkeypatch, body
+):
+    """Defect 2: NaN and Infinity were accepted, stored, and then blocked publishing.
+
+    Python's JSON parser accepts the bare words NaN and Infinity, and turns a
+    number too large for a float into infinity. Stored, such a value later
+    failed the document's validation, and the run published nothing at all
+    until upstream changed. It is refused where every other malformed
+    response is refused, and the stored copy survives.
+    """
+    good = [{"time_tag": "2026-08-05T21:00:00", "Kp": 2.33}]
+    serve(monkeypatch, {"planetary-k-index": good})
+    fetch_source(swpc.KP, state_store)
+
+    serve(monkeypatch, {"planetary-k-index": body})
+    result = fetch_source(swpc.KP, state_store)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert result.data == good
+    assert stored_record(state_store, swpc.KP)["payload"] == good
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-inf", "nan"])
+def test_one_non_finite_reading_costs_that_reading_not_the_series(bad):
+    """A number spelt as text ("NaN") gets past JSON; it stops at the parser."""
+    readings = swpc.parse_kp_series(
+        [
+            {"time_tag": "2026-08-06T00:00:00", "Kp": "2.33"},
+            {"time_tag": "2026-08-06T03:00:00", "Kp": bad},
+            {"time_tag": "2026-08-06T06:00:00", "Kp": "3.00"},
+        ]
+    )
+
+    assert [reading.kp for reading in readings] == [2.33, 3.0]
+    value, _stamp = swpc.latest_value([{"proton_speed": bad}], "proton_speed")
+    assert value is None
+
+
+def test_overlapping_failure_does_not_displace_a_fresh_payload(state_store, monkeypatch):
+    """Defect 3: the slower run's good download was thrown away.
+
+    Run A is downloading. Run B, started meanwhile, fails and saves its
+    failure record first. A's save then met the precondition and gave up --
+    so the store kept "failed" and lost the payload A had just fetched. A
+    success now looks again and writes over a record that is not a newer
+    success.
+    """
+    clock = FakeClock()
+    serve(monkeypatch, {"data.json": {"version": "original"}})
+    fetch_source(DEMO, state_store, clock=clock)
+    clock.advance(timedelta(minutes=10))
+
+    def run_b_fails_meanwhile(request, timeout=None):
+        monkeypatch.setattr(
+            "urllib.request.urlopen", responder({"data.json": TimeoutError("timed out")})
+        )
+        b = fetch_source(DEMO, state_store, clock=clock)
+        assert b.outcome is Outcome.CACHE_FALLBACK
+        clock.advance(timedelta(seconds=5))
+        return FakeResponse(json.dumps({"version": "from A"}).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", run_b_fails_meanwhile)
+    result_a = fetch_source(DEMO, state_store, clock=clock)
+
+    record = stored_record(state_store, DEMO)
+    assert result_a.outcome is Outcome.LIVE
+    assert record["payload"] == {"version": "from A"}
+    assert record["last_outcome"] == "live"
+    assert record["confirmed_at"] == clock.now.isoformat()
+
+
+def test_overlapping_runs_ask_a_polite_source_once(state_store, monkeypatch):
+    """Defects 3 and 4: two runs at once must not both ask Celestrak.
+
+    The attempt is claimed in the store *before* the request is made. A run
+    that finds the claim -- or loses the race to write it -- leaves the
+    upstream alone.
+    """
+    clock = FakeClock()
+    calls = serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    fetch_source(POLITE, state_store, clock=clock)
+    clock.advance(timedelta(hours=2))
+    seen_by_b: list = []
+
+    def run_b_starts_meanwhile(request, timeout=None):
+        calls.append(request)
+        inner = responder({"gp.php": [{"a": "B asked too"}]}, calls=calls)
+        monkeypatch.setattr("urllib.request.urlopen", inner)
+        seen_by_b.append(fetch_source(POLITE, state_store, clock=clock))
+        return FakeResponse(json.dumps([{"a": 2}]).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", run_b_starts_meanwhile)
+    result_a = fetch_source(POLITE, state_store, clock=clock)
+
+    assert len(calls) == 2, "one request at the start, one from run A, none from run B"
+    assert result_a.outcome is Outcome.LIVE
+    assert stored_record(state_store, POLITE)["payload"] == [{"a": 2}]
+    (b,) = seen_by_b
+    assert b.outcome is Outcome.CACHE_FALLBACK
+    assert b.data == [{"a": 1}]
+    assert "has not recorded a result" in " ".join(b.notes)
+
+
+class ReadOnlyStore:
+    """A state store that can be read and refuses every write."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def describe(self) -> str:
+        return "a store that has gone read-only"
+
+    def read(self, key):
+        return self._inner.read(key)
+
+    def write(self, *args, **kwargs):
+        raise StoreError("permission denied")
+
+
+def test_unwritable_state_does_not_turn_into_a_request_every_run(
+    state_store, monkeypatch
+):
+    """Defect 4: the floor depended on a write made *after* the request.
+
+    With state readable but not writable, nothing recorded that Celestrak had
+    been asked, so every run asked again: six requests in an hour. The
+    attempt is now recorded first, and if it cannot be, the request is not
+    made.
+    """
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    fetch_source(POLITE, state_store, clock=clock)
+    clock.advance(timedelta(hours=2))
+
+    calls = serve(monkeypatch, {"gp.php": [{"a": 2}]})
+    read_only = ReadOnlyStore(state_store)
+    for _run in range(6):
+        result = fetch_source(POLITE, read_only, clock=clock)
+        assert result.outcome is Outcome.CACHE_FALLBACK
+        assert result.data == [{"a": 1}]
+        assert "not contacted" in result.error
+        clock.advance(timedelta(minutes=10))
+
+    assert urls(calls) == []
+
+
+def test_unwritable_state_on_a_first_run_makes_no_request(state_store, monkeypatch):
+    calls = serve(monkeypatch, {"gp.php": [{"a": 1}]})
+
+    for _run in range(3):
+        result = fetch_source(POLITE, ReadOnlyStore(state_store))
+        assert result.outcome is Outcome.FAILED
+        assert "not contacted" in result.error
+
+    assert urls(calls) == []
+
+
+def test_run_killed_mid_request_is_not_repeated_by_the_next_run(state_store, monkeypatch):
+    """Defects 1 and 4: an attempt that never finished still counts as asked.
+
+    When the platform killed a run that was stuck reading a throttled body,
+    no record of the attempt existed, so the next run asked again, and the
+    next. The claim written before the request survives the kill.
+    """
+    clock = FakeClock()
+
+    def killed(request, timeout=None):
+        raise SystemExit("the platform stopped the task")
+
+    monkeypatch.setattr("urllib.request.urlopen", killed)
+    with pytest.raises(SystemExit):
+        fetch_source(POLITE, state_store, clock=clock)
+
+    clock.advance(timedelta(minutes=10))
+    calls = serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    waiting = fetch_source(POLITE, state_store, clock=clock)
+
+    assert urls(calls) == []
+    assert waiting.outcome is Outcome.FAILED
+    assert "has not recorded a result" in " ".join(waiting.notes)
+
+    clock.advance(timedelta(minutes=20))  # thirty minutes after the claim: due
+    retried = fetch_source(POLITE, state_store, clock=clock)
+    assert retried.outcome is Outcome.LIVE
+    assert len(calls) == 1
+
+
+def test_claiming_an_attempt_keeps_the_stored_payload(state_store, monkeypatch):
+    """The record written before the request must not lose what is stored."""
+    clock = FakeClock()
+    serve(monkeypatch, {"gp.php": [{"a": 1}]})
+    fetch_source(POLITE, state_store, clock=clock)
+    first_contact = clock.now
+    clock.advance(timedelta(hours=2))
+    seen: list[dict] = []
+
+    def look_at_the_claim(request, timeout=None):
+        seen.append(stored_record(state_store, POLITE))
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", look_at_the_claim)
+    fetch_source(POLITE, state_store, clock=clock)
+
+    (claim,) = seen
+    assert claim["payload"] == [{"a": 1}]
+    assert claim["confirmed_at"] == first_contact.isoformat()
+    assert claim["last_attempt_at"] == clock.now.isoformat()
+    assert claim["attempt_open"] is True
+    assert stored_record(state_store, POLITE)["attempt_open"] is False
+
+
+def test_truncated_group_is_refused_even_when_the_sample_is_full(
+    state_store, monkeypatch
+):
+    """A group cut from thousands to hundreds still fills the sample of five.
+
+    Comparing the kept objects would see five and five. The collapse is
+    judged on how many objects the group *offered*.
+    """
+    records = json.loads(fixture_bytes("celestrak_starlink.json"))
+    group = SatelliteGroup(key="starlink", label="Starlink", max_objects=5)
+    spec = celestrak.group_spec(group)
+    clock = FakeClock()
+    serve(monkeypatch, {"GROUP=starlink": records})
+    fetch_source(spec, state_store, clock=clock)
+
+    clock.advance(CELESTRAK_MIN_REFETCH_INTERVAL)
+    truncated = records[: len(records) // 4]
+    assert len(truncated) >= group.max_objects
+    serve(monkeypatch, {"GROUP=starlink": truncated})
+    result = fetch_source(spec, state_store, clock=clock)
+
+    assert result.outcome is Outcome.CACHE_FALLBACK
+    assert "shrank" in result.error
+    assert result.facts == {"available": len(records)}
