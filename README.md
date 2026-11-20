@@ -19,23 +19,26 @@ and the failures that forced it, which is the half of engineering a repo
 usually hides. That includes the first delivery architecture, which produced
 five production bugs and was replaced ([what broke](#what-broke-in-the-first-design)).
 
-![The Orbital Watch dashboard: operational assessment banner, space weather tiles, and Kp history chart](docs/dashboard.jpg)
+![The Orbital Watch dashboard on 20 November 2026: the masthead reads fresh, 7 of 7 sources fresh; operational assessment banner, space weather tiles and Kp history chart](docs/dashboard.jpg)
 
 The system health panel, which is the part worth looking at closely — every
 source reports its state, when upstream last answered, the thresholds that
 define that state, and how long the fetch took:
 
-![The system health panel: per-source state, last success time, freshness thresholds and fetch duration for all seven upstream sources](docs/health-panel.jpg)
+![The system health panel with all seven sources fresh: two Celestrak groups deliberately not contacted because they were asked 1 h 10 m earlier, the third fetched live in 33 seconds, four NOAA SWPC sources fetched live](docs/health-panel.jpg)
 
-And the same panel during a real degradation — NOAA SWPC unreachable, the site
-serving hours-old space weather and saying so. A dashboard that only ever
-shows seven green rows is just asserting its own health, not reporting it:
+And the same panel during a real degradation, three quarters of an hour
+after the job first ran on Google Cloud: Celestrak was answering HTTP 503 to
+everyone, the state store was still empty, and the page said exactly that. A
+dashboard that only ever shows seven green rows is just asserting its own
+health, not reporting it:
 
-![The health panel degraded: three Celestrak sources fresh, four NOAA SWPC sources stale with the connection error and the age of the stored data they are serving](docs/health-degraded.jpg)
+![The health panel degraded: three Celestrak sources failed, never succeeded, HTTP 503 Service Unavailable](docs/health-degraded.jpg)
 
-*These screenshots were taken before the November 2026 rebuild described
-below. The panels and the look are unchanged; the thresholds, the outcome
-names and some of the wording in the health panel are not.*
+*All three were taken on 20 November 2026, the day of the rebuild described
+below: the degraded one at 16:15 UTC, the others at 18:01 UTC. The 33-second
+fetch in the second image is Celestrak on a slow day, and the reason for
+[DECISIONS.md](DECISIONS.md) §33.*
 
 ---
 
