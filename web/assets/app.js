@@ -662,6 +662,9 @@
     var coverage = (meta && meta.coverage) || [];
     if (!coverage.length) return null;
     var parts = coverage.map(function (g) {
+      // A group whose element sets could not be had this run is said to be
+      // missing, not counted as "all 0".
+      if (!g.tracked) return "no " + g.label.toLowerCase() + " (element sets unavailable)";
       return g.sampled
         ? int(g.tracked) + " of " + int(g.available) + " " + g.label.toLowerCase()
         : "all " + int(g.tracked) + " " + g.label.toLowerCase();
@@ -1196,15 +1199,15 @@
     clear(overall);
     overall.appendChild(
       liveNode("span", null, function (t) {
-        return statusBadge(
-          healthSources && healthSources.length
-            ? worstState(
-                healthSources.map(function (source) {
-                  return stateNow(source, t);
-                })
-              )
-            : "unknown"
+        var summary = Core.systemSummary(
+          (healthSources || []).map(function (source) {
+            return stateNow(source, t);
+          })
         );
+        var key = has(STATUS_GLYPH, summary.worst) ? summary.worst : "unknown";
+        var node = badge("status-" + key, STATUS_GLYPH[key], summary.label);
+        if (summary.detail) node.appendChild(el("span", "status-detail", summary.detail));
+        return node;
       })
     );
 

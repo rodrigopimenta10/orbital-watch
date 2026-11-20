@@ -371,6 +371,32 @@
     return states.length ? "fresh" : "unknown";
   }
 
+  /* What the masthead says about the system as a whole.
+   *
+   * The badge used to repeat the worst single source, so one source out of
+   * seven failing put "FAILED" at the top of a page that was serving the
+   * other six correctly. That is the opposite mistake to hiding a failure:
+   * it reports more breakage than there is. The masthead now names the
+   * system's state -- one word only when every source agrees, "degraded"
+   * when they do not -- and counts how many sources are fresh. Each source's
+   * own state is still in the health panel, unsoftened. */
+  function systemSummary(states) {
+    var total = states.length;
+    var worst = worstState(states);
+    var fresh = states.filter(function (state) {
+      return state === "fresh";
+    }).length;
+    var unanimous = states.every(function (state) {
+      return state === worst;
+    });
+    return {
+      // Drives the colour and glyph: still the worst state present.
+      worst: worst,
+      label: total === 0 ? "unknown" : unanimous ? worst : "degraded",
+      detail: total === 0 ? "" : fresh + " of " + total + " sources fresh",
+    };
+  }
+
   // ------------------------------------------------------------- sky, live
   //
   // The document carries, for each object near the sky, its position
@@ -509,6 +535,7 @@
     pipelineStatus: pipelineStatus,
     stateNow: stateNow,
     worstState: worstState,
+    systemSummary: systemSummary,
     trackPosition: trackPosition,
     skyAt: skyAt,
   };

@@ -395,6 +395,21 @@ test("the overall badge is the worst state, and unknown outranks fresh", () => {
   assert.equal(Core.worstState([]), "unknown");
 });
 
+test("the masthead names the system, not its worst source", () => {
+  // One failure among seven is a degraded system that is still serving six sources.
+  const mixed = Core.systemSummary(["fresh", "fresh", "failed", "fresh", "fresh", "fresh", "fresh"]);
+  assert.deepEqual(mixed, { worst: "failed", label: "degraded", detail: "6 of 7 sources fresh" });
+
+  // A single word only when every source agrees.
+  assert.equal(Core.systemSummary(["fresh", "fresh"]).label, "fresh");
+  assert.equal(Core.systemSummary(["failed", "failed"]).label, "failed");
+  assert.equal(Core.systemSummary(["failed", "failed"]).detail, "0 of 2 sources fresh");
+  assert.equal(Core.systemSummary(["stale", "fresh"]).worst, "stale");
+
+  // Nothing to judge is unknown, and claims no count.
+  assert.deepEqual(Core.systemSummary([]), { worst: "unknown", label: "unknown", detail: "" });
+});
+
 // ------------------------------------------------------------- sky, live
 
 const CASE = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "track_case.json"), "utf8"));

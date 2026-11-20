@@ -543,3 +543,13 @@ footer a {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* The count beside the masthead badge ("6 of 7 sources fresh"): quieter than
+ * the state word, and not uppercased with it. */
+.status .status-detail {
+  margin-left: 0.6em;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-muted);
+}
