@@ -13,6 +13,7 @@ the failure is reported rather than hidden.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import urllib.error
 from datetime import timedelta
@@ -124,7 +125,7 @@ def test_document_states_the_schedule_it_was_produced_on(state_store, monkeypatc
 
 
 def test_coverage_reports_the_group_size_not_the_sample_size(state_store, monkeypatch):
-    """ "60 of 11,205 starlink", never "all 60 starlink".
+    """ "60 of 107 recent starlink", never "all 60 recent starlink".
 
     Only the sampled objects are stored, so on every run after the first the
     group's real size comes from the stored record, not from the data.
@@ -133,13 +134,13 @@ def test_coverage_reports_the_group_size_not_the_sample_size(state_store, monkey
         pipeline,
         "TRACKED_GROUPS",
         tuple(
-            type(group)(key=group.key, label=group.label, max_objects=5)
+            dataclasses.replace(group, max_objects=5)
             if group.key == "starlink"
             else group
             for group in pipeline.TRACKED_GROUPS
         ),
     )
-    fixture_size = len(json.loads(ALL_SOURCES_OK["GROUP=starlink"]))
+    fixture_size = len(json.loads(ALL_SOURCES_OK["GROUP=last-30-days"]))
     serve(monkeypatch, ALL_SOURCES_OK)
     clock = FakeClock()
 
@@ -151,7 +152,7 @@ def test_coverage_reports_the_group_size_not_the_sample_size(state_store, monkey
         starlink = next(g for g in document["meta"]["coverage"] if g["key"] == "starlink")
         assert starlink == {
             "key": "starlink",
-            "label": "Starlink",
+            "label": "Recent Starlink",
             "available": fixture_size,
             "tracked": 5,
             "sampled": True,

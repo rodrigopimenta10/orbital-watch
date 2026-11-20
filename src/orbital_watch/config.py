@@ -174,12 +174,12 @@ HTTP_STALL_TIMEOUT_SECONDS = 10.0
 #: under a second with at most half a megabyte.
 HTTP_TIMEOUT_SECONDS = 20.0
 
-#: The one large response is the Starlink group: about 5 MB. A healthy
-#: transfer takes a few seconds. 45 s lets it complete at a ninth of a
-#: megabyte per second, more than ten times slower than healthy; anything
-#: slower than that is a throttled connection (8 KB/s was seen on the first
-#: real run, which would need ten minutes) and is better abandoned, reported,
-#: and retried in half an hour than waited on.
+#: The largest response is the group Starlink is taken from: under 100 KB
+#: since §31 (it was the full 5 MB Starlink group before). It keeps a longer
+#: ceiling than the others because Celestrak has been seen serving at a few
+#: kilobytes a second on a bad day (3.4 KB/s for this file on 2026-11-20, so
+#: 25 s), and one slow answer every two hours is better than none. Anything
+#: slower than this is abandoned, reported, and retried in half an hour.
 STARLINK_TIMEOUT_SECONDS = 45.0
 
 #: Ceilings on total network time per upstream provider in one run, kept
@@ -233,16 +233,29 @@ class SatelliteGroup:
     max_objects: int
     #: Ceiling on one whole request for this group, body included.
     fetch_seconds: float = HTTP_TIMEOUT_SECONDS
+    #: The Celestrak GROUP to ask for, when it is not the key itself.
+    query_group: str | None = None
+    #: Keep only objects whose name starts with this, when the group asked for
+    #: holds more than the objects we want from it.
+    name_prefix: str | None = None
 
 
 TRACKED_GROUPS: tuple[SatelliteGroup, ...] = (
     SatelliteGroup(key="stations", label="Space Stations", max_objects=40),
     SatelliteGroup(key="weather", label="Weather Satellites", max_objects=90),
+    # Starlink, taken from Celestrak's "launched in the last 30 days" group
+    # (about 200 objects, under 100 KB) and not from the full Starlink group
+    # (about 11,000 objects, 5 MB). The page shows sixty of them either way;
+    # downloading 5 MB every two hours to show sixty objects cost Celestrak
+    # about 60 MB a day, against a published limit of roughly 100 MB a day per
+    # address before it firewalls the address. See DECISIONS.md §31.
     SatelliteGroup(
         key="starlink",
-        label="Starlink",
+        label="Recent Starlink",
         max_objects=60,
         fetch_seconds=STARLINK_TIMEOUT_SECONDS,
+        query_group="last-30-days",
+        name_prefix="STARLINK",
     ),
 )
 

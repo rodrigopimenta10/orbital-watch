@@ -57,7 +57,12 @@ def fixture_bytes(name: str) -> bytes:
 ALL_SOURCES_OK = {
     "GROUP=stations": fixture_bytes("celestrak_stations.json"),
     "GROUP=weather": fixture_bytes("celestrak_weather.json"),
-    "GROUP=starlink": fixture_bytes("celestrak_starlink.json"),
+    # The tracked Starlink group asks for Celestrak's "last-30-days" group and
+    # keeps the objects named STARLINK. Here it is answered with the Starlink
+    # fixture captured alongside the others, so every element set in a test
+    # run is from the same day; the real last-30-days response has its own
+    # fixture and its own test (test_sources.py).
+    "GROUP=last-30-days": fixture_bytes("celestrak_starlink.json"),
     "planetary-k-index": fixture_bytes("swpc_kindex.json"),
     "solar-wind-speed": fixture_bytes("swpc_solar_wind_speed.json"),
     "solar-wind-mag-field": fixture_bytes("swpc_solar_wind_mag.json"),

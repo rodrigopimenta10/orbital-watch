@@ -22,6 +22,7 @@ from orbital_watch.config import (
     CELESTRAK_RETRY_INTERVAL,
     SPACE_WEATHER_STALENESS,
     TLE_STALENESS,
+    TRACKED_GROUPS,
     SatelliteGroup,
     StalenessPolicy,
 )
@@ -1356,3 +1357,50 @@ def test_truncated_group_is_refused_even_when_the_sample_is_full(
     assert result.outcome is Outcome.CACHE_FALLBACK
     assert "shrank" in result.error
     assert result.facts == {"available": len(records)}
+
+
+def test_starlink_comes_from_the_small_recent_launches_group(state_store, monkeypatch):
+    """Sixty Starlinks from an 86 KB response, not from the 5 MB Starlink group.
+
+    The fixture is the real ``GROUP=last-30-days`` response of 2026-11-20: 204
+    objects from every operator, 107 of them Starlink. The tracked group asks
+    for that group by name, keeps the objects named STARLINK, and reports the
+    107 as what was available -- the number the page's "60 of 107" is about.
+    """
+    group = next(g for g in TRACKED_GROUPS if g.key == "starlink")
+    spec = celestrak.group_spec(group)
+    assert "GROUP=last-30-days" in spec.url
+    assert "GROUP=starlink" not in spec.url
+
+    everything = json.loads(fixture_bytes("celestrak_last_30_days.json"))
+    assert len(everything) == 204
+    serve(monkeypatch, {"GROUP=last-30-days": everything})
+
+    result = fetch_source(spec, state_store, clock=FakeClock())
+
+    assert result.outcome is Outcome.LIVE
+    assert len(result.data) == 60
+    assert all(record["OBJECT_NAME"].startswith("STARLINK") for record in result.data)
+    assert result.facts == {"available": 107}
+
+
+def test_a_recent_launches_group_with_no_starlink_keeps_the_stored_group(
+    state_store, monkeypatch
+):
+    """Thirty days without a Starlink launch must not empty the group."""
+    group = next(g for g in TRACKED_GROUPS if g.key == "starlink")
+    spec = celestrak.group_spec(group)
+    everything = json.loads(fixture_bytes("celestrak_last_30_days.json"))
+    serve(monkeypatch, {"GROUP=last-30-days": everything})
+    clock = FakeClock()
+    first = fetch_source(spec, state_store, clock=clock)
+    assert first.outcome is Outcome.LIVE
+
+    others = [r for r in everything if not r["OBJECT_NAME"].startswith("STARLINK")]
+    serve(monkeypatch, {"GROUP=last-30-days": others})
+    clock.advance(spec.min_refetch_interval + timedelta(minutes=1))
+    second = fetch_source(spec, state_store, clock=clock)
+
+    assert second.outcome is Outcome.CACHE_FALLBACK
+    assert len(second.data) == 60
+    assert "no object named STARLINK" in second.error
