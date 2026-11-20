@@ -8,30 +8,34 @@ station and correlates those passes with live space-weather conditions.
 **The design thesis: a monitoring system must report its own degradation as
 honestly as it reports its data.** Every number on the page carries its source
 and age; every upstream source is classified fresh, stale, or failed against
-published thresholds; and no fallback — cache, snapshot, or seed — is ever
-allowed to claim freshness it does not have. The interesting engineering here
-is not the orbital mechanics, it is what happens when things break.
+published thresholds; and no fallback — stored data, or the copy of the data
+shipped with the site — is ever allowed to claim freshness it does not have.
+The interesting engineering here is not the orbital mechanics, it is what
+happens when things break.
 
 **Live site:** **[orbital.rodrigopimenta.com](https://orbital.rodrigopimenta.com)**
 · **[DECISIONS.md](DECISIONS.md)** — every design decision with its rationale
 and the failures that forced it, which is the half of engineering a repo
-usually hides.
+usually hides. That includes the first delivery architecture, which produced
+five production bugs and was replaced ([what broke](#what-broke-in-the-first-design)).
 
 ![The Orbital Watch dashboard: operational assessment banner, space weather tiles, and Kp history chart](docs/dashboard.jpg)
 
 The system health panel, which is the part worth looking at closely — every
-source reports its state, its last success, the thresholds that define that
-state, and how long the fetch took:
+source reports its state, when upstream last answered, the thresholds that
+define that state, and how long the fetch took:
 
 ![The system health panel: per-source state, last success time, freshness thresholds and fetch duration for all seven upstream sources](docs/health-panel.jpg)
 
 And the same panel during a real degradation — NOAA SWPC unreachable, the site
-serving five-hour-old cached space weather and saying so, while the element
-sets stay fresh from the committed snapshot. This mixed state is the thesis in
-one image; a dashboard that only ever shows seven green rows is just asserting
-its own health, not reporting it:
+serving hours-old space weather and saying so. A dashboard that only ever
+shows seven green rows is just asserting its own health, not reporting it:
 
-![The health panel degraded: three Celestrak sources fresh from the snapshot, four NOAA SWPC sources stale with the connection error and the age of the cached data they are serving](docs/health-degraded.jpg)
+![The health panel degraded: three Celestrak sources fresh, four NOAA SWPC sources stale with the connection error and the age of the stored data they are serving](docs/health-degraded.jpg)
+
+*These screenshots were taken before the November 2026 rebuild described
+below. The panels and the look are unchanged; the thresholds, the outcome
+names and some of the wording in the health panel are not.*
 
 ---
 
@@ -65,46 +69,96 @@ It is a portfolio project, not an operational tool.
 
 ```
    ┌─────────────────┐        ┌──────────────────┐
-   │  Celestrak GP   │        │    NOAA SWPC     │      upstream, public,
-   │  (TLE/OMM)      │        │  (Kp, wind, IMF) │      unauthenticated
+   │  Celestrak GP   │        │    NOAA SWPC     │     upstream, public,
+   │  (TLE/OMM)      │        │  (Kp, wind, IMF) │     unauthenticated
    └────────┬────────┘        └────────┬─────────┘
-            │                          │
-            └──────────┬───────────────┘
-                       ▼
-         ┌──────────────────────────────┐
-         │  Cloudflare Pages build      │  2-hourly, via
-         │  fetch → propagate → health  │  a deploy hook
-         │  → write JSON (seed backstop)│
-         └──────────────┬───────────────┘
-                        ▼
-         ┌──────────────────────────────┐
-         │  static JSON + HTML/CSS/JS   │   dist/
-         └──────────────┬───────────────┘
-                        ▼
-               Cloudflare Pages
-                        │
-                        ▼
-                    browser          ← never calls an upstream API
+            │ each group at most       │ every run,
+            │ once per 2 h             │ conditionally
+            └────────────┬─────────────┘
+                         ▼
+   Cloud Scheduler ──▶ Cloud Run job  ◀──▶  state bucket (private)
+   every 10 min        fetch what is due     last good payload per source,
+                       → propagate           and when it was last asked for
+                       → evaluate health
+                       → validate
+                         │ one atomic write
+                         ▼
+                  public bucket: latest.json  ◀── Cloud Monitoring
+                         │                         run failed · no run for
+                         │ polled once a minute    30 min · content checks
+                         ▼
+                      browser  ◀── Firebase Hosting: static page, plus a
+                                   copy of latest.json baked in at deploy
 ```
 
-A Python build job fetches upstream data, computes positions and passes,
-evaluates the health of every source, and writes five JSON files into the build
-output. The frontend loads those files and renders. **The browser never
-contacts Celestrak or NOAA.**
+One container runs every ten minutes. It fetches whatever is due, propagates
+orbits, evaluates the health of every source, and publishes **one** JSON
+document. The page is static files; it reads that document and renders it.
+**The browser never contacts Celestrak or NOAA, and nothing serves requests
+except a CDN and a storage bucket.**
 
-That indirection is the point, and it buys three things:
+Four properties come from that shape:
 
 1. **An upstream outage cannot take the site down.** If Celestrak is
-   unreachable at 03:00, the run falls back to cached element sets — or, on a
-   cold build container, to the committed seed snapshot — the site still
+   unreachable, the run uses the element sets it stored last time, the page
    renders every panel, and the health panel says the data is stale and why.
    Compare a live-proxy design, where the same outage puts a spinner or a
    stack trace in front of whoever is looking.
-2. **Hosting costs nothing and cannot fall over.** Static files on a CDN. No
-   server, no serverless function, no database, no secrets.
-3. **"Last updated" becomes a real claim.** Because every fetch is recorded
-   with its outcome and timestamp, the freshness shown on the page is measured
-   rather than asserted.
+2. **State is real, so politeness is real.** What the job knows between runs
+   lives in a bucket: per source, the last good payload and when upstream was
+   last asked. "Ask Celestrak at most once every two hours" is enforced
+   against that record, not against a schedule — so it holds if the job is
+   started every ten minutes, or by hand five times in a row.
+3. **A reader can never see half an update.** Everything the page shows is in
+   one object, and one object write is atomic. Before the write, the document
+   is validated against the shape the page reads and against the honesty
+   rules below; a document that fails is withheld and the previous one stays.
+4. **A stopped pipeline is visible to a visitor with no help from the
+   pipeline.** The page computes every age against the reader's own clock.
+   Once the document is older than three runs, it says when the pipeline last
+   published. Separately, Cloud Monitoring emails the owner.
+
+The sky view deserves a note. A low-orbit satellite crosses the sky in about
+ten minutes, so positions computed when the document was written are wrong
+by the time it is read. The document therefore carries a 30-minute track for
+each object near the sky — its position relative to the station every 30
+seconds — and the page interpolates along it to the current time. All the
+orbital mechanics stays in Python; the browser draws a straight line between
+two points and takes two arctangents. A test holds that straight line to
+within 0.2° of SGP4. When the track runs out, the page says positions are no
+longer current instead of showing old ones as live.
+
+---
+
+## What broke in the first design
+
+The first version ran on Cloudflare Pages. A scheduled trigger rebuilt and
+redeployed the whole site every two hours; because build containers kept
+nothing between runs, a GitHub Actions cron fetched Celestrak and **committed
+the result to this repository**, which was the only state the system had.
+
+On 2026-11-20 the live site was reporting all three Celestrak sources stale:
+element sets 15 hours old, against an 8-hour freshness window. Nothing had
+failed.
+
+- The Actions cron was written to run 12 times a day (`30 1-23/2 * * *`).
+  GitHub ran it about 3 times a day — on 18, 19 and 20 November at 04:39,
+  14:27 and 22:40; 04:25, 14:38 and 22:44; 04:11 and 14:16 UTC.
+- The 04:11 run arrived 5 h 27 m after the previous capture. The politeness
+  floor was 5 h 30 m, so it correctly skipped.
+- The next run came ten hours later.
+
+This was the fifth production bug, and the second with this exact cause: a
+design that depended on the punctuality of a scheduler that promises none
+([DECISIONS.md §19](DECISIONS.md)). The individual fix each time was correct
+and the class of bug stayed, because the flaws were structural:
+
+| Flaw | What it caused | What replaced it |
+|---|---|---|
+| No persistent state; "state" was commits to git | A refresh needed repository write access and a commit, and the rate-limit floor could not be enforced inside a build | A state bucket, read and written by the job |
+| Refreshing data meant rebuilding and redeploying the site | A 500-builds-a-month cap dictated a 2-hour cadence for everything | The job publishes a document; the site is deployed only when code changes |
+| Three schedulers on two platforms had to line up | Each could be late independently, and the freshness window was tuned against their sum | One scheduler, and an alert when its runs stop succeeding |
+| Floor, cadence and window were three hand-tuned numbers | Twice, a combination where every part was right and the system was wrong | The windows are expressions over the cadence and upstream's publication interval |
 
 ---
 
@@ -113,17 +167,19 @@ That indirection is the point, and it buys three things:
 This is the part worth reading closely, because it is the part the project is
 actually about.
 
-### Every network call goes through one function
+### Every upstream call goes through one function
 
-There is exactly one place in the codebase that performs network I/O:
-`fetch_json()` in `src/orbital_watch/sources/fetch.py`. It guarantees four
-things for every caller:
+There is exactly one place in the codebase that talks to an upstream:
+`fetch_source()` in `src/orbital_watch/sources/fetch.py`. It guarantees the
+same things for every caller:
 
 - a hard timeout — no unbounded waits;
-- failure is caught, logged with source and elapsed time, and falls back to the
-  on-disk cache;
+- failure is caught, logged with source and elapsed time, and falls back to
+  the last good payload in the state store;
+- a source with a politeness floor is not contacted until the floor clears,
+  decided from the stored record of the last attempt;
 - the outcome is recorded in a result object the health panel reports verbatim;
-- **it never raises.** No caller can abort the build by forgetting a
+- **it never raises.** No caller can abort the run by forgetting a
   `try`/`except`, because there is nothing to catch.
 
 A single choke point rather than scattered `try`/`except` blocks means the
@@ -135,61 +191,86 @@ answer is testable in isolation.
 | Situation | Outcome | Site behaviour | Health panel |
 |---|---|---|---|
 | Fetch succeeds | `live` | Fresh data | **fresh** |
-| Cache younger than the refetch floor | `cache_fresh` | Cached data | **fresh** — upstream deliberately not contacted |
-| Upstream says nothing changed | `not_modified` | Cached data | **fresh** |
-| Upstream down, cache warm | `cache_fallback` | Cached data still renders | **stale** — with the connection error |
-| Celestrak (by design, every build) | `snapshot` | Committed snapshot renders | judged by **age alone** — the snapshot is the intended source, not a fallback |
-| Upstream down, no cache, seed present | `seed` | Committed seed renders | **stale** — never *fresh*, whatever its age |
-| Upstream down, no cache, no seed | `failed` | That panel empties, others unaffected | **failed** — with the reason |
+| Upstream answered recently and is not due to be asked | `cache_fresh` | Stored data | **fresh** — upstream deliberately not contacted |
+| Upstream says nothing changed (HTTP 304, or Celestrak's own reply) | `not_modified` | Stored data | **fresh** — and says how old the download itself is |
+| Upstream down, data stored | `cache_fallback` | Stored data still renders | **stale** — with the error, even if the data is minutes old |
+| Upstream down, retry not yet due | `cache_fallback` | Stored data | **stale** — still; it does not flip back to fresh between retries |
+| Upstream down, nothing stored | `failed` | That panel empties, others unaffected | **failed** — with the reason |
 | Data older than the staleness limit | — | Data still renders | **failed** — "not operationally current" |
-| Malformed / non-JSON response | `cache_fallback` | Cached data | **stale** — cache is *not* overwritten |
+| Malformed, wrong-shaped or non-JSON response | `cache_fallback` | Stored data | **stale** — the stored copy is *not* overwritten |
+| Stored data with no date | — | Data renders | **stale** — undated is never fresh |
+| State store unreadable | `failed` for Celestrak | Celestrak panels empty | **failed** — and Celestrak is *not* contacted, since nothing says when it last was |
+| The document would be malformed | — | Previous document stays | unchanged; the run fails and the owner is alerted |
+| The pipeline stops | — | Page shows the last document | every state recomputed in the browser; banner after 30 min |
+| The page cannot reach the live document | — | Copy baked into the site is shown, labelled | nothing in it is reported **fresh** |
 
-Two behaviours worth calling out:
+Three behaviours worth calling out:
 
 **A source can be serving good numbers and still not be "fresh."** If upstream
-was unreachable this run but the cache is 30 minutes old, the data on screen is
-fine — and the panel reports **stale** anyway, because we have lost contact and
-saying "fresh" would be a lie. Reporting freshness honestly is the entire
-purpose of the panel.
+was unreachable at the last attempt but the stored data is ten minutes old,
+the data on screen is fine — and the panel reports **stale** anyway, because
+contact has been lost and saying "fresh" would be a lie. Reporting freshness
+honestly is the entire purpose of the panel. The same rule is applied one
+level up: when the *page* cannot reach the pipeline's live document and falls
+back to the copy shipped with the site, it reports nothing in it as fresh.
 
-**A bad response never poisons the cache.** A malformed or non-JSON reply is
-rejected at the boundary, so the good cached copy you would fall back to
-survives. There is a test for exactly this.
+**A bad response never replaces good data.** A malformed, non-JSON or
+reshaped reply is rejected at the boundary, so the stored copy you would fall
+back to survives. So does a reply that is valid but implausible — a
+satellite group that has lost most of its members since the last fetch.
+
+**The rules are checked on the output, not only in the code.** Before a
+document is published it is validated, and the validator re-states the rules
+independently: no source may be fresh on a fallback outcome or without a
+date, every source must be accounted for, the overall state must be the worst
+one. A future change that breaks classification cannot publish its mistake.
+
+### What counts as a failed run
+
+The job exits non-zero only when it **could not publish**: the bucket refused
+the write, the document failed validation, or the code has a bug. An upstream
+outage is not a failed run — the document says the source is down, and saying
+so is the job working. That is what lets a monitoring alert on "an execution
+failed" mean something instead of firing whenever NOAA has a bad hour.
+
+Something independent watches for the rest: an alert when no run has
+succeeded for 30 minutes, and uptime checks on the published document and on
+the site that match content, not only a status code.
 
 ### Degradation is proven, not asserted
 
-`tests/test_sources.py` exercises this at two levels. At the fetch layer it
-breaks a source under four failure modes (timeout, DNS failure, HTTP 500,
-HTTP 403), with and without a warm cache. At the build level it breaks each
-of the seven sources in turn under timeout and HTTP 500, then breaks all
-seven at once, and asserts every time that the build completes and writes a
-complete, parseable site. The full-blackout test additionally asserts that
-the health block reports everything failed rather than pretending otherwise.
-A further set feeds deliberately wrong-shaped payloads — a dict where a list
-belongs, a list of scalars, a bare string — from both upstream and a stale
-cache, because a cache written by older code is routinely read by newer code.
+`tests/test_sources.py` breaks the fetch layer under four failure modes
+(timeout, DNS failure, HTTP 500, HTTP 403), with and without stored data, and
+feeds it damaged state in eight shapes. `tests/test_pipeline.py` breaks each
+of the seven sources in turn through a whole run — on a first-ever run, and
+again with stored state — then breaks all seven at once, and each time holds
+the resulting document to the same validation production applies. The
+blackout tests additionally assert that nothing claims to be fresh.
 
 You can watch it happen for real:
 
 ```bash
-# Build with all sockets blocked and a cold cache.
+# One run with every socket refused and nothing stored.
 uv run python - <<'PY'
 import socket
 def dead(*a, **k): raise OSError(101, "Network is unreachable")
 socket.socket.connect = dead; socket.create_connection = dead; socket.getaddrinfo = dead
-from orbital_watch.build import main
-raise SystemExit(main(["--build-dir", "dist-offline", "--cache-dir", ".cache-offline"]))
+from orbital_watch.job import main
+raise SystemExit(main(["--local-dir", ".local-offline", "--out", "dist-offline"]))
 PY
 ```
 
-This exits 0, writes all five JSON files, and reports 7/7 sources failed. The
-same check runs in CI on every push.
+This exits 0, publishes a complete document, and reports 7 of 7 sources
+failed. The same check runs in CI on every push, and again against the built
+container with networking switched off.
 
 ---
 
 ## Local setup
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+. No cloud account
+is needed: with no bucket configured, the job keeps its state and its
+published document in a local directory.
 
 ```bash
 git clone https://github.com/rodrigopimenta10/orbital-watch.git
@@ -198,21 +279,26 @@ cd orbital-watch
 # Install dependencies (creates .venv automatically)
 uv sync --dev
 
-# Fetch upstream data and build the site into dist/
-uv run python -m orbital_watch.build
+# Run one refresh cycle and assemble the site into dist/
+uv run python -m orbital_watch.job
 
 # Serve it -- the page fetches JSON, so file:// will not work
 python3 -m http.server 8000 --directory dist
 # then open http://localhost:8000
 ```
 
-Useful flags:
+State lives in `.local/state/`, the published document in `.local/public/`.
+Run the job again and it behaves as it does in production: space weather is
+re-fetched, Celestrak is left alone until two hours have passed.
 
 ```bash
-uv run python -m orbital_watch.build --verbose          # debug logging
-uv run python -m orbital_watch.build --build-dir out    # different output dir
-uv run python -m orbital_watch.build --cache-dir /tmp/c # different cache
+uv run python -m orbital_watch.job --verbose              # debug logging
+uv run python -m orbital_watch.job --no-site              # publish only
+uv run python -m orbital_watch.job --local-dir /tmp/ow    # state elsewhere
 ```
+
+To see the page fall back, delete `dist/live/latest.json` (the local stand-in
+for the public bucket) and reload: it shows the baked copy and says so.
 
 Point it at a different ground station without touching code:
 
@@ -220,7 +306,7 @@ Point it at a different ground station without touching code:
 ORBITAL_WATCH_SITE_NAME="Svalbard" \
 ORBITAL_WATCH_LAT=78.2297 \
 ORBITAL_WATCH_LON=15.4075 \
-  uv run python -m orbital_watch.build
+  uv run python -m orbital_watch.job
 ```
 
 ---
@@ -228,18 +314,21 @@ ORBITAL_WATCH_LON=15.4075 \
 ## Tests
 
 ```bash
-uv run pytest              # 133 tests
-uv run ruff check .        # lint
+uv run pytest                 # 307 tests
+uv run ruff check .           # lint
 uv run ruff format --check .
+node --test tests/web/        # 45 tests of the page's logic; no npm, no dependencies
+(cd infra && terraform init -backend=false && terraform test)   # 12 runs, mocked providers
 ```
 
 **No test makes a network call.** That is enforced mechanically, not by
 convention: an autouse fixture in `tests/conftest.py` replaces
-`urllib.request.urlopen` with a function that raises, so a live call fails
-loudly instead of passing on one machine and flaking in CI. Everything runs
-from real API responses captured into `tests/fixtures/`.
+`urllib.request.urlopen` and the socket connect call with functions that
+raise, so a live call fails loudly instead of passing on one machine and
+flaking in CI. Everything runs from real API responses captured into
+`tests/fixtures/`.
 
-Three groups are worth knowing about:
+The groups worth knowing about:
 
 **Propagation correctness** (`test_propagate.py`) checks against the published
 SGP4 verification vectors from Vallado et al., *Revisiting Spacetrack Report #3*
@@ -247,14 +336,34 @@ SGP4 verification vectors from Vallado et al., *Revisiting Spacetrack Report #3*
 generated and then froze. Backed by physical checks that nothing in the code
 knows the answer to: GOES spacecraft must come out at geostationary altitude
 (~35,786 km), the ISS at a plausible LEO altitude with a ~93-minute period.
+The published position track is held to SGP4 between its samples, through a
+pass near the zenith.
 
 **Health boundaries** (`test_health.py`) pin every freshness threshold
 including the exact-equality cases, where off-by-one errors live.
 
-**Graceful degradation** (`test_sources.py`) is the most important test in the
-project. It proves the claim the whole architecture rests on: that no upstream
-failure — individually or all at once, cold cache or warm — can prevent the
-build from producing a complete site that tells the truth about its own state.
+**Graceful degradation** (`test_sources.py`, `test_pipeline.py`) is the most
+important part of the suite. It proves the claim the whole architecture rests
+on: that no upstream failure — individually or all at once, with stored state
+or without — can prevent a run from producing a complete document that tells
+the truth about its own state.
+
+**State and concurrency** (`test_store.py`, `test_sources.py`,
+`test_document.py`): the politeness floor survives a new process; two
+overlapping runs cannot overwrite each other's state; an older run cannot
+replace a newer document.
+
+**The page** (`tests/web/core.test.js`): which copy of the document is shown
+and when it falls back, that a frozen pipeline is noticed from the reader's
+clock alone, that nothing in a fallback copy is fresh, and that interpolated
+positions match SGP4. The reference values for that last one are written by
+the Python pipeline (`test_web_fixture.py`), so the JavaScript is checked
+against SGP4 rather than against numbers typed into a test.
+
+**Agreement across languages** (`test_repo_conventions.py`): the facts that
+Python, JavaScript, Terraform and the workflows each hold a copy of — schema
+version, cadence, environment variable names, the security headers — are
+pinned to each other.
 
 ---
 
@@ -262,30 +371,31 @@ build from producing a complete site that tells the truth about its own state.
 
 | Source | Endpoint | Fetched |
 |---|---|---|
-| [Celestrak](https://celestrak.org/) | GP API, groups `stations`, `weather`, `starlink` | at most every 5.5 h, by the snapshot refresher only — **builds never call it** |
-| [NOAA SWPC](https://www.swpc.noaa.gov/) | planetary K-index | every 2 h, during each build |
-| NOAA SWPC | solar wind speed, IMF Bt/Bz | every 2 h, during each build |
-| NOAA SWPC | observed solar cycle indices | every 2 h, during each build |
+| [Celestrak](https://celestrak.org/) | GP API, groups `stations`, `weather`, `starlink` | each group at most once every 2 h; after a failed attempt, not again for 30 min |
+| [NOAA SWPC](https://www.swpc.noaa.gov/) | planetary K-index | every run (10 min), conditionally |
+| NOAA SWPC | solar wind speed, IMF Bt/Bz | every run, conditionally |
+| NOAA SWPC | observed solar cycle indices | every run, conditionally |
 
 All public, unauthenticated, no API keys. **The project requires no secrets and
 no `.env` file of any kind.**
 
-Celestrak rate-limits aggressively and blocks abusive clients, so all
-traffic to it is concentrated in one place:
+"Conditionally" means the request carries the `ETag` and `Last-Modified`
+upstream sent last time, so a product that has not changed costs NOAA a
+header exchange (HTTP 304) and nothing more.
 
-- **builds never contact Celestrak.** They read the committed `seed/`
-  snapshot; a single scheduled refresher (`refresh-snapshot.yml`) owns every
-  request and commits what it fetches;
-- the refresher refuses to re-request a group whose snapshot is younger than
-  the politeness floor (5 h 30 m — derived, not arbitrary: freshness window
-  minus cron cadence minus scheduling margin, an invariant a test enforces),
-  checked against the committed manifest — the only state that survives
-  ephemeral build containers — so the limit holds even under manual runs or
-  a misconfigured schedule;
+Celestrak rate-limits aggressively and blocks abusive clients, so:
+
+- each group is asked **at most once per publication interval**. Celestrak
+  regenerates GP data about every two hours; asking sooner cannot return
+  newer element sets;
+- that floor is enforced against the stored record of the last attempt, so it
+  holds however often the job runs — and if the state store cannot be read,
+  Celestrak is not contacted at all;
+- a failing group is retried every 30 minutes, not every run;
 - requests carry a descriptive `User-Agent` identifying the project;
 - only the three named groups are fetched, never the full catalogue.
 
-Starlink is sampled (60 of ~10,900 objects, most recent epochs) — see
+Starlink is sampled (60 of ~11,000 objects, most recent epochs) — see
 [DECISIONS.md](DECISIONS.md).
 
 Two upstream findings, both documented in [DECISIONS.md](DECISIONS.md): the
@@ -293,159 +403,72 @@ Two upstream findings, both documented in [DECISIONS.md](DECISIONS.md): the
 404 and were replaced with SWPC's summary endpoints; and Celestrak signals
 "nothing has changed" with an **HTTP 403 whose body is a plain sentence**,
 which needs handling on the error path or a benign no-op gets reported as a
-hard failure.
+hard failure. That sentence names the time of "your last download", which
+Celestrak tracks per requesting address; it is only accepted as confirmation
+if the download it names is ours (§29).
 
 ---
 
 ## Deployment
 
-Hosted on **Cloudflare Pages** at
-[orbital.rodrigopimenta.com](https://orbital.rodrigopimenta.com), built
-directly from this repository. The domain is registered through Cloudflare
-Registrar with its DNS on the same account, which keeps the custom-domain
-step to a confirmation rather than a DNS edit. There are no secrets in the
-repo and none are needed to build it.
+Runs on Google Cloud, in one project and one region (`us-east4`):
 
-### 1. Connect the repository
-
-In the Cloudflare dashboard: **Workers & Pages → Create → Pages → Connect to
-Git**, pick this repository, then set:
-
-| Setting | Value |
+| Piece | Service |
 |---|---|
-| Framework preset | **None** |
-| Build command | `pip install uv && uv sync --frozen && uv run python -m orbital_watch.build` |
-| Build output directory | `dist` |
-| Root directory | *(leave blank)* |
-| Production branch | `main` |
+| The refresh job | Cloud Run job `orbital-watch-refresh`, 1 vCPU / 512 MiB, a few seconds a run |
+| The schedule | Cloud Scheduler, every 10 minutes |
+| State | Cloud Storage bucket, private, versioned |
+| The published document | Cloud Storage bucket, public read, `Cache-Control: public, max-age=60`, CORS limited to the site |
+| The page | Firebase Hosting, at [orbital.rodrigopimenta.com](https://orbital.rodrigopimenta.com) |
+| Alerts | Cloud Monitoring, by email |
 
-No environment variables are required. `PYTHON_VERSION` is not needed either —
-the committed `.python-version` pins the interpreter, and Cloudflare's build
-image reads it.
+All of it is Terraform, in [`infra/`](infra/), with the bootstrap and apply
+steps, the DNS change and a cost table in [`infra/README.md`](infra/README.md).
+There are no secrets in the repository and none are needed to run it: the
+scheduler and the deploy workflow both authenticate with short-lived tokens,
+and no service account key exists.
 
-`wrangler.toml` declares `pages_build_output_dir = "dist"`. Once that file
-exists Cloudflare treats it as the source of truth for the output directory,
-so the dashboard field for it becomes read-only. That is deliberate: the
-deploy configuration is reviewed in pull requests instead of being clicked
-into a web form and forgotten. The build *command* has no wrangler equivalent
-and stays in the dashboard.
+### Cost
 
-### 2. Point the custom domain at it
-
-**Pages project → Custom domains → Set up a domain →**
-`orbital.rodrigopimenta.com` → **Continue** → confirm the record.
-
-`rodrigopimenta.com` is registered through Cloudflare and its zone is on the
-same account, so there is no DNS record to add by hand: Cloudflare creates the
-proxied `CNAME orbital → <project>.pages.dev` for you once you confirm. Because
-this is a subdomain rather than an apex, no nameserver change is involved
-either. TLS is provisioned automatically — nothing to configure, no
-certificate to renew.
-
-The equivalent record, if the zone ever moves to another DNS provider:
-
-```
-Type    Name       Target
-CNAME   orbital    <project>.pages.dev
-```
-
-### 3. Add the scheduled refresh
-
-Cloudflare rebuilds on every push, but the data needs refreshing on a schedule
-too. That is a **Cloudflare Worker Cron Trigger** in `infra/refresh-worker/`,
-which POSTs a Pages **deploy hook** every two hours.
-
-1. **Pages project → Settings → Builds & deployments → Deploy hooks →** create
-   one for `main`. Cloudflare gives you a URL.
-2. Deploy the Worker and give it that URL as a secret:
-
-   ```bash
-   cd infra/refresh-worker
-   npx wrangler secret put DEPLOY_HOOK     # paste the deploy hook URL
-   npx wrangler secret put GITHUB_TOKEN    # optional, see below
-   npx wrangler deploy
-   ```
-
-The hook URL is a capability — anyone holding it can trigger a build — so it
-lives only as a Worker secret, never in the repository.
-
-**Why the scheduler is on Cloudflare rather than GitHub Actions.** It used to
-be an Actions cron. On 2026-08-06 Actions went into a major outage, the site's
-data went stale for more than three hours, and the staleness banner fired —
-while Cloudflare, which actually serves the site, was healthy throughout. Only
-the scheduler was down, and it took the freshness story with it. Worse, that
-workflow had never fired once in its entire life: `gh run list` showed zero
-runs. Host and scheduler now live on the same platform, so a refresh can only
-stop for a reason that would have taken the site down anyway. See
-[DECISIONS.md](DECISIONS.md) §14.
-
-**The Worker also watches the watchman.** After triggering, it reads the
-deployed `/data/health.json` and compares `generated_at` to now. Because the
-build it just started cannot have finished, that timestamp describes the
-*previous* cycle — which is exactly the question worth asking: did the last
-refresh actually publish? If the data is older than three times the cadence it
-reports loudly, opening a GitHub issue when `GITHUB_TOKEN` is set and logging
-at error level regardless. Without that check the only signal that refreshes
-had stopped was a visitor noticing the banner, which is how the original
-outage was found.
-
-`ci.yml` stays on GitHub Actions. Tests and linting belong with the code host;
-it is only the production refresh path that must not depend on it.
-
-### Why the data paths look the way they do
-
-Cloudflare build containers are ephemeral, so unlike a CI runner there is no
-`.cache/` carried between builds — every build starts cold. That single fact
-shaped both data paths:
-
-**Celestrak (TLEs)** is not fetched by builds at all. A cold cache meant the
-in-code rate-limit floor never applied in production and every build hit a
-rate-limited third party three times — so one scheduled refresher now owns
-that traffic and commits the result, and builds read the committed snapshot
-(`snapshot` outcome, judged by age like everything else).
-
-**NOAA SWPC (space weather)** is fetched live during each build — it has no
-comparable rate limit and its data genuinely changes between builds. A cold
-build during an SWPC outage would still publish an empty weather panel, which
-is exactly the failure this project exists to avoid; that is what the seed
-exists for.
-
-`seed/` is the answer: a small committed snapshot used only when there is no
-cache **and** upstream is unreachable. It is honest by construction rather
-than by disclaimer — `seed/manifest.json` records each snapshot's real capture
-time, that timestamp is what the health panel classifies, and a seed never
-reports **fresh** no matter how recent it is, because it is served precisely
-when we reached nobody. So a seeded build shows real satellites while stating
-plainly that the data is not live.
+About $0.50 to $1 a month at list prices — 4,320 short job runs, about 23,000
+storage writes, and under a gigabyte of transfer — and most of that falls
+inside free allowances. The breakdown and its assumptions are in
+[`infra/README.md`](infra/README.md#cost).
 
 ### Workflows
 
-- **`ci.yml`** — `ruff check`, `ruff format --check`, and `pytest` on a
-  3.11/3.12 matrix for every push and PR, plus a step that builds with all
-  sockets blocked and asserts the result is a complete site reporting total
-  upstream failure. Actions are pinned to commit SHAs rather than tags, since
-  a tag can be re-pointed at other code.
-- **`refresh-snapshot.yml`** — cron every 2 hours, but fetches Celestrak only
-  when the politeness floor (5 h 30 m) has cleared — so actual fetches land
-  roughly every 6 hours. It fetches GP data and
-  commits it to `seed/` with a `[CI Skip]` prefix so the commit costs no
-  Pages build; the next scheduled rebuild picks it up. The only code path in
-  the project that talks to Celestrak.
-- The **rebuild trigger is not a workflow at all** — it is the Cloudflare
-  Worker in `infra/refresh-worker/` (see step 3 above), which also carries
-  the dead-man and synthetic endpoint checks.
+- **`ci.yml`** — on every push and PR: `ruff` and `pytest` on Python 3.11 and
+  3.12; the real entry point run with all sockets blocked, asserting a
+  complete and truthful document; the page's logic under `node --test`; the
+  container built and run with networking off; `terraform fmt`, `validate`
+  and `test` against mocked providers. Actions are pinned to commit SHAs
+  rather than tags, since a tag can be re-pointed at other code.
+- **`deploy.yml`** — on pushes to `main`, signing in through Workload Identity
+  Federation: build and push the image, point the job at it, start one run,
+  wait until the document at the public address carries this commit's
+  revision, bake that document into the site, deploy Hosting, and check what
+  was published.
 
-### Deploying from the command line instead
+**Deploying does not refresh data, and data does not need a deploy.** The
+schedule lives in Cloud Scheduler and nowhere else; there is no cron in this
+repository, and a test fails if one is added.
 
-The Git integration above is the intended path. For a one-off manual deploy:
+### Known limits
 
-```bash
-uv run python -m orbital_watch.build
-npx wrangler pages deploy dist --project-name orbital-watch
-```
-
-That needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in your
-environment. Do not commit them.
+- **Celestrak's rate limit is per address, and Cloud Run's outbound addresses
+  are shared.** If another tenant on the same address fetches a group first,
+  Celestrak may answer our request with "not updated since your last
+  download". The job recognises that the download is not ours and reports the
+  group stale rather than confirmed; if it happened persistently, the fix
+  would be a reserved outbound address, which costs more than everything else
+  here combined.
+- **Readers can be up to about two minutes behind.** The document may be
+  cached for 60 seconds and the page polls once a minute. Every age shown is
+  computed from timestamps inside the document, so the lag is visible, not
+  hidden.
+- **The deploy account can publish to any Hosting site in the project.**
+  Firebase has no narrower role. Everything else it holds is scoped to one
+  resource.
 
 ---
 
@@ -453,8 +476,9 @@ environment. Do not commit them.
 
 Scope discipline is part of the design, so these are omissions, not gaps:
 
-- **No user accounts, no database, no notifications.** All three would require
-  a backend, which would forfeit the property that makes this thing reliable.
+- **No user accounts, no database, no notifications to visitors.** The only
+  state is a handful of objects in a bucket, and the only alerts go to the
+  owner.
 - **No full satellite catalogue browser.** Celestrak already is one, and doing
   it properly means search, pagination, and a much larger payload.
 - **No 3D globe.** It would be the most eye-catching thing here and would tell
@@ -462,12 +486,17 @@ Scope discipline is part of the design, so these are omissions, not gaps:
   already say more precisely.
 - **No mobile app.** The page is responsive; a native app would add
   distribution overhead for zero functional gain.
-- **No live API proxy or serverless function.** Deliberate. It would
-  reintroduce exactly the runtime upstream dependency the architecture exists
-  to remove.
+- **No live API proxy and nothing that serves requests.** Deliberate. The job
+  runs on a schedule and writes a file; a visitor's request is answered by a
+  CDN or a bucket and never causes an upstream call. A request-time backend
+  would reintroduce exactly the runtime upstream dependency the architecture
+  exists to remove.
+- **No orbital mechanics in the browser.** The page interpolates along a
+  published track. Shipping SGP4 to the client would mean a second
+  implementation to keep correct, checked by nobody.
 - **No illumination or eclipse modelling.** It needs a JPL ephemeris kernel —
-  a ~16 MB download and another build-time network dependency — for a feature
-  outside the brief.
+  a ~16 MB download and another network dependency — for a feature outside
+  the brief.
 
 ---
 
@@ -475,19 +504,26 @@ Scope discipline is part of the design, so these are omissions, not gaps:
 
 ```
 src/orbital_watch/
-├── config.py            observer, tracked groups, thresholds — all constants
+├── config.py            observer, tracked groups, cadence, thresholds — all constants
+├── store.py             storage interface: local directory or Cloud Storage bucket
 ├── sources/
-│   ├── fetch.py         the only network I/O: timeout, cache, status
-│   ├── celestrak.py     GP element sets, rate-limit-aware
+│   ├── fetch.py         the only upstream I/O: timeout, state, politeness, outcome
+│   ├── celestrak.py     GP element sets
 │   └── swpc.py          space weather + Kp interpretation
-├── propagate.py         SGP4 → positions and passes
+├── propagate.py         SGP4 → position tracks and passes
 ├── health.py            freshness state machine
-└── build.py             entry point: writes dist/data/*.json
-web/                     static frontend, copied verbatim into dist/
-  _headers               Cloudflare Pages response headers (CSP, caching)
-seed/                    last-resort snapshot for builds with no cache
-tests/fixtures/          real API responses, committed
-wrangler.toml            Cloudflare Pages build output directory
+├── pipeline.py          one cycle: fetch, propagate, evaluate, assemble the document
+├── document.py          the document's shape, its validation, and publication
+├── job.py               entry point of the scheduled job
+└── site.py              assembles the static site around a baked copy of the document
+web/                     static frontend, copied into the site as it is
+  assets/config.js       where the document is; the one file a deploy rewrites
+  assets/core.js         the page's logic, no DOM (tested under Node)
+  assets/app.js          the drawing
+infra/                   Terraform: job, schedule, buckets, monitoring, deploy identity
+tests/                   pytest; tests/web/ for the page; tests/fixtures/ real API responses
+Dockerfile               the job's image
+firebase.json            Hosting: response headers (CSP, caching)
 ```
 
 Design decisions and their rationale are in [DECISIONS.md](DECISIONS.md).
