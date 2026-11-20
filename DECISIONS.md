@@ -1282,6 +1282,8 @@ like, on a day the upstream was down.
 **The address.** `orbital.rodrigopimenta.com` was moved from Cloudflare Pages
 to Firebase Hosting at about 16:45 UTC, after the portfolio site's status
 check had been switched to read the published document. The certificate was
-issued within fifteen minutes. The Cloudflare Pages project and the
-scheduler Worker were deleted afterwards.
+issued within fifteen minutes. The scheduler Worker was deleted the same
+day and the Pages project's builds were switched off; Cloudflare will not
+delete a Pages project that has more than a hundred past deployments until
+they are removed through its API, so the dormant project outlived the move.
 
