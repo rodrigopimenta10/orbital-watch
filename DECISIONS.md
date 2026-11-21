@@ -1285,7 +1285,10 @@ check had been switched to read the published document. The certificate was
 issued within fifteen minutes. The scheduler Worker was deleted the same
 day and the Pages project's builds were switched off; Cloudflare will not
 delete a Pages project that has more than a hundred past deployments until
-they are removed through its API, so the dormant project outlived the move.
+they are removed through its API, so the dormant project outlived the move
+by a day: its 1,598 old deployments were removed and the project deleted on
+21 November. Nothing of this project runs at Cloudflare now; it only answers
+DNS for the domain.
 
 ---
 
