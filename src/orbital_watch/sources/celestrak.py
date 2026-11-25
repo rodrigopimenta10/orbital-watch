@@ -151,7 +151,7 @@ def _refuse_collapse(new: Payload, previous: Payload) -> None:
     if before >= MIN_PLAUSIBLE_RECORDS and after < before * SHRINKAGE_FLOOR:
         raise ValueError(
             f"group shrank from {before} to {after} objects, below the "
-            f"{int(SHRINKAGE_FLOOR * 100)}% floor; keeping the stored group"
+            f"{int(SHRINKAGE_FLOOR * 100)}% floor, so the stored group is kept"
         )
 
 

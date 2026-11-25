@@ -254,7 +254,7 @@
     return (
       " This device's clock appears to be at least " +
       humanDuration(behind) +
-      " slow; times here are worked out from the later of it, the document, " +
+      " slow, so times here are worked out from the later of it, the document, " +
       "and the server's own clock."
     );
   }
@@ -670,7 +670,7 @@
         "div",
         "chart-caption",
         history.length +
-          " three-hourly observations. Bar height is the Kp value; colour " +
+          " three-hourly observations. Bar height is the Kp value, and colour " +
           "restates the NOAA severity band. Hover a bar for its timestamp."
       )
     );
@@ -769,7 +769,7 @@
             utcStamp(view.coveredUntil) +
             " UTC, which was " +
             relative(view.coveredUntil, now) +
-            ", and no newer document has arrived. Satellites have moved on; " +
+            ", and no newer document has arrived. Satellites have moved on, and " +
             "showing where they were would be showing them in the wrong place."
         );
         caption.textContent = "";
@@ -838,7 +838,7 @@
         "div",
         "provenance",
         "The pipeline propagates Celestrak element sets with SGP4 and " +
-          "publishes a short track per object; this page interpolates along " +
+          "publishes a short track per object. This page interpolates along " +
           'it to the current time and does no orbital mechanics itself. "Elem. ' +
           'age" is the age of the element set — propagation error grows with it.'
       )
@@ -1000,7 +1000,7 @@
           " is flagged at the top of this page"
       );
     }
-    var text = parts.length ? parts.join("; ") + ". " : "";
+    var text = parts.length ? parts.join(", and ") + ". " : "";
     if (Core.isNumber(parameters.celestrak_min_refetch_seconds)) {
       text +=
         "NOAA SWPC is asked on every run. Each Celestrak group is asked at " +
@@ -1079,7 +1079,7 @@
             " when published, now " +
             current +
             (shown && shown.origin === "baked" && source.state === "fresh"
-              ? " (this is a fallback copy; nothing in it is reported fresh)."
+              ? " (this is a fallback copy, and nothing in it is reported fresh)."
               : ".")
           );
         })

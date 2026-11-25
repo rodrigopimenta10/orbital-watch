@@ -139,8 +139,8 @@ def _classify(
         return (
             State.STALE,
             None,
-            "Serving data of unknown age; the time upstream last answered for "
-            "it is missing.",
+            "Serving data of unknown age, because the time upstream last answered "
+            "for it is missing.",
         )
 
     # Clamped at zero. A source fetched *after* the reference instant is not
@@ -183,8 +183,8 @@ def _classify(
         return (
             State.STALE,
             age,
-            f"Upstream unreachable at the last attempt ({result.error}); "
-            f"serving stored data from {age_text} ago.",
+            f"Upstream unreachable at the last attempt ({result.error}). "
+            f"Serving stored data from {age_text} ago.",
         )
 
     if result.outcome is Outcome.NOT_MODIFIED:
@@ -208,7 +208,7 @@ def _classify(
             State.FRESH,
             age,
             f"Upstream last answered {age_text} ago and is not due to be asked "
-            f"again yet; it was deliberately not contacted.",
+            f"again yet, so it was deliberately not contacted.",
         )
 
     return State.FRESH, age, f"Fetched from upstream {age_text} ago."
