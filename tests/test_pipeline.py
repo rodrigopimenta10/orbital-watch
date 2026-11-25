@@ -69,7 +69,22 @@ def run(store, clock) -> dict:
     assert problems == [], f"the run produced a document it could not publish: {problems}"
     # And it must survive the trip through JSON unchanged.
     assert json.loads(json.dumps(document, allow_nan=False)) == document
+    # Every sentence in it is shown to a visitor, and the page's prose is
+    # written without semicolons.
+    assert [text for text in strings(document) if ";" in text] == []
     return document
+
+
+def strings(value):
+    """Every string anywhere in a document."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings(item)
 
 
 def sources(document) -> dict[str, dict]:

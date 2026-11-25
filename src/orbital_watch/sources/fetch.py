@@ -368,7 +368,7 @@ def _load_state(spec: SourceSpec, store: Store) -> _State:
 _SAVED, _CONFLICT, _UNWRITABLE = "saved", "conflict", "unwritable"
 
 _CONFLICT_NOTE = (
-    "Another run updated this source's stored state at the same time; its "
+    "Another run updated this source's stored state at the same time, and its "
     "record was kept."
 )
 _UNWRITABLE_NOTE = (
@@ -606,7 +606,7 @@ def _fetch(
                 Outcome.FAILED,
                 error=(
                     "The state store could not be read, so it is not known when "
-                    "this upstream was last asked; it was not contacted."
+                    "this upstream was last asked. It was not contacted."
                 ),
             )
         log.warning(
@@ -756,13 +756,13 @@ def _claim_attempt(
                 return state, _not_due(spec, theirs, wait, now, started, result)
             state = theirs
         error = (
-            "Another run was contacting this upstream at the same moment; "
+            "Another run was contacting this upstream at the same moment, so "
             "this run left it alone."
         )
     else:
         error = (
             "The state store could not be written, so this request could not "
-            "be recorded; the upstream was not contacted."
+            "be recorded. The upstream was not contacted."
         )
 
     serving = state.data is not None
@@ -844,7 +844,7 @@ def _not_due(
             "The stored payload is missing or no longer valid, and this "
             "upstream may not be asked again yet."
         )
-        note = f"Upstream last answered {since} ago; the next request is due in {format_duration(wait)}."
+        note = f"Upstream last answered {since} ago, and the next request is due in {format_duration(wait)}."
         log.error(
             "source=%s outcome=failed elapsed=%.3fs error=stored-payload-unusable "
             "(next request in %s)",
@@ -864,12 +864,12 @@ def _not_due(
         # here the two cannot be told apart, and the note does not pretend to.
         note = (
             f"An attempt started {since} ago has not recorded a result "
-            f"(another run may still be making it, or it was cut off); the "
+            f"(another run may still be making it, or it was cut off). The "
             f"next one is due in {format_duration(wait)}."
         )
     else:
         note = (
-            f"Last attempt was {since} ago and failed; the next one is due in "
+            f"Last attempt was {since} ago and failed. The next one is due in "
             f"{format_duration(wait)}."
         )
     if state.data is not None:
@@ -923,7 +923,7 @@ def _degrade(
             state,
             Outcome.CACHE_FALLBACK,
             error=detail,
-            notes=["Upstream unreachable; serving the last stored payload.", note],
+            notes=["Upstream unreachable. Serving the last stored payload.", note],
         )
 
     log.error(
@@ -1074,7 +1074,7 @@ def _read_capped(
         received += len(piece)
         if received > limit:
             raise ValueError(
-                f"response exceeded the {limit // (1024 * 1024)} MB cap; refusing to buffer it"
+                f"response exceeded the {limit // (1024 * 1024)} MB cap and was not buffered"
             )
 
 

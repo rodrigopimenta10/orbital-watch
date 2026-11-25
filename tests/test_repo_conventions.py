@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 from orbital_watch.config import BAKED_DOCUMENT_PATH, LOCAL_LIVE_DOCUMENT_PATH
@@ -57,6 +58,52 @@ def test_page_loads_its_scripts_in_dependency_order():
     assert "<script>" not in html
     assert "style=" not in html
     assert "onclick=" not in html
+
+
+# --------------------------------------------------------------------------
+# Wording
+# --------------------------------------------------------------------------
+#
+# The prose a visitor reads is written without semicolons: two sentences, or
+# one joined with a plain word. The sentences the pipeline writes are checked
+# on every document the pipeline tests build (tests/test_pipeline.py). These
+# two cover the template and the sentences the page composes itself.
+
+
+class _VisibleText(HTMLParser):
+    """Collects the text and the attribute values of a page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.found: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        self.found.extend(value for _, value in attrs if value)
+
+    def handle_data(self, data):
+        if data.strip():
+            self.found.append(" ".join(data.split()))
+
+
+def test_page_template_has_no_semicolon_in_its_text_or_attributes():
+    page = _VisibleText()
+    page.feed(read("web/index.html"))
+
+    assert page.found, "expected the template to carry text"
+    assert [text for text in page.found if ";" in text] == []
+
+
+def test_sentences_the_page_composes_have_no_semicolon():
+    """A string literal with a semicolon inside it, on any line of the scripts."""
+    literal = re.compile(r""""[^"]*;[^"]*"|'[^']*;[^']*'""")
+    offenders = [
+        f"{path.name}:{number}: {line.strip()}"
+        for path in sorted((REPO / "web" / "assets").glob("*.js"))
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if literal.search(line)
+    ]
+
+    assert offenders == []
 
 
 # --------------------------------------------------------------------------

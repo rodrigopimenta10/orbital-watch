@@ -397,11 +397,11 @@ def build_correlation(weather: dict, *, kp_current: bool = True) -> dict:
             ),
             "explanation": CORRELATION_EXPLANATION,
             "operational_impacts": [
-                "Increased along-track tracking error; consider tightening the "
+                "Increased along-track tracking error. Consider tightening the "
                 "element-set refresh cycle.",
-                "Elevated drag on LEO assets; station-keeping budgets may be "
+                "Elevated drag on LEO assets, so station-keeping budgets may be "
                 "consumed faster than nominal.",
-                "HF links unreliable at high latitude; expect polar-route "
+                "HF links unreliable at high latitude. Expect polar-route "
                 "communication outages.",
                 "Ionospheric scintillation may degrade UHF/L-band, including GNSS "
                 "timing and positioning.",
@@ -434,8 +434,8 @@ def build_correlation(weather: dict, *, kp_current: bool = True) -> dict:
         "headline": f"Geomagnetic conditions nominal — Kp {kp:g}",
         "detail": (
             f"Kp is {kp:g}, below the elevated threshold of "
-            f"{KP_ELEVATED_THRESHOLD:g}. Drag and link conditions are nominal; "
-            f"standard element-set refresh cadence is sufficient."
+            f"{KP_ELEVATED_THRESHOLD:g}. Drag and link conditions are nominal, and "
+            f"the standard element-set refresh cadence is sufficient."
         ),
         "explanation": CORRELATION_EXPLANATION,
         "operational_impacts": [],
